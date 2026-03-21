@@ -1,13 +1,11 @@
 #include "thread_pool.hpp"
 
-OpTask::OpTask(std::function<void()> op) : op(std::move(op)) {}
-void OpTask::execute() { op(); }
 ThreadPool::ThreadPool(size_t numThreads)
     : stop(false), taskCount(0) {  // 初始化 taskCount 为 0
   for (size_t i = 0; i < numThreads; i++) {
     workers.emplace_back([this]() {
       while (true) {
-        std::shared_ptr<Task> task;
+        std::function<void()> task;
         {
           std::unique_lock<std::mutex> lock(this->queueMutex);
           this->condition.wait(lock, [this]() {
@@ -20,7 +18,7 @@ ThreadPool::ThreadPool(size_t numThreads)
           task = std::move(this->taskQueue.front());
           this->taskQueue.pop();
         }
-        task->execute();
+        task();
         // 任务执行完成后，减少任务计数并检查是否完成
         if (--taskCount == 0) {
           std::unique_lock<std::mutex> lock(completionMutex);
@@ -32,7 +30,7 @@ ThreadPool::ThreadPool(size_t numThreads)
 }
 
 // 向任务队列添加任务
-void ThreadPool::enqueueTask(std::shared_ptr<Task> task) {
+void ThreadPool::enqueueTask(std::function<void()> task) {
   {
     std::unique_lock<std::mutex> lock(queueMutex);
     if (stop) {
@@ -52,11 +50,16 @@ void ThreadPool::waitForAllTasks() {
 void ThreadPool::stopThreadPool() {
   {
     std::unique_lock<std::mutex> lock(queueMutex);
+    if (stop) {
+      return;
+    }
     stop = true;
   }
   condition.notify_all();
   for (auto& worker : workers) {
-    worker.join();
+    if (worker.joinable()) {
+      worker.join();
+    }
   }
 }
 

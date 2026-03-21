@@ -5,8 +5,6 @@
 
 CudaMemoryPool* GlobalCudaMemoryPool::pool_instance_ptr = nullptr;
 
-std::once_flag GlobalCudaMemoryPool::init_flag_;
-
 std::mutex GlobalCudaMemoryPool::init_mutex_;
 
 // 注意：

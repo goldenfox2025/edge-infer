@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdlib>
 #include <iostream>
 #include <set>
 #include <tuple>
@@ -8,6 +9,11 @@
 
 // Qwen3 模型权重处理器命名空间
 namespace qwen3_weight_processor {
+
+inline bool verbose_awq_debug() {
+    const char* value = std::getenv("LLM_INFER_VERBOSE_WEIGHTS");
+    return value != nullptr && std::string(value) == "1";
+}
 
 // 前向声明所有的辅助函数
 inline void process_global_weights_bf16(const py::dict& weights,
@@ -188,13 +194,15 @@ inline void process_quantized_weights_awq(const py::dict& weights,
     std::set<std::string> found_qzeros_keys;
 
     // 调试信息：列出所有权重键
-    std::cout << "\n=== AWQ权重处理开始 ===" << std::endl;
-    std::cout << "所有权重键名：" << std::endl;
-    for (auto item : weights) {
-        std::string key = py::str(item.first).cast<std::string>();
-        std::cout << "  " << key << std::endl;
+    if (verbose_awq_debug()) {
+        std::cout << "\n=== AWQ权重处理开始 ===" << std::endl;
+        std::cout << "所有权重键名：" << std::endl;
+        for (auto item : weights) {
+            std::string key = py::str(item.first).cast<std::string>();
+            std::cout << "  " << key << std::endl;
+        }
+        std::cout << "=== 开始处理权重 ===" << std::endl;
     }
-    std::cout << "=== 开始处理权重 ===" << std::endl;
 
     for (auto item : weights) {
         std::string key = py::str(item.first).cast<std::string>();
@@ -409,7 +417,9 @@ inline void process_quantized_weights_awq(const py::dict& weights,
     }
 
     // 检查并处理缺失的权重
-    std::cout << "\n=== 检查AWQ权重完整性 ===" << std::endl;
+    if (verbose_awq_debug()) {
+        std::cout << "\n=== 检查AWQ权重完整性 ===" << std::endl;
+    }
 
     // 检查所有层是否存在所有必要的权重
     bool missing_weights = false;
@@ -440,23 +450,25 @@ inline void process_quantized_weights_awq(const py::dict& weights,
     }
 
     // 添加处理权重结果的调试信息
-    std::cout << "\n=== AWQ权重处理后信息 ===" << std::endl;
-    std::cout << "cpp_qweight_params 键名数量: " << cpp_qweight_params.size() << std::endl;
-    for (const auto& [key, _] : cpp_qweight_params) {
-        std::cout << "  qweight键: " << key << std::endl;
-    }
+    if (verbose_awq_debug()) {
+        std::cout << "\n=== AWQ权重处理后信息 ===" << std::endl;
+        std::cout << "cpp_qweight_params 键名数量: " << cpp_qweight_params.size() << std::endl;
+        for (const auto& [key, _] : cpp_qweight_params) {
+            std::cout << "  qweight键: " << key << std::endl;
+        }
 
-    std::cout << "cpp_scales_params 键名数量: " << cpp_scales_params.size() << std::endl;
-    for (const auto& [key, _] : cpp_scales_params) {
-        std::cout << "  scales键: " << key << std::endl;
-    }
+        std::cout << "cpp_scales_params 键名数量: " << cpp_scales_params.size() << std::endl;
+        for (const auto& [key, _] : cpp_scales_params) {
+            std::cout << "  scales键: " << key << std::endl;
+        }
 
-    std::cout << "cpp_qzeros_params 键名数量: " << cpp_qzeros_params.size() << std::endl;
-    for (const auto& [key, _] : cpp_qzeros_params) {
-        std::cout << "  qzeros键: " << key << std::endl;
-    }
+        std::cout << "cpp_qzeros_params 键名数量: " << cpp_qzeros_params.size() << std::endl;
+        for (const auto& [key, _] : cpp_qzeros_params) {
+            std::cout << "  qzeros键: " << key << std::endl;
+        }
 
-    std::cout << "=== AWQ权重完整性检查完成 ===" << std::endl;
+        std::cout << "=== AWQ权重完整性检查完成 ===" << std::endl;
+    }
 }
 
 // 处理 Qwen3 模型权重（BF16）
@@ -519,7 +531,9 @@ process_weights_awq(const py::dict& weights) {
         }
     }
 
-    std::cout << "\n检测到Qwen3模型层数: " << num_layers << std::endl;
+    if (verbose_awq_debug()) {
+        std::cout << "\n检测到Qwen3模型层数: " << num_layers << std::endl;
+    }
 
     // 完成进度条
     weight_processor_utils::finish_progress();

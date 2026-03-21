@@ -21,16 +21,81 @@
 namespace py = pybind11;
 class infer_base;
 
-// 使用 model_factory.hpp 中定义的 ModelType 和 ModelFactory
+namespace {
+
+using InitModelFn = bool (*)(py::dict, py::dict, std::shared_ptr<BaseModel>&,
+                             std::unique_ptr<infer_base>&);
+
+InitModelFn resolve_initializer(ModelType type) {
+  switch (type) {
+    case ModelType::LLAMA:
+      return &ModelInitializer::init_llama_model;
+    case ModelType::QWEN:
+      return &ModelInitializer::init_qwen_fp32_model;
+    case ModelType::QWEN_BF16:
+      return &ModelInitializer::init_qwen_bf16_model;
+    case ModelType::QWEN_AWQ:
+      return &ModelInitializer::init_qwen_awq_model;
+    case ModelType::QWEN3_BF16:
+      return &ModelInitializer::init_qwen3_bf16_model;
+    case ModelType::QWEN3_AWQ:
+      return &ModelInitializer::init_qwen3_awq_model;
+    default:
+      throw std::runtime_error("Unsupported model type");
+  }
+}
+
+InitModelFn resolve_draft_initializer(ModelType type) {
+  switch (type) {
+    case ModelType::QWEN_BF16:
+      return &ModelInitializer::init_qwen_bf16_model;
+    case ModelType::QWEN_AWQ:
+      return &ModelInitializer::init_qwen_awq_model;
+    case ModelType::QWEN3_BF16:
+      return &ModelInitializer::init_qwen3_bf16_model;
+    case ModelType::QWEN3_AWQ:
+      return &ModelInitializer::init_qwen3_awq_model;
+    default:
+      throw std::runtime_error("Unsupported draft model type");
+  }
+}
+
+ModelConfig build_runtime_pool_config(py::dict config) {
+  ModelConfig cpp_config = ModelInitializer::build_base_config(config);
+  cpp_config["n_layers"] = config["num_hidden_layers"].cast<int>();
+  return cpp_config;
+}
+
+}  // namespace
 
 // 全局模型与推理引擎实例 便于维护生命周期
 std::shared_ptr<BaseModel> g_model;
 std::unique_ptr<infer_base> g_engine;
+std::unique_ptr<infer_base> g_spec_engine;
 
 // 投机解码相关的全局变量
 std::shared_ptr<BaseModel> g_draft_model;  // 草稿模型
-std::unique_ptr<SpeculativeDecoder<__nv_bfloat16>>
-    g_spec_decoder;  // 投机解码器
+
+infer_base* resolve_generation_engine(bool prefer_speculative) {
+  if (prefer_speculative && g_spec_engine) {
+    return g_spec_engine.get();
+  }
+  return g_engine.get();
+}
+
+void dispatch_generation(infer_base* engine, const std::vector<uint32_t>& input_ids,
+                         py::function callback, size_t max_length, float temperature,
+                         float top_p, size_t top_k) {
+  if (!engine) {
+    throw std::runtime_error("Generation engine not initialized");
+  }
+
+  engine->generate_with_callback(input_ids, max_length, temperature, top_p,
+                                 top_k, [callback](uint32_t token) {
+                                   py::gil_scoped_acquire acquire;
+                                   callback(token);
+                                 });
+}
 
 bool init_model(py::dict config, py::dict weights,
                 const std::string& model_type) {
@@ -38,55 +103,21 @@ bool init_model(py::dict config, py::dict weights,
     // 打印配置与权重调试信息
     ModelInitializer::print_config_and_weights_info(config, weights);
 
-    // 根据模型类型初始化不同的模型
-    bool result = false;
-
-    if (model_type == "llama") {
-      result = ModelInitializer::init_llama_model(config, weights, g_model,
-                                                  g_engine);
-    } else if (model_type == "qwen") {
-      result = ModelInitializer::init_qwen_fp32_model(config, weights, g_model,
-                                                      g_engine);
-    } else if (model_type == "qwen_bf16") {
-      result = ModelInitializer::init_qwen_bf16_model(config, weights, g_model,
-                                                      g_engine);
-    } else if (model_type == "qwen_awq") {
-      result = ModelInitializer::init_qwen_awq_model(config, weights, g_model,
-                                                     g_engine);
-    } else if (model_type == "qwen3_bf16") {
-      result = ModelInitializer::init_qwen3_bf16_model(config, weights, g_model,
-                                                       g_engine);
-    } else if (model_type == "qwen3_awq") {
-      result = ModelInitializer::init_qwen3_awq_model(config, weights, g_model,
-                                                      g_engine);
-    } else {
-      throw std::runtime_error("Unsupported model type: " + model_type);
-    }
+    const ModelType parsed_model_type = model_type_from_string(model_type);
+    const InitModelFn initializer = resolve_initializer(parsed_model_type);
+    const bool result = initializer(config, weights, g_model, g_engine);
+    g_spec_engine.reset();
+    g_draft_model.reset();
 
     if (result) {
-      // 打印模型信息
-      //   g_model->print_model_info();
-
       // 打印模型设备信息
       std::cout << "\n=== 模型初始化完成，设备信息 ===" << std::endl;
       g_model->print_device_info();
       std::cout << "模型类型: " << model_type << std::endl;
       std::cout << "==============================" << std::endl;
 
-      // 构建基础配置用于初始化CUDA内存池
-      std::unordered_map<std::string, int> cpp_config =
-          ModelInitializer::build_base_config(config);
-
-      // 添加模型特定的配置
-      if (model_type == "llama") {
-        cpp_config["num_hidden_layers"] =
-            config["num_hidden_layers"].cast<int>();
-      } else {
-        cpp_config["n_layers"] = config["num_hidden_layers"].cast<int>();
-      }
-
       // 初始化CUDA内存池
-      ModelInitializer::init_cuda_memory_pool(cpp_config);
+      ModelInitializer::init_cuda_memory_pool(build_runtime_pool_config(config));
     }
 
     return result;
@@ -102,15 +133,8 @@ void generate_text_stream(const std::vector<uint32_t>& input_ids,
                           py::function callback, size_t max_length = 100,
                           float temperature = 1.0f, float top_p = 0.9f,
                           size_t top_k = 50) {
-  if (!g_engine) {
-    throw std::runtime_error("Model not initialized");
-  }
-
-  g_engine->generate_with_callback(input_ids, max_length, temperature, top_p,
-                                   top_k, [callback](uint32_t token) {
-                                     py::gil_scoped_acquire acquire;
-                                     callback(token);
-                                   });
+  dispatch_generation(resolve_generation_engine(false), input_ids, callback,
+                      max_length, temperature, top_p, top_k);
 }
 
 // 设置默认设备
@@ -165,27 +189,18 @@ bool init_speculative_decoder(py::dict config, py::dict weights,
     std::cout << "\n=== 初始化草稿模型 ===" << std::endl;
     ModelInitializer::print_config_and_weights_info(config, weights);
 
-    // 根据模型类型初始化草稿模型
-    bool result = false;
     std::unique_ptr<infer_base> draft_engine;
-
-    if (draft_model_type == "qwen3_bf16") {
-      result = ModelInitializer::init_qwen3_bf16_model(
-          config, weights, g_draft_model, draft_engine);
-    } else if (draft_model_type == "qwen3_awq") {
-      result = ModelInitializer::init_qwen3_awq_model(
-          config, weights, g_draft_model, draft_engine);
-    } else {
-      throw std::runtime_error("Unsupported draft model type: " +
-                               draft_model_type);
-    }
+    const ModelType parsed_draft_type = model_type_from_string(draft_model_type);
+    const InitModelFn initializer = resolve_draft_initializer(parsed_draft_type);
+    const bool result =
+        initializer(config, weights, g_draft_model, draft_engine);
 
     if (!result) {
       throw std::runtime_error("Failed to initialize draft model");
     }
 
     // 创建投机解码器
-    g_spec_decoder = std::make_unique<SpeculativeDecoder<__nv_bfloat16>>(
+    g_spec_engine = std::make_unique<SpeculativeDecoder<__nv_bfloat16>>(
         g_model, g_draft_model, spec_length);
 
     std::cout << "\n=== 投机解码器初始化完成 ===" << std::endl;
@@ -209,16 +224,8 @@ void generate_text_stream_speculative(const std::vector<uint32_t>& input_ids,
                                       size_t max_length = 100,
                                       float temperature = 1.0f,
                                       float top_p = 0.9f, size_t top_k = 50) {
-  if (!g_spec_decoder) {
-    throw std::runtime_error("Speculative decoder not initialized");
-  }
-
-  g_spec_decoder->generate_with_callback(input_ids, max_length, temperature,
-                                         top_p, top_k,
-                                         [callback](uint32_t token) {
-                                           py::gil_scoped_acquire acquire;
-                                           callback(token);
-                                         });
+  dispatch_generation(resolve_generation_engine(true), input_ids, callback,
+                      max_length, temperature, top_p, top_k);
 }
 
 // Pybind11 模块定义

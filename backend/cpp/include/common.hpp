@@ -136,7 +136,7 @@ inline void checkCublasStatus(cublasStatus_t status, const char* file, int line)
 /**
  * @brief 检查CUTLASS状态并在发生错误时抛出异常
  *
- * 注意：这部分被注释掉以避免与cudaOP.cuh中的定义重复
+ * 注意：这部分被注释掉以避免与 legacy CUDA 头中的定义重复
  */
 /*
 #define CUTLASS_CHECK(status)                                             \

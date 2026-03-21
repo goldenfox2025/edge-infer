@@ -7,38 +7,18 @@
 #include "CudaMemoryPool.hpp"
 #include "base_model.hpp"
 #include "inference.hpp"
+#include "speculative_model.hpp"
 #include "tensor.hpp"
 #include "thread_pool.hpp"
 
-// 定义一个结构体来存储 GPU 指针和数量
-struct GPUTokens {
-    std::vector<uint32_t*> tokens;     // GPU 指针数组
-    std::vector<uint32_t> cpu_tokens;  // CPU 上的 token 副本，用于调试
-
-    // 构造函数
-    GPUTokens() {
-    }
-
-    // 添加一个 GPU 指针
-    void add_token(uint32_t* token_ptr, uint32_t token_value) {
-        tokens.push_back(token_ptr);
-        cpu_tokens.push_back(token_value);
-    }
-
-    // 获取 token 数量
-    size_t size() const {
-        return tokens.size();
-    }
-
-    // 判断是否为空
-    bool empty() const {
-        return tokens.empty();
-    }
-};
+namespace op {
+template <typename T>
+class UnifiedOperators;
+}
 
 // 投机解码器类，用于实现投机解码功能
 template <typename T>
-class SpeculativeDecoder {
+class SpeculativeDecoder : public infer_base {
    public:
     // 构造函数，接收目标模型和草稿模型
     SpeculativeDecoder(std::shared_ptr<BaseModel> target_model, std::shared_ptr<BaseModel> draft_model,
@@ -50,7 +30,10 @@ class SpeculativeDecoder {
 
     // 生成文本，通过回调函数返回每个token
     void generate_with_callback(const std::vector<uint32_t>& input_ids, size_t max_length, float temperature,
-                                float top_p, size_t top_k, std::function<void(uint32_t)> callback);
+                                float top_p, size_t top_k, std::function<void(uint32_t)> callback) override;
+    Device device() const override {
+        return device_;
+    }
 
     // 设置是否使用基于概率比值的投机采样
     void set_use_probability_ratio(bool use_ratio) {
@@ -86,6 +69,8 @@ class SpeculativeDecoder {
     std::shared_ptr<BaseModel> target_model_;
     // 草稿模型（小模型）
     std::shared_ptr<BaseModel> draft_model_;
+    std::shared_ptr<SpeculativeModel<T>> target_spec_model_;
+    std::shared_ptr<SpeculativeModel<T>> draft_spec_model_;
     // 目标模型KV缓存
     KVCache<T> target_kv_cache_;
     // 草稿模型KV缓存
@@ -94,6 +79,7 @@ class SpeculativeDecoder {
     ThreadPool thread_pool_;
     // CUDA随机状态
     curandState* d_states;
+    std::unique_ptr<op::UnifiedOperators<T>> operators_;
     // 用于重用的token内存，避免频繁的分配和释放
     uint32_t* d_reuse_token;
     // 用于存储草稿模型生成的tokens的固定GPU内存

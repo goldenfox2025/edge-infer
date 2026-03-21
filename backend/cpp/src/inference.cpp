@@ -9,9 +9,7 @@
 
 #include "base_model.hpp"
 #include "common.hpp"
-#include "cudaOP.cuh"
-#include "llama.hpp"
-#include "operators.hpp"
+#include "operators/unified_operators.hpp"
 #include "qwen.hpp"
 
 // 关于如何测试Qwen2.5的图推理
@@ -27,6 +25,100 @@ enum class Signal { EndOfStream };                                            //
 using GenerationResult = std::variant<uint32_t, Signal, std::exception_ptr>;  // 定义类型别名
 // using GenerationResult = uint32_t*;
 namespace py = pybind11;
+
+namespace {
+
+class DeviceTimer {
+ public:
+  explicit DeviceTimer(Device device) : device_(device) {
+    if (device_ == Device::CUDA) {
+      gpu_timer_ = std::make_unique<GpuTimer>();
+    }
+  }
+
+  void start(cudaStream_t stream = nullptr) {
+    if (gpu_timer_) {
+      gpu_timer_->start(stream);
+    } else {
+      cpu_timer_.start();
+    }
+  }
+
+  void stop(cudaStream_t stream = nullptr) {
+    if (gpu_timer_) {
+      gpu_timer_->stop(stream);
+    } else {
+      cpu_timer_.stop();
+    }
+  }
+
+  float milliseconds() {
+    return gpu_timer_ ? gpu_timer_->milliseconds()
+                      : static_cast<float>(cpu_timer_.milliseconds());
+  }
+
+ private:
+  Device device_;
+  std::unique_ptr<GpuTimer> gpu_timer_;
+  CpuTimer cpu_timer_;
+};
+
+uint32_t read_token_from_device(uint32_t* token_ptr, Device device) {
+  if (device == Device::CUDA) {
+    uint32_t token = 0;
+    checkCudaErrors(cudaMemcpyAsync(&token, token_ptr, sizeof(uint32_t),
+                                    cudaMemcpyDeviceToHost,
+                                    cudaStreamDefault));
+    checkCudaErrors(cudaStreamSynchronize(cudaStreamDefault));
+    return token;
+  }
+
+  if (!token_ptr) {
+    throw std::runtime_error("Received null CPU token pointer");
+  }
+  return *token_ptr;
+}
+
+void validate_token_id(const BaseModel* model, uint32_t token,
+                       const char* phase) {
+  if (!model) {
+    throw std::runtime_error("Model is null while validating token id");
+  }
+
+  const size_t vocab_size = model->get_vocab_size();
+  if (token >= vocab_size) {
+    throw std::runtime_error(std::string("Invalid token id from ") + phase +
+                             ": " + std::to_string(token) +
+                             " >= vocab_size " +
+                             std::to_string(vocab_size));
+  }
+}
+
+size_t estimate_prefill_arena_bytes(const BaseModel* model, size_t token_count,
+                                    size_t element_size) {
+  if (model == nullptr || token_count == 0) {
+    return 0;
+  }
+
+  const size_t model_estimate = model->estimate_prefill_workspace_bytes(token_count);
+  if (model_estimate > 0) {
+    const size_t slack_bytes =
+        std::max<size_t>(32 * 1024 * 1024, model_estimate / 8);
+    return model_estimate + slack_bytes;
+  }
+
+  const size_t hidden = model->get_hidden_size();
+  const size_t kv_width = model->get_n_kv_heads() * model->get_head_dim();
+  const size_t per_layer_elements = (6 * hidden) + (4 * kv_width);
+  const size_t total_elements =
+      token_count * model->get_n_layers() * per_layer_elements;
+  const size_t estimated_bytes = total_elements * element_size;
+  const size_t slack_bytes = std::max<size_t>(32 * 1024 * 1024,
+                                              estimated_bytes / 4);
+  return estimated_bytes + slack_bytes;
+}
+
+}  // namespace
 
 template <typename T>
 KVCache<T>::KVCache(size_t n_layers, size_t max_seq_len, size_t head_dim, Device device, size_t initial_size)
@@ -180,6 +272,7 @@ InferenceEngine<T>::InferenceEngine(std::shared_ptr<BaseModel> model, Device dev
       thread_pool_(4),
       device_(device),
       d_states(nullptr),  // 初始化 d_states 为 nullptr
+      operators_(std::make_unique<op::UnifiedOperators<T>>(device)),
       benchmark_mode_(true),  // 默认开启基准测试模式
       benchmark_warmup_tokens_(64) {  // 默认基准测试预热64个tokens
 
@@ -197,7 +290,8 @@ InferenceEngine<T>::InferenceEngine(std::shared_ptr<BaseModel> model, Device dev
                                      std::string(cudaGetErrorString(err)));
         }
         int seed = std::chrono::system_clock::now().time_since_epoch().count();
-        cuda_OP::init_curand(d_states, seed, 0, nullptr);
+        operators_->cuda();
+        operators_->init_curand(d_states, seed, 0, nullptr);
         this->cuda();
     }
 
@@ -221,13 +315,15 @@ InferenceEngine<T>::~InferenceEngine() {
 template <typename T>
 uint32_t* InferenceEngine<T>::generate_next_token(ThreadPool& thread_pool, uint32_t* input_ids, float temperature,
                                                   float top_p, size_t top_k) {
-    // 创建GPU计时器
-    GpuTimer token_gen_timer;
+    DeviceTimer token_gen_timer(device_);
     token_gen_timer.start();
 
-    // 修复：input_ids是GPU指针，需要用特殊构造函数
-    // 构造输入张量，取 input_ids 中最后一个 token, 放置在正确的设备上
-    Tensor<uint32_t> input(input_ids, {1}, device_);  // 这里使用GPU指针构造函数
+    Tensor<uint32_t> input;
+    if (device_ == Device::CUDA) {
+        input = Tensor<uint32_t>(input_ids, {1}, device_);
+    } else {
+        input = Tensor<uint32_t>(std::vector<uint32_t>{*input_ids}, {1}, Device::CPU);
+    }
 
     // 更新 KV 缓存长度（为新 token 分配缓存空间）
     try {
@@ -336,6 +432,9 @@ void InferenceEngine<T>::warmup(size_t warmup_tokens, bool force_warmup, float t
             GpuTimer warmup_timer;
             warmup_timer.start();
 
+            GlobalCudaMemoryPool::prepare_prefill_capacity(
+                estimate_prefill_arena_bytes(model_.get(), warmup_input.size(), sizeof(T)));
+
             // 设置prefill阶段标志
             GlobalCudaMemoryPool::set_prefill_phase(true);
 
@@ -438,36 +537,36 @@ void InferenceEngine<T>::generate_with_callback(const std::vector<uint32_t>& inp
     bind_this_thread_to_core(3);
     std::thread generation_thread([&, this, input_ids_copy = input_ids]() {
         try {
-            uint32_t* next_token_gpu_ptr;   // 指向 GPU 上的 next_token
-            uint32_t next_token_host = -1;  // CPU 上的 next_token 副本
+            uint32_t* next_token_ptr;
+            uint32_t next_token_host = -1;
             size_t input_size = input_ids_copy.size();
 
-            // 声明计时器，确保在整个函数范围内可见
-            GpuTimer total_prefill_timer;
+            DeviceTimer total_prefill_timer(this->device_);
             total_prefill_timer.start();
 
             {
-                // 设置prefill阶段标志，启用prefill模式
-                GlobalCudaMemoryPool::set_prefill_phase(true);
+                if (this->device_ == Device::CUDA) {
+                    GlobalCudaMemoryPool::prepare_prefill_capacity(
+                        estimate_prefill_arena_bytes(this->model_.get(), input_size, sizeof(T)));
+                    GlobalCudaMemoryPool::set_prefill_phase(true);
+                }
                 std::cerr << "进入prefill阶段，序列长度: " << input_size << std::endl;
 
-                // 开始计时 - 仅计算部分
-                GpuTimer prefill_timer;
+                DeviceTimer prefill_timer(this->device_);
                 prefill_timer.start();
 
                 kv_cache_.resize(kv_cache_.size() + input_size);  // 调整大小移到 prefill 前
                 std::vector<uint32_t> prefill_input = input_ids_copy;
                 Tensor<uint32_t> input_tensor(std::move(prefill_input), {input_size}, this->device_);
-                next_token_gpu_ptr = this->model_->prefill(&input_tensor, this->thread_pool_, &this->kv_cache_, top_k,
-                                                           temperature, top_p, this->d_states);
+                next_token_ptr = this->model_->prefill(&input_tensor, this->thread_pool_, &this->kv_cache_, top_k,
+                                                       temperature, top_p, this->d_states);
 
-                // 确保所有CUDA操作完成后再停止计时
                 prefill_timer.stop();
 
-                // 关闭prefill阶段标志
-                GlobalCudaMemoryPool::set_prefill_phase(false);
+                if (this->device_ == Device::CUDA) {
+                    GlobalCudaMemoryPool::set_prefill_phase(false);
+                }
 
-                // 输出计时结果，确保立即刷新输出缓冲区
                 std::cout << "Prefill阶段完成，耗时: " << std::fixed << std::setprecision(2)
                           << prefill_timer.milliseconds() << " 毫秒" << std::endl
                           << std::flush;
@@ -475,17 +574,11 @@ void InferenceEngine<T>::generate_with_callback(const std::vector<uint32_t>& inp
                 std::cerr << "退出prefill阶段" << std::endl;
             }
 
-            // --- 处理 Prefill 的第一个 Token ---
-            // 开始计时 - 第一个token处理
-            GpuTimer token_timer;
+            DeviceTimer token_timer(this->device_);
             token_timer.start();
+            next_token_host = read_token_from_device(next_token_ptr, this->device_);
+            validate_token_id(this->model_.get(), next_token_host, "prefill");
 
-            // 从 GPU 获取 prefill 产生的第一个 token
-            checkCudaErrors(cudaMemcpyAsync(&next_token_host, next_token_gpu_ptr, sizeof(uint32_t),
-                                            cudaMemcpyDeviceToHost, cudaStreamDefault));
-            checkCudaErrors(cudaStreamSynchronize(cudaStreamDefault));
-
-            // 结束计时 - 第一个token处理
             token_timer.stop();
 
             // 输出第一个token处理时间
@@ -500,6 +593,9 @@ void InferenceEngine<T>::generate_with_callback(const std::vector<uint32_t>& inp
                       << std::flush;
 
             if (next_token_host == this->model_->get_eos_token_id()) {
+                if (this->device_ == Device::CPU && next_token_ptr != nullptr) {
+                    delete next_token_ptr;
+                }
                 result_queue.push(Signal::EndOfStream);
                 return;
             }
@@ -507,37 +603,26 @@ void InferenceEngine<T>::generate_with_callback(const std::vector<uint32_t>& inp
             result_queue.push(next_token_host);
 
             size_t current_total_length = input_size + 1;
-            uint32_t* last_token_gpu_ptr = next_token_gpu_ptr;  // 下一轮的输入是 GPU 指针
+            uint32_t* last_token_ptr = next_token_ptr;
 
-            // ==================== 新增代码段：初始化解码计时器 ====================
             std::vector<float> decode_times;
-            // ===============================================================
 
             while (current_total_length < max_length) {
-                // 创建GPU计时器用于整个token生成和处理过程
-                GpuTimer full_token_timer;
+                DeviceTimer full_token_timer(this->device_);
                 full_token_timer.start();
 
-                // --- 生成下一个 token (主要是 GPU 计算) ---
-                next_token_gpu_ptr =
-                    this->generate_next_token(this->thread_pool_, last_token_gpu_ptr, temperature, top_p, top_k);
+                next_token_ptr =
+                    this->generate_next_token(this->thread_pool_, last_token_ptr, temperature, top_p, top_k);
+                if (this->device_ == Device::CPU) {
+                    delete last_token_ptr;
+                }
+                next_token_host = read_token_from_device(next_token_ptr, this->device_);
+                validate_token_id(this->model_.get(), next_token_host, "decode");
 
-                // --- 异步拷贝结果回 CPU ---
-                checkCudaErrors(
-                    cudaMemcpyAsync(&next_token_host, next_token_gpu_ptr, sizeof(uint32_t), cudaMemcpyDeviceToHost));
-
-                // 等待GPU计算和数据传输完成，以确保计时准确
-                checkCudaErrors(cudaStreamSynchronize(cudaStreamDefault));
-
-                // 停止整体计时
                 full_token_timer.stop();
-
-                // ==================== 新增代码段：记录本次解码时间 ====================
                 decode_times.push_back(full_token_timer.milliseconds());
-                // =================================================================
 
-                // --- CPU 逻辑和 Push ---
-                last_token_gpu_ptr = next_token_gpu_ptr;  // 更新下一轮的输入指针
+                last_token_ptr = next_token_ptr;
                 current_total_length++;
                 bool is_eos = (next_token_host == this->model_->get_eos_token_id());
 
@@ -549,9 +634,13 @@ void InferenceEngine<T>::generate_with_callback(const std::vector<uint32_t>& inp
                 result_queue.push(next_token_host);
             }  // end while loop
 
+            if (this->device_ == Device::CPU && last_token_ptr != nullptr) {
+                delete last_token_ptr;
+                last_token_ptr = nullptr;
+            }
+
             result_queue.push(Signal::EndOfStream);
 
-            // ==================== 新增代码段：计算并打印解码性能统计 ====================
             if (!decode_times.empty()) {
                 float total_decode_time = std::accumulate(decode_times.begin(), decode_times.end(), 0.0f);
                 float average_decode_time = total_decode_time / decode_times.size();
@@ -566,7 +655,6 @@ void InferenceEngine<T>::generate_with_callback(const std::vector<uint32_t>& inp
                           << " Token/秒" << std::endl;
                 std::cout << "--------------------------------------------------------" << std::endl << std::flush;
             }
-            // ========================================================================
 
         } catch (...) {
             // 如果发生异常，把异常推入队列
@@ -656,6 +744,20 @@ InferenceEngine<T>& InferenceEngine<T>::cuda() {
     }
 
     kv_cache_.cuda();
+    if (!operators_) {
+        operators_ = std::make_unique<op::UnifiedOperators<T>>(Device::CUDA);
+    } else {
+        operators_->cuda();
+    }
+    if (d_states == nullptr) {
+        cudaError_t err = cudaMalloc(&d_states, sizeof(curandState));
+        if (err != cudaSuccess) {
+            throw std::runtime_error("Failed to allocate CUDA memory for curand states: " +
+                                     std::string(cudaGetErrorString(err)));
+        }
+        int seed = std::chrono::system_clock::now().time_since_epoch().count();
+        operators_->init_curand(d_states, seed, 0, nullptr);
+    }
 
     device_ = Device::CUDA;
     return *this;
@@ -667,6 +769,14 @@ InferenceEngine<T>& InferenceEngine<T>::cpu() {
     }
     model_->cpu();
     kv_cache_.cpu();
+    if (operators_) {
+        operators_->cpu();
+    }
+    if (d_states != nullptr) {
+        cudaDeviceSynchronize();
+        cudaFree(d_states);
+        d_states = nullptr;
+    }
     device_ = Device::CPU;
     return *this;
 }

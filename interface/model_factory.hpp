@@ -5,7 +5,6 @@
 #include <unordered_map>
 
 #include "base_model.hpp"
-#include "llama.hpp"
 #include "qwen.hpp"
 #include "qwen3.hpp"
 
@@ -44,16 +43,9 @@ class ModelFactory {
     // 创建FP32模型
     static std::shared_ptr<BaseModel> create_model(ModelType type,
                                                    const std::unordered_map<std::string, Tensor<float>>& weights,
-                                                   const std::unordered_map<std::string, int>& config) {
+                                                   const ModelConfig& config) {
         switch (type) {
-            case ModelType::LLAMA: {
-                auto model = std::make_shared<LlamaModel>(weights, config);
-                model->print_model_info();
-                if (!model->verify_params()) {
-                    throw std::runtime_error("Model parameter verification failed");
-                }
-                return model;
-            }
+            case ModelType::LLAMA:
             case ModelType::QWEN: {
                 auto model = std::make_shared<QwenModel<float>>(weights, config);
                 model->print_model_info();
@@ -70,7 +62,7 @@ class ModelFactory {
     // 创建BF16模型
     static std::shared_ptr<BaseModel> create_model_bf16(
         ModelType type, const std::unordered_map<std::string, Tensor<__nv_bfloat16>>& weights,
-        const std::unordered_map<std::string, int>& config) {
+        const ModelConfig& config) {
         switch (type) {
             case ModelType::QWEN_BF16: {
                 auto model = std::make_shared<QwenModel<__nv_bfloat16>>(weights, config);
@@ -100,7 +92,7 @@ class ModelFactory {
         const std::unordered_map<std::string, Tensor<int32_t>>& qweight_params,
         const std::unordered_map<std::string, Tensor<__nv_bfloat16>>& scales_params,
         const std::unordered_map<std::string, Tensor<int32_t>>& qzeros_params,
-        const std::unordered_map<std::string, int>& config) {
+        const ModelConfig& config) {
         switch (type) {
             case ModelType::QWEN_AWQ: {
                 auto model = std::make_shared<QwenModel<__nv_bfloat16>>(weights, qweight_params, scales_params,

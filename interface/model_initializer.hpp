@@ -46,12 +46,11 @@ class ModelInitializer {
 
   // 初始化 CUDA 内存池
   static bool init_cuda_memory_pool(
-      const std::unordered_map<std::string, int>& config);
+      const ModelConfig& config);
 
   // 打印配置和权重信息
   static void print_config_and_weights_info(py::dict config, py::dict weights);
 
   // 构建基础配置
-  static std::unordered_map<std::string, int> build_base_config(
-      py::dict config);
+  static ModelConfig build_base_config(py::dict config);
 };

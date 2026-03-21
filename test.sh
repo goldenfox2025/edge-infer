@@ -7,7 +7,7 @@ echo "================================"
 
 # Build the test directly
 echo "🛠️  Building AVX matmul benchmark..."
-g++ -O3 -mavx2 -mfma -fopenmp -I./backend/cpp/include -I./SICore -std=c++17 test/avx_matmul_bench.cpp -o test_matmul
+g++ -O3 -mavx2 -mfma -fopenmp -I./backend/cpp/include -I./operators/include -I./SICore -std=c++17 operators/benchmarks/avx_matmul_bench.cpp -o test_matmul
 
 # Check if the executable exists
 if [ ! -f "test_matmul" ]; then
@@ -44,6 +44,6 @@ done
 echo "🏁 All tests completed!"
 echo ""
 echo "💡 Tips for adding new GEMM versions:"
-echo "   1. Implement your function in backend/cpp/include/avx_operators.hpp"
-echo "   2. Add registration in test/avx_matmul_bench.cpp main()"
+echo "   1. Implement your function in operators/src/cpu/matmul_cpu.cpp or a new operator source"
+echo "   2. Add registration in operators/benchmarks/avx_matmul_bench.cpp main()"
 echo "   3. Run this script again to test automatically"

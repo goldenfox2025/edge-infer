@@ -11,9 +11,7 @@
 #include <vector>
 
 #include "common.hpp"
-#include "cudaOP.cuh"
 #include "operators/unified_operators.hpp"
-#include "qwen3.hpp"
 
 // 构造函数实现
 template <typename T>
@@ -31,6 +29,7 @@ SpeculativeDecoder<T>::SpeculativeDecoder(std::shared_ptr<BaseModel> target_mode
       spec_length_(spec_length),
       adaptive_spec_length_(spec_length),  // 初始化自适应投机长度
       d_states(nullptr),
+      operators_(nullptr),
       d_reuse_token(nullptr),
       main_stream_(nullptr),
       draft_stream_(nullptr),
@@ -42,6 +41,12 @@ SpeculativeDecoder<T>::SpeculativeDecoder(std::shared_ptr<BaseModel> target_mode
     if (draft_model_->device() != Device::CUDA) {
         draft_model_->cuda();
     }
+    target_spec_model_ = std::dynamic_pointer_cast<SpeculativeModel<T>>(target_model_);
+    draft_spec_model_ = std::dynamic_pointer_cast<SpeculativeModel<T>>(draft_model_);
+    if (!target_spec_model_ || !draft_spec_model_) {
+        throw std::runtime_error("Speculative decoding requires models that implement SpeculativeModel");
+    }
+    operators_ = std::make_unique<op::UnifiedOperators<T>>(Device::CUDA);
     draft_kv_cache_.clear();
     target_kv_cache_.clear();
     // 初始化CUDA资源
@@ -67,7 +72,7 @@ void SpeculativeDecoder<T>::init_cuda_resources() {
     // 分配CUDA随机状态
     cudaMalloc(&d_states, sizeof(curandState));
     int seed = std::chrono::system_clock::now().time_since_epoch().count();
-    cuda_OP::init_curand(d_states, seed, 0, nullptr);
+    operators_->init_curand(d_states, seed, 0, nullptr);
 
     // 创建CUDA流，用于异步操作
     cudaStreamCreate(&main_stream_);
@@ -188,7 +193,6 @@ std::vector<uint32_t*> SpeculativeDecoder<T>::generate_draft_tokens_gpu(uint32_t
                                                                         float temperature, float top_p, size_t top_k) {
     // 预分配GPU指针数组，避免频繁扩容
     std::vector<uint32_t*> gpu_tokens;
-    int initial_kv_size = draft_kv_cache_.size();
 
     // 计时开始 - 整个草稿生成过程
     GpuTimer draft_total_timer;
@@ -200,12 +204,6 @@ std::vector<uint32_t*> SpeculativeDecoder<T>::generate_draft_tokens_gpu(uint32_t
 
         // 添加输入token指针到结果数组
         gpu_tokens.push_back(d_draft_tokens);
-
-        // 获取Qwen3模型实例（所有模型都应该是Qwen3类型）
-        auto qwen3 = std::dynamic_pointer_cast<Qwen3Model<T>>(draft_model_);
-        if (!qwen3) {
-            throw std::runtime_error("草稿模型必须是Qwen3Model类型");
-        }
 
         std::cout << "【草稿】开始生成 " << num_tokens << " 个草稿token" << std::endl;
         float total_forward_time = 0.0f;
@@ -228,7 +226,7 @@ std::vector<uint32_t*> SpeculativeDecoder<T>::generate_draft_tokens_gpu(uint32_t
             forward_timer.start();
 
             // 使用forward_cuda获取logits并直接采样到固定内存位置
-            Tensor<T> logits = qwen3->forward_cuda(&input, &draft_kv_cache_);
+            Tensor<T> logits = draft_spec_model_->speculative_forward_logits(&input, &draft_kv_cache_);
 
             forward_timer.stop();
             float forward_time = forward_timer.milliseconds();
@@ -238,7 +236,8 @@ std::vector<uint32_t*> SpeculativeDecoder<T>::generate_draft_tokens_gpu(uint32_t
             GpuTimer sample_timer;
             sample_timer.start();
 
-            cuda_OP::sample_to_fixed(std::move(logits), next_token_ptr, temperature, top_p, 1, d_states, draft_stream_);
+            operators_->sample_to_fixed(std::move(logits), next_token_ptr, temperature, top_p, 1, d_states,
+                                        draft_stream_);
 
             sample_timer.stop();
             float sample_time = sample_timer.milliseconds();
@@ -303,7 +302,6 @@ std::pair<std::vector<uint32_t*>, std::vector<float*>> SpeculativeDecoder<T>::ge
     // 预分配GPU指针数组，避免频繁扩容
     std::vector<uint32_t*> gpu_tokens;
     std::vector<float*> gpu_probs;
-    int initial_kv_size = draft_kv_cache_.size();
 
     // 计时开始 - 整个草稿生成过程
     GpuTimer draft_total_timer;
@@ -316,12 +314,6 @@ std::pair<std::vector<uint32_t*>, std::vector<float*>> SpeculativeDecoder<T>::ge
         // 添加输入token指针到结果数组
         gpu_tokens.push_back(d_draft_tokens);
         gpu_probs.push_back(d_draft_probs);  // 输入token没有概率值，但为了保持索引一致，仍添加
-
-        // 获取Qwen3模型实例（所有模型都应该是Qwen3类型）
-        auto qwen3 = std::dynamic_pointer_cast<Qwen3Model<T>>(draft_model_);
-        if (!qwen3) {
-            throw std::runtime_error("草稿模型必须是Qwen3Model类型");
-        }
 
         // 开始生成草稿token
         std::cout << "【草稿】开始生成 " << num_tokens << " 个草稿token（带概率）" << std::endl;
@@ -346,7 +338,7 @@ std::pair<std::vector<uint32_t*>, std::vector<float*>> SpeculativeDecoder<T>::ge
             forward_timer.start();
 
             // 使用forward_cuda获取logits
-            Tensor<T> logits = qwen3->forward_cuda(&input, &draft_kv_cache_);
+            Tensor<T> logits = draft_spec_model_->speculative_forward_logits(&input, &draft_kv_cache_);
 
             forward_timer.stop();
             float forward_time = forward_timer.milliseconds();
@@ -357,8 +349,8 @@ std::pair<std::vector<uint32_t*>, std::vector<float*>> SpeculativeDecoder<T>::ge
             sample_timer.start();
 
             // 使用sample_to_fixed_with_prob将token和概率写入固定内存位置
-            cuda_OP::sample_to_fixed_with_prob(std::move(logits), next_token_ptr, next_prob_ptr, temperature, top_p,
-                                               top_k, d_states, draft_stream_);
+            operators_->sample_to_fixed_with_prob(std::move(logits), next_token_ptr, next_prob_ptr, temperature,
+                                                  top_p, top_k, d_states, draft_stream_);
 
             sample_timer.stop();
             float sample_time = sample_timer.milliseconds();
@@ -455,7 +447,8 @@ void SpeculativeDecoder<T>::generate_with_callback(const std::vector<uint32_t>& 
             target_kv_cache_.resize(target_kv_cache_.size() + current_ids.size());
 
             // 首次使用prefill处理整个提示词序列 - 直接创建张量而不是移动
-            Tensor<uint32_t> input_tensor({current_ids.begin(), current_ids.end()}, {current_ids.size()}, device_);
+            Tensor<uint32_t> input_tensor(std::vector<uint32_t>(current_ids.begin(), current_ids.end()),
+                                         {current_ids.size()}, device_);
             uint32_t* first_token = target_model_->prefill(&input_tensor, thread_pool_, &target_kv_cache_, top_k,
                                                            temperature, top_p, d_states);
 
@@ -468,6 +461,11 @@ void SpeculativeDecoder<T>::generate_with_callback(const std::vector<uint32_t>& 
             cudaMemcpyAsync(&first_target_token_value, first_token, sizeof(uint32_t), cudaMemcpyDeviceToHost,
                             main_stream_);
             cudaStreamSynchronize(main_stream_);  // 确保拷贝完成
+
+            if (first_target_token_value >= target_model_->get_vocab_size()) {
+                throw std::runtime_error("目标模型prefill返回了越界token: " +
+                                         std::to_string(first_target_token_value));
+            }
 
             target_init_timer.stop();
             float target_init_time = target_init_timer.milliseconds();
@@ -484,7 +482,6 @@ void SpeculativeDecoder<T>::generate_with_callback(const std::vector<uint32_t>& 
             }
         }
 
-        uint32_t first_draft_token_value = -1;
         // 2. 草稿模型初始化 - 同样预分配内存并使用批量处理
         {
             // 计时开始 - 草稿模型初始化
@@ -493,15 +490,14 @@ void SpeculativeDecoder<T>::generate_with_callback(const std::vector<uint32_t>& 
             draft_kv_cache_.resize(draft_kv_cache_.size() + current_ids.size());
 
             // 使用prefill为草稿模型准备KV缓存 - 直接传递数据不创建副本
-            Tensor<uint32_t> draft_input_tensor({current_ids.begin(), current_ids.end()}, {current_ids.size()},
-                                                device_);
+            Tensor<uint32_t> draft_input_tensor(std::vector<uint32_t>(current_ids.begin(), current_ids.end()),
+                                                {current_ids.size()}, device_);
             uint32_t* draft_first_token = draft_model_->prefill(&draft_input_tensor, thread_pool_, &draft_kv_cache_,
                                                                 top_k, temperature, top_p, d_states);
 
-            // 从GPU读取第一个token值 - 使用异步拷贝
-            cudaMemcpyAsync(&first_draft_token_value, draft_first_token, sizeof(uint32_t), cudaMemcpyDeviceToHost,
-                            main_stream_);
-            cudaStreamSynchronize(main_stream_);  // 确保拷贝完成
+            if (draft_first_token == nullptr) {
+                throw std::runtime_error("草稿模型初始预填充返回空指针");
+            }
 
             draft_init_timer.stop();
             float draft_init_time = draft_init_timer.milliseconds();
@@ -617,6 +613,10 @@ void SpeculativeDecoder<T>::generate_with_callback(const std::vector<uint32_t>& 
 
                 // 批量调用回调函数
                 for (size_t i = 0; i < tokens_to_add; i++) {
+                    if (verified_tokens[i] >= target_model_->get_vocab_size()) {
+                        throw std::runtime_error("投机解码验证阶段返回了越界token: " +
+                                                 std::to_string(verified_tokens[i]));
+                    }
                     callback(verified_tokens[i]);
                 }
 
@@ -688,11 +688,6 @@ size_t SpeculativeDecoder<T>::verify_draft_tokens_greedy(const std::vector<uint3
         return 0;  // 如果没有token或只有一个token（输入token），直接返回
     }
 
-    auto qwen3 = std::dynamic_pointer_cast<Qwen3Model<T>>(target_model_);
-    if (!qwen3) {
-        throw std::runtime_error("目标模型必须是Qwen3Model类型");
-    }
-
     try {
         // 使用验证专用流
         cudaStream_t verify_stream = verify_stream_;
@@ -743,7 +738,7 @@ size_t SpeculativeDecoder<T>::verify_draft_tokens_greedy(const std::vector<uint3
         prefill_timer.start();
 
         // 使用prefill_cuda获取logits并直接采样到固定内存
-        Tensor<T> logits_tensor = qwen3->prefill_cuda(&combined_tokens, &target_kv_cache_);
+        Tensor<T> logits_tensor = target_spec_model_->speculative_prefill_logits(&combined_tokens, &target_kv_cache_);
 
         // 保存目标模型的logits到文件
         size_t base_position = original_cache_size;  // 验证开始时的KV缓存位置
@@ -764,8 +759,8 @@ size_t SpeculativeDecoder<T>::verify_draft_tokens_greedy(const std::vector<uint3
         sample_timer.start();
 
         // 使用sample_batch_to_fixed直接将结果写入固定内存
-        cuda_OP::sample_batch_to_fixed(std::move(logits_tensor), target_tokens, temperature, top_p, top_k, d_states,
-                                       verify_stream);
+        operators_->sample_batch_to_fixed(std::move(logits_tensor), target_tokens, temperature, top_p, top_k,
+                                          d_states, verify_stream);
 
         sample_timer.stop();
         float sample_time = sample_timer.milliseconds();
@@ -890,16 +885,6 @@ size_t SpeculativeDecoder<T>::verify_draft_tokens_prob_ratio(const std::vector<u
         return 0;  // 如果没有token或只有一个token（输入token），直接返回
     }
 
-    auto qwen3 = std::dynamic_pointer_cast<Qwen3Model<T>>(target_model_);
-    if (!qwen3) {
-        throw std::runtime_error("目标模型必须是Qwen3Model类型");
-    }
-
-    auto draft_qwen3 = std::dynamic_pointer_cast<Qwen3Model<T>>(draft_model_);
-    if (!draft_qwen3) {
-        throw std::runtime_error("草稿模型必须是Qwen3Model类型");
-    }
-
     try {
         // 使用验证专用流
         cudaStream_t verify_stream = verify_stream_;
@@ -935,7 +920,7 @@ size_t SpeculativeDecoder<T>::verify_draft_tokens_prob_ratio(const std::vector<u
         prefill_timer.start();
 
         // 使用prefill_cuda获取logits - 移除第三个参数false
-        Tensor<T> target_logits = qwen3->prefill_cuda(&combined_tokens, &target_kv_cache_);
+        Tensor<T> target_logits = target_spec_model_->speculative_prefill_logits(&combined_tokens, &target_kv_cache_);
 
         // 保存目标模型的logits到文件
         // 注意：combined_tokens中可能有多个token，每个token对应一个logits输出
@@ -958,7 +943,7 @@ size_t SpeculativeDecoder<T>::verify_draft_tokens_prob_ratio(const std::vector<u
         random_timer.start();
 
         // 生成随机数用于接受/拒绝决策
-        cuda_OP::generate_random_values(d_random_values, num_draft_tokens, d_states, verify_stream);
+        operators_->generate_random_values(d_random_values, num_draft_tokens, d_states, verify_stream);
 
         random_timer.stop();
         float random_time = random_timer.milliseconds();
@@ -991,7 +976,7 @@ size_t SpeculativeDecoder<T>::verify_draft_tokens_prob_ratio(const std::vector<u
             uint32_t draft_token = host_draft_tokens[i];
             
             // 获取目标模型对该token的概率
-            float target_prob = cuda_OP::get_token_probability(target_logits, i, draft_token, verify_stream);
+            float target_prob = operators_->get_token_probability(target_logits, i, draft_token, verify_stream);
             
             // 获取草稿模型对该token的概率
             float draft_prob = host_draft_probs[i];
@@ -1017,8 +1002,8 @@ size_t SpeculativeDecoder<T>::verify_draft_tokens_prob_ratio(const std::vector<u
                 uint32_t* target_token_ptr;
                 cudaMalloc(&target_token_ptr, sizeof(uint32_t));
                 
-                cuda_OP::sample_to_fixed(std::move(current_logits), target_token_ptr, temperature, top_p, top_k,
-                                         d_states, verify_stream);
+                operators_->sample_to_fixed(std::move(current_logits), target_token_ptr, temperature, top_p, top_k,
+                                            d_states, verify_stream);
                 
                 cudaMemcpyAsync(&rejected_token, target_token_ptr, sizeof(uint32_t), cudaMemcpyDeviceToHost, verify_stream);
                 cudaStreamSynchronize(verify_stream);

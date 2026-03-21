@@ -22,6 +22,11 @@
 #include "kvcache_base.hpp"
 #include "tensor.hpp"
 #include "thread_pool.hpp"
+
+namespace op {
+template <typename T>
+class UnifiedOperators;
+}
 template <typename T>
 class ThreadSafeQueue {
  public:
@@ -165,6 +170,7 @@ class InferenceEngine : public infer_base {
   KVCache<T> kv_cache_;
   Device device_;
   curandState* d_states;
+  std::unique_ptr<op::UnifiedOperators<T>> operators_;
   
   // 基准测试模式相关变量
   bool benchmark_mode_;

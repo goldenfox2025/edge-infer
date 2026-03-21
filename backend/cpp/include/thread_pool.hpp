@@ -4,28 +4,11 @@
 #include <atomic>
 #include <condition_variable>
 #include <functional>
-#include <memory>
 #include <mutex>
 #include <queue>
 #include <stdexcept>
 #include <thread>
 #include <vector>
-
-
-// 通用任务类，可以接受任意算子函数
-class Task {
- public:
-  virtual ~Task() = default;
-  virtual void execute() = 0;
-};
-
-class OpTask : public Task {
- public:
-  explicit OpTask(std::function<void()> op);
-  void execute() override;
- private:
-  std::function<void()> op;
-};
 
 class ThreadPool {
  public:
@@ -36,13 +19,13 @@ class ThreadPool {
   ThreadPool(const ThreadPool&) = delete;
   ThreadPool& operator=(const ThreadPool&) = delete;
 
-  void enqueueTask(std::shared_ptr<Task> task);
+  void enqueueTask(std::function<void()> task);
   void stopThreadPool();
   void waitForAllTasks();  // 新增等待所有任务完成的方法
 
  private:
   std::vector<std::thread> workers;             // 工作线程
-  std::queue<std::shared_ptr<Task>> taskQueue;  // 任务队列
+  std::queue<std::function<void()>> taskQueue;  // 任务队列
   std::mutex queueMutex;                        // 任务队列锁
   std::condition_variable condition;            // 条件变量
   std::atomic<bool> stop;                       // 停止标志

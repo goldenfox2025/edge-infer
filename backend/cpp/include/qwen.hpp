@@ -1,16 +1,21 @@
 #pragma once
 #include <cuda_bf16.h>  // For __nv_bfloat16 support
 
+#include <algorithm>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 
 #include "base_model.hpp"
-#include "cudaOP.cuh"
+#include "execution/cuda_workspace_arena.hpp"
+#include "cuda_graph_runtime.hpp"
 #include "inference.hpp"
 #include "operators/unified_operators.hpp"
+#include "speculative_model.hpp"
 #include "tensor.hpp"
 #include "thread_pool.hpp"
+#include "execution/workspace_plan.hpp"
 #include "weight_tensor.hpp"
 
 // Sample模式枚举
@@ -21,17 +26,17 @@ enum class SampleMode {
 };
 
 template <typename T>
-class QwenModel : public BaseModel {
+class QwenModel : public BaseModel, public SpeculativeModel<T> {
    public:
     QwenModel(const std::unordered_map<std::string, Tensor<T>>& params,
-              const std::unordered_map<std::string, int>& config);
+              const ModelConfig& config);
 
     // 带量化参数的构造函数
     QwenModel(const std::unordered_map<std::string, Tensor<T>>& params,
               const std::unordered_map<std::string, Tensor<int32_t>>& qweight_params,
               const std::unordered_map<std::string, Tensor<T>>& scales_params,
               const std::unordered_map<std::string, Tensor<int32_t>>& qzeros_params,
-              const std::unordered_map<std::string, int>& config);
+              const ModelConfig& config);
     ~QwenModel() override;
 
     bool verify_params() const override;
@@ -39,32 +44,50 @@ class QwenModel : public BaseModel {
     uint32_t* forward(const Tensor<uint32_t>* input, ThreadPool& thread_pool, KVCacheBase* kv_cache, size_t top_k,
                       float temperature, float top_p, curandState* d_states = nullptr) override {
         KVCache<T>* typed_cache = dynamic_cast<KVCache<T>*>(kv_cache);
+        if (!typed_cache) {
+            throw std::runtime_error("Invalid KV cache type for QwenModel::forward");
+        }
 
-        // 1. 执行GPU forward，获得logits
         Tensor<T> logits;
-        if (use_cuda_graph_) {
-            // CUDA图路径的logits获取
+        if (device_ == Device::CUDA && use_cuda_graph_) {
             logits = forward_for_graph_logits_only(input, typed_cache);
-
-            // 图推理结束后批量应用预计算的offset
             apply_prepared_offsets();
         } else {
-            // 常规CUDA路径的logits获取
             logits = forward_logits_only(input, typed_cache);
         }
 
-        // 2. 使用新的统一sample接口
-        if (use_cuda_graph_) {
-            return sample_unified(logits, temperature, top_p, top_k, typed_cache, d_states, graph_stream_);
-        } else {
-            return sample_unified(logits, temperature, top_p, top_k, typed_cache, d_states);
+        if (device_ == Device::CUDA && use_cuda_graph_) {
+            return sample_unified(logits, temperature, top_p, top_k, typed_cache, d_states, graph_stream());
         }
+        return sample_unified(logits, temperature, top_p, top_k, typed_cache, d_states);
     }
     uint32_t* prefill(const Tensor<uint32_t>* input, ThreadPool& thread_pool, KVCacheBase* kv_cache, size_t top_k,
                       float temperature, float top_p, curandState* d_states = nullptr) override {
         KVCache<T>* typed_cache = dynamic_cast<KVCache<T>*>(kv_cache);
+        if (!typed_cache) {
+            throw std::runtime_error("Invalid KV cache type for QwenModel::prefill");
+        }
 
-        return cuda_OP::sample(prefill_cuda(input, typed_cache), temperature, top_p, top_k, d_states);
+        Tensor<T> logits =
+            device_ == Device::CUDA ? prefill_cuda(input, typed_cache) : prefill_generic(input, typed_cache);
+
+        if (logits.sizes().size() != 2 || logits.sizes()[0] == 0) {
+            throw std::runtime_error("Invalid logits shape returned from Qwen prefill");
+        }
+
+        const size_t seq_len = logits.sizes()[0];
+        const size_t vocab_size = logits.sizes()[1];
+        Tensor<T> last_logits({1, vocab_size}, device_);
+
+        if (device_ == Device::CUDA) {
+            cudaMemcpy(last_logits.data_ptr(), logits.data_ptr() + (seq_len - 1) * vocab_size, vocab_size * sizeof(T),
+                       cudaMemcpyDeviceToDevice);
+        } else {
+            std::copy(logits.data_ptr() + (seq_len - 1) * vocab_size, logits.data_ptr() + seq_len * vocab_size,
+                      last_logits.data_ptr());
+        }
+
+        return sample_unified(last_logits, temperature, top_p, top_k, typed_cache, d_states);
     }
 
     // Token generation
@@ -90,6 +113,7 @@ class QwenModel : public BaseModel {
     size_t get_hidden_size() const override {
         return hidden_size_;
     }
+    size_t estimate_prefill_workspace_bytes(size_t seq_len) const override;
 
     // Additional getter methods for qwen_decode.cpp
     size_t get_n_heads() const {
@@ -104,7 +128,7 @@ class QwenModel : public BaseModel {
     float get_rope_theta() const {
         return rope_theta_;
     }
-    size_t get_vocab_size() const {
+    size_t get_vocab_size() const override {
         return vocab_size_;
     }
     int get_quant_type() const {
@@ -134,6 +158,14 @@ class QwenModel : public BaseModel {
     // CPU sample相关方法
     Tensor<T> forward_logits_only(const Tensor<uint32_t>* input, KVCache<T>* kv_cache);
     Tensor<T> forward_for_graph_logits_only(const Tensor<uint32_t>* input, KVCache<T>* kv_cache);
+    Tensor<T> forward_generic(const Tensor<uint32_t>* input, KVCache<T>* kv_cache);
+    Tensor<T> prefill_generic(const Tensor<uint32_t>* input, KVCache<T>* kv_cache);
+    Tensor<T> speculative_forward_logits(const Tensor<uint32_t>* input, KVCache<T>* kv_cache) override {
+        return device_ == Device::CUDA ? forward_cuda(input, kv_cache) : forward_generic(input, kv_cache);
+    }
+    Tensor<T> speculative_prefill_logits(const Tensor<uint32_t>* input, KVCache<T>* kv_cache) override {
+        return device_ == Device::CUDA ? prefill_cuda(input, kv_cache) : prefill_generic(input, kv_cache);
+    }
     uint32_t sample_cpu(const Tensor<T>& gpu_logits, float temperature, float top_p, size_t top_k);
     uint32_t* sample_with_metadata_update(const Tensor<T>& logits, float temperature, float top_p, size_t top_k,
                                           KVCache<T>* kv_cache);
@@ -148,7 +180,6 @@ class QwenModel : public BaseModel {
     // 新的offset优化方法
     void compute_next_offsets_async(int offset);
     void apply_prepared_offsets();
-    void initialize_offset_cache();
 
     // 获取权重（普通或量化）
     op::WeightTensor<T> get_weight(const std::string& key) {
@@ -194,6 +225,8 @@ class QwenModel : public BaseModel {
     }
 
     // CUDA图优化相关方法
+    void initialize_cuda_runtime();
+    void cleanup_cuda_runtime();
     void initialize_graph_fixed_memory();                                             // 初始化图执行所需的固定内存
     void cleanup_graph_fixed_memory();                                                // 清理图执行的固定内存
     void update_rope_offset(size_t offset, cudaStream_t stream, int pongpong_index);  // 更新RoPE offset到固定内存
@@ -208,6 +241,13 @@ class QwenModel : public BaseModel {
                                  int pingpong_index = 0);  // 在图执行前准备所有动态数据
 
     void initialize_cuda_graph_with_kv_cache(KVCache<T>* kv_cache);  // 使用真实KV cache初始化CUDA图
+    void initialize_decode_workspace();
+    WorkspacePlan build_decode_workspace_plan() const;
+    WorkspacePlan build_prefill_workspace_plan(size_t seq_len) const;
+    Tensor<T> decode_workspace_tensor(const std::string& name, const std::vector<size_t>& shape) const;
+    std::vector<size_t> decode_tensor_shape(const std::string& name) const;
+    std::string graph_tensor_tag(const std::string& name) const;
+    std::string graph_layer_tensor_tag(const std::string& name, size_t layer) const;
 
     // 逐层输出保存功能
     void save_tensor_to_binary(const Tensor<T>& tensor,
@@ -224,8 +264,20 @@ class QwenModel : public BaseModel {
         return rope_sin_cos_cache_.numel() > 0;
     }  // 检查是否已初始化RoPE缓存
 
+    const Tensor<T>* find_optional_param(const std::string& key) const;
+    void add_residual_and_norm(Tensor<T>* hidden_states, Tensor<T>* residual, Tensor<T>* update,
+                               Tensor<T>* norm_weight, cudaStream_t stream = nullptr);
+    CudaGraphRuntime<T>& graph_runtime() {
+        return *graph_runtime_;
+    }
+    const CudaGraphRuntime<T>& graph_runtime() const {
+        return *graph_runtime_;
+    }
+    cudaStream_t graph_stream() const {
+        return graph_runtime_ ? graph_runtime_->graph_stream : nullptr;
+    }
+
    private:
-    int pingpong_index_ = 0;
     std::array<cudaEvent_t, 3> fa_done_events_;
     size_t vocab_size_;
     size_t n_layers_;
@@ -266,44 +318,11 @@ class QwenModel : public BaseModel {
     // 推理模式控制 - 默认使用常规CUDA推理，手动修改此值来测试CUDA图
     bool use_cuda_graph_ = true;  // 改为true来启用CUDA图推理
 
-    // CUDA 图执行相关成员
-    cudaGraph_t cuda_graph_;
-    cudaGraphExec_t graph_exec_;
-    cudaStream_t graph_stream_;
-    bool graph_initialized_;
-
-    // 图执行所需的固定输入输出张量
-    Tensor<uint32_t> graph_input_tensor_;
-    Tensor<T> graph_output_tensor_;
-
     // RoPE预计算的sin/cos缓存
     Tensor<float> rope_sin_cos_cache_;  // 存储预计算的sin/cos值，形状为[max_seq_len, head_dim]
-
-    size_t* d_rope_offset_;  // 设备端固定内存存储offset
-    int* d_offset_array_;    // 设备端连续offset数组，所有层共享，通过索引访问
-
-    std::vector<Tensor<T>> fixed_k_buffers_;  // 每层的K投影固定缓冲区
-    std::vector<Tensor<T>> fixed_v_buffers_;  // 每层的V投影固定缓冲区
-
-    // 图节点更新相关
-    std::vector<cudaGraphNode_t> kv_copy_nodes_;  // KV复制节点列表，用于更新目标地址
-
-    // KV地址更新优化：缓存节点参数
-    std::vector<cudaMemcpy3DParms> cached_k_params_;  // 缓存的K节点参数
-    std::vector<cudaMemcpy3DParms> cached_v_params_;  // 缓存的V节点参数
-    bool kv_params_cached_;                           // 标记参数是否已缓存
-
-    // 问题3解决方案：flash attention固定内存地址和分段信息
-    int* d_segment_info_;                      // 设备端分段信息：[total_seq_len, branch_count,
-                                               // branch_lengths...]
-    T** d_output_ptrs_;                        // 设备端输出指针数组
-    std::vector<Tensor<T>> fixed_fa_outputs_;  // 每层的flash attention输出固定内存
-    int* pingpong;
-    // 异步预准备优化相关成员
-    bool next_execution_prepared_;  // 标记下一次执行是否已经预准备完成
-    cudaStream_t prep_stream_;      // 专用于预准备操作的CUDA流
-    cudaEvent_t prep_done_event_;   // 预准备完成事件
-    size_t last_kv_cache_size_;     // 记录上次执行时的KV cache大小，用于检测新轮对话
+    std::unique_ptr<CudaGraphRuntime<T>> graph_runtime_;
+    std::unique_ptr<CudaWorkspaceArena> decode_workspace_;
+    std::unique_ptr<WorkspacePlan> decode_workspace_plan_;
 };
 
 // 使用 extern template 声明已在别处定义的模板特化
