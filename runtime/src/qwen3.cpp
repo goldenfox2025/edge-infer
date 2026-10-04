@@ -71,6 +71,103 @@ Qwen3Session<T>::Qwen3Session(
                                                  qzeros, config)) {}
 
 template <typename T>
+std::unique_ptr<Qwen3Session<T>> Qwen3Session<T>::create(
+    std::shared_ptr<const Qwen3Model<T>> model, size_t context_capacity,
+    bool enable_graph) {
+  if (!model) throw std::invalid_argument("Qwen3 session requires a model");
+  const auto& config = model->config();
+  if (!context_capacity || context_capacity > config.max_position_embeddings) {
+    throw std::invalid_argument("Qwen3 session context capacity must be positive and not exceed the model limit");
+  }
+  auto session = std::make_unique<Qwen3Session<T>>(std::move(model), enable_graph);
+  session->managed_cache_ = std::make_unique<KVCache<T>>(
+      config.n_layers, context_capacity, config.n_kv_heads * config.head_dim,
+      Device::CUDA);
+  return session;
+}
+
+template <typename T>
+std::unique_ptr<Qwen3Session<T>> Qwen3Session<T>::new_session(
+    size_t context_capacity, bool enable_graph) const {
+  return create(model_, context_capacity, enable_graph);
+}
+
+template <typename T>
+void Qwen3Session<T>::require_managed_cache() const {
+  if (!managed_cache_) {
+    throw std::logic_error("Qwen3 context operations require a managed session created with create or new_session");
+  }
+}
+
+template <typename T>
+size_t Qwen3Session<T>::context_size() const {
+  require_managed_cache();
+  return managed_cache_->size();
+}
+
+template <typename T>
+size_t Qwen3Session<T>::context_capacity() const {
+  require_managed_cache();
+  return managed_cache_->get_max_seq_len();
+}
+
+template <typename T>
+void Qwen3Session<T>::reset() {
+  require_managed_cache();
+  synchronize();
+  managed_cache_->clear();
+  managed_history_ready_ = false;
+}
+
+template <typename T>
+Tensor<T> Qwen3Session<T>::prefill(const Tensor<uint32_t>& input) {
+  require_managed_cache();
+  if (!input.numel()) {
+    throw std::invalid_argument("Qwen3 managed prefill requires a nonempty prompt");
+  }
+  if (input.numel() > managed_cache_->get_max_seq_len()) {
+    throw std::length_error("Qwen3 prompt exceeds session context capacity");
+  }
+  const size_t previous_size = managed_cache_->size();
+  try {
+    // The prompt begins at cache offset zero, retaining the fixed backing storage.
+    managed_cache_->resize(input.numel());
+    auto logits = prefill_eager(&input, managed_cache_.get());
+    managed_history_ready_ = true;
+    return logits;
+  } catch (...) {
+    // Validation rejects before model writes. CUDA execution failures do not
+    // promise preservation of existing KV values, even when length is restored.
+    managed_cache_->resize(previous_size);
+    throw;
+  }
+}
+
+template <typename T>
+Tensor<T> Qwen3Session<T>::decode(const Tensor<uint32_t>& input) {
+  require_managed_cache();
+  if (!managed_history_ready_) {
+    throw std::logic_error("Qwen3 managed decode requires a successful prefill");
+  }
+  if (input.numel() != 1) {
+    throw std::invalid_argument("Qwen3 managed decode requires exactly one token");
+  }
+  const size_t previous_size = managed_cache_->size();
+  if (previous_size >= managed_cache_->get_max_seq_len()) {
+    throw std::length_error("Qwen3 session context capacity is exhausted");
+  }
+  try {
+    managed_cache_->resize(previous_size + 1);
+    return use_cuda_graph_
+        ? forward_for_graph_logits_only(&input, managed_cache_.get())
+        : forward_eager(&input, managed_cache_.get());
+  } catch (...) {
+    managed_cache_->resize(previous_size);
+    throw;
+  }
+}
+
+template <typename T>
 void Qwen3Session<T>::init_runtime_state() {
   CUDA_CHECK(cudaStreamCreateWithFlags(&execution_stream_, cudaStreamNonBlocking));
   CUBLAS_CHECK(cublasCreate(&cublas_handle_));
@@ -117,6 +214,9 @@ template <typename T>
 void Qwen3Session<T>::validate_and_bind(const Tensor<uint32_t>* input,
                                        KVCache<T>* cache, bool decode) {
   if (!input || !cache) throw std::invalid_argument("Qwen3 session requires input and KV cache");
+  if (managed_cache_ && cache != managed_cache_.get()) {
+    throw std::invalid_argument("Qwen3 managed session requires its owned KV cache");
+  }
   int device_id = 0;
   CUDA_CHECK(cudaGetDevice(&device_id));
   if (device_id != model_->cuda_device_id()) {
@@ -338,6 +438,8 @@ Qwen3Session<T>::~Qwen3Session() {
   graph_workspace_.release();
   sampling_workspace_.release();
   attention_storage_.release();
+  // Captured graph operations must be destroyed before their cache addresses.
+  managed_cache_.reset();
   if (previous_device != model_->cuda_device_id()) cudaSetDevice(previous_device);
 }
 

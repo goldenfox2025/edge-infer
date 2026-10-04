@@ -27,6 +27,23 @@ class Qwen3Session : public BaseModel, public SpeculativeModel<T> {
     Qwen3Session(Qwen3Session&&) = delete;
     Qwen3Session& operator=(Qwen3Session&&) = delete;
 
+    // Managed sessions own a fixed-capacity cache and start with empty history.
+    // Creation and execution require the model's CUDA device to be current.
+    static std::unique_ptr<Qwen3Session<T>> create(
+        std::shared_ptr<const Qwen3Model<T>> model, size_t context_capacity,
+        bool enable_graph = false);
+    // Share prepared weights with a fresh session; no history or prefix is copied.
+    std::unique_ptr<Qwen3Session<T>> new_session(
+        size_t context_capacity, bool enable_graph = false) const;
+    // Context operations below require a managed session. Logits borrow its storage.
+    // Start a new history and return logits for all prompt rows.
+    Tensor<T> prefill(const Tensor<uint32_t>& input);
+    // Append exactly one token after prefill; the graph flag selects decode mode.
+    Tensor<T> decode(const Tensor<uint32_t>& input);
+    void reset();
+    size_t context_size() const;
+    size_t context_capacity() const;
+
     const std::shared_ptr<const Qwen3Model<T>>& model() const { return model_; }
     cudaStream_t stream() const { return execution_stream_; }
     void synchronize() const;
@@ -171,6 +188,7 @@ class Qwen3Session : public BaseModel, public SpeculativeModel<T> {
                      DecoderBuffers& buffers, bool prefill);
     void validate_and_bind(const Tensor<uint32_t>* input, KVCache<T>* cache,
                            bool decode);
+    void require_managed_cache() const;
 
     void initialize_graph_fixed_memory();
     void initialize_cuda_graph_with_kv_cache(KVCache<T>* cache);
@@ -188,6 +206,8 @@ class Qwen3Session : public BaseModel, public SpeculativeModel<T> {
                        cudaStream_t stream) const;
 
     std::shared_ptr<const Qwen3Model<T>> model_;
+    std::unique_ptr<KVCache<T>> managed_cache_;
+    bool managed_history_ready_ = false;
     cudaStream_t execution_stream_ = nullptr;
     cublasHandle_t cublas_handle_ = nullptr;
     std::unique_ptr<op::UnifiedOperators<T>> operators_;

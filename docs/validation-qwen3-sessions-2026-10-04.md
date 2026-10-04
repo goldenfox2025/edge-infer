@@ -43,6 +43,13 @@ prefill logits after another session and a legacy pool reset, shared model
 lifetime, preserved rectangular transposed weight layout, same-cache reset
 replay and continuation after another session is destroyed.
 
+The managed API is checked in both eager and graph modes with capacities six
+and seven. A child shares the exact prepared model, starts empty and maintains
+its own history and fixed decode output. Automatic prefill/decode logits match
+the isolated baselines. Tests cover replacing a history, reset/replay, parent
+continuation after child destruction, full-capacity refusal and invalid input
+or capacity requests preserving logical length and held logits.
+
 Greedy sampled prefill checks the final prompt row, then sampled decode checks
 argmax of complete logits. Sampled-token addresses stay private and fixed.
 Out-of-vocabulary tokens, invalid pointers/ranks/devices/extents, malformed

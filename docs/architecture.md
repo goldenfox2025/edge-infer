@@ -47,6 +47,14 @@ CUDA arenas, independent of process-global tags and the legacy prefill phase.
 The compatibility inference engine skips global prefill reservation for this
 executor.
 
+The managed session API pairs execution with an owned KV cache of explicit
+context capacity. `new_session()` shares the prepared model and starts an empty
+history with its own buffers and cache. `prefill()` replaces the active history,
+`decode()` appends one token, and `reset()` retains allocations for reuse.
+Applications choose semantic context compaction, truncation and retrieval;
+prefilling the resulting tokens rebuilds their KV state. The runtime owns
+capacity checks, position semantics and any future KV storage compression.
+
 The decoder is an explicit typed operator sequence in `qwen3_forward.cpp`:
 embedding, attention norm/projections, Q/K norm and RoPE, KV write, attention,
 output projection, residual, MLP, final norm and output head. Eager prefill and

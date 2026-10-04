@@ -377,6 +377,177 @@ void destruction_test(const std::shared_ptr<const Model>& model,
             << " A continues correctly after B destruction\n";
 }
 
+void expect_managed_rejected(Session& session,
+                             const std::function<void()>& operation,
+                             const std::string& label,
+                             const Tensor<BFloat16>* held_logits = nullptr) {
+  session.synchronize();
+  const auto before_size = session.context_size();
+  const auto before_capacity = session.context_capacity();
+  const auto* before_model = session.model().get();
+  const auto before_logits = held_logits ? download(*held_logits)
+                                         : std::vector<BFloat16>{};
+  bool rejected = false;
+  try {
+    operation();
+  } catch (const std::exception& error) {
+    require(std::strlen(error.what()) > 0, label + " missing diagnostic");
+    rejected = true;
+  }
+  require(rejected, label + " was accepted");
+  session.synchronize();
+  require(session.context_size() == before_size &&
+              session.context_capacity() == before_capacity &&
+              session.model().get() == before_model,
+          label + " changed managed history or model ownership");
+  if (held_logits) {
+    equal_values(before_logits, download(*held_logits),
+                  label + " modified held managed logits");
+  }
+}
+
+void managed_test(const std::shared_ptr<const Model>& model,
+                  const std::vector<Snapshot>& expected_a,
+                  const std::vector<Snapshot>& expected_b, bool graph) {
+  constexpr std::size_t parent_capacity = 6;
+  constexpr std::size_t child_capacity = 7;
+  auto parent = Session::create(model, parent_capacity, graph);
+  require(parent->model().get() == model.get() &&
+              parent->context_size() == 0 &&
+              parent->context_capacity() == parent_capacity,
+          "Managed factory must retain the shared model and start empty");
+  auto token = input({kA.continuation[0]});
+  expect_managed_rejected(*parent, [&] { parent->decode(token); },
+                          "Managed decode before prefill");
+  auto prompt_a = input(kA.prompt);
+  auto logits_a = parent->prefill(prompt_a);
+  equal_values(expected_a[0].logits, download(logits_a),
+                "Managed parent prefill logits");
+  require(parent->context_size() == kA.prompt.size(),
+          "Managed prefill must record its prompt length");
+
+  for (std::size_t invalid_capacity : {std::size_t{0}, kCapacity + 1}) {
+    expect_managed_rejected(*parent,
+        [&] { auto invalid = Session::create(model, invalid_capacity, graph); },
+        "Invalid managed factory capacity", &logits_a);
+    expect_managed_rejected(*parent,
+        [&] { auto invalid = parent->new_session(invalid_capacity, graph); },
+        "Invalid child capacity", &logits_a);
+  }
+  auto bad_token = input({static_cast<std::uint32_t>(kVocabulary)});
+  auto bad_decode_shape = input({3, 7});
+  auto bad_prompt = input({3, static_cast<std::uint32_t>(kVocabulary)});
+  auto bad_prompt_rank = input({3}, {1, 1});
+  auto oversized_prompt = input({3, 7, 11, 13, 19, 2, 5});
+  expect_managed_rejected(*parent, [&] { parent->decode(bad_token); },
+                          "Managed invalid decode token", &logits_a);
+  expect_managed_rejected(*parent, [&] { parent->decode(bad_decode_shape); },
+                          "Managed invalid decode shape", &logits_a);
+  expect_managed_rejected(*parent, [&] { parent->prefill(bad_prompt); },
+                          "Managed invalid prefill token", &logits_a);
+  expect_managed_rejected(*parent, [&] { parent->prefill(bad_prompt_rank); },
+                          "Managed invalid prefill rank", &logits_a);
+  expect_managed_rejected(*parent, [&] { parent->prefill(oversized_prompt); },
+                          "Managed oversized prompt", &logits_a);
+
+  // A child receives private empty history even though its parent has a prefix.
+  auto child = parent->new_session(child_capacity, graph);
+  require(child->model().get() == model.get() && child->context_size() == 0 &&
+              child->context_capacity() == child_capacity &&
+              parent->context_size() == kA.prompt.size(),
+          "Managed child must share weights without copying its parent's prefix");
+  expect_managed_rejected(*child, [&] { child->decode(token); },
+                          "Fresh child decode before prefill");
+  auto prompt_b = input(kB.prompt);
+  const auto held_prefill_a = download(logits_a);
+  auto logits_b = child->prefill(prompt_b);
+  equal_values(expected_b[0].logits, download(logits_b),
+                "Managed child prefill logits");
+  equal_values(held_prefill_a, download(logits_a),
+                "Managed child prefill changed held parent logits");
+  require(child->context_size() == kB.prompt.size(),
+          "Managed child prefill must record its own prompt length");
+
+  const BFloat16* fixed_parent_output = nullptr;
+  const BFloat16* fixed_child_output = nullptr;
+  for (std::size_t step = 0; step < 2; ++step) {
+    auto token_a = input({kA.continuation[step]});
+    auto token_b = input({kB.continuation[step]});
+    logits_a = parent->decode(token_a);
+    equal_values(expected_a[step + 1].logits, download(logits_a),
+                  "Managed parent decode logits");
+    const auto held_a = download(logits_a);
+    logits_b = child->decode(token_b);
+    equal_values(expected_b[step + 1].logits, download(logits_b),
+                  "Managed child decode logits");
+    equal_values(held_a, download(logits_a),
+                  "Managed child decode changed held parent logits");
+    require(parent->context_size() == kA.prompt.size() + step + 1 &&
+                child->context_size() == kB.prompt.size() + step + 1,
+            "Managed decode must advance only its own history");
+    if (step == 0) {
+      fixed_parent_output = logits_a.data_ptr();
+      fixed_child_output = logits_b.data_ptr();
+      require(fixed_parent_output != fixed_child_output,
+              "Managed sessions must own separate fixed decode outputs");
+    } else {
+      require(logits_a.data_ptr() == fixed_parent_output &&
+                  logits_b.data_ptr() == fixed_child_output,
+              "Managed decode must reuse fixed session output storage");
+    }
+  }
+  const auto held_parent = download(logits_a);
+  auto last_child_token = input({kB.continuation[2]});
+  logits_b = child->decode(last_child_token);
+  equal_values(expected_b[3].logits, download(logits_b),
+                "Managed child final decode logits");
+  require(child->context_size() == child_capacity,
+          "Managed child must fill its requested capacity");
+  expect_managed_rejected(*child, [&] { child->decode(token); },
+                          "Managed child full-capacity decode", &logits_b);
+  child.reset();
+  require(parent->context_size() == kA.prompt.size() + 2 &&
+              parent->context_capacity() == parent_capacity,
+          "Child destruction changed parent history/capacity");
+  equal_values(held_parent, download(logits_a),
+                "Child execution/destruction changed parent output");
+  auto last_parent_token = input({kA.continuation[2]});
+  logits_a = parent->decode(last_parent_token);
+  equal_values(expected_a[3].logits, download(logits_a),
+                "Managed parent decode after child destruction");
+  require(logits_a.data_ptr() == fixed_parent_output &&
+              parent->context_size() == parent_capacity,
+          "Managed parent final decode must reuse storage and fill capacity");
+  expect_managed_rejected(*parent, [&] { parent->decode(token); },
+                          "Managed parent full-capacity decode", &logits_a);
+
+  // Re-prefill replaces an existing history; explicit reset also starts empty.
+  logits_a = parent->prefill(prompt_a);
+  equal_values(expected_a[0].logits, download(logits_a),
+                "Managed fresh prefill over existing history");
+  require(parent->context_size() == kA.prompt.size(),
+          "Managed prefill appended instead of replacing history");
+  parent->reset();
+  require(parent->context_size() == 0 &&
+              parent->context_capacity() == parent_capacity,
+          "Managed reset must clear history while retaining capacity");
+  expect_managed_rejected(*parent, [&] { parent->decode(token); },
+                          "Managed decode after reset without prefill");
+  logits_a = parent->prefill(prompt_a);
+  equal_values(expected_a[0].logits, download(logits_a),
+                "Managed reset/replayed prefill logits");
+  for (std::size_t step = 0; step < kA.continuation.size(); ++step) {
+    auto next = input({kA.continuation[step]});
+    logits_a = parent->decode(next);
+    equal_values(expected_a[step + 1].logits, download(logits_a),
+                  "Managed reset/replayed decode logits");
+    require(parent->context_size() == kA.prompt.size() + step + 1,
+            "Managed replay context length differs");
+  }
+  std::cout << (graph ? "Graph" : "Eager")
+            << " managed sessions: owned history, children and replay match baseline\n";
+}
+
 void sampling_test(const std::shared_ptr<const Model>& model,
                    const std::vector<Snapshot>& expected_a,
                    const std::vector<Snapshot>& expected_b, bool graph) {
@@ -535,6 +706,7 @@ void isolation_test(const Weights& source, bool graph) {
   sampling_test(model, expected_a, expected_b, graph);
   reset_test(model, expected_a, graph);
   destruction_test(model, expected_a, graph);
+  managed_test(model, expected_a, expected_b, graph);
 }
 
 void expect_rejected(Session& session, Cache& cache,

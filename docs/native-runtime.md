@@ -75,8 +75,42 @@ while introducing speech-specific model state and outputs as described in the
 ## Shared Qwen3 weights and dedicated execution
 
 For direct logits integration, prepare weights once and create separate native
-sessions. Each session binds to one fixed-capacity cache; the cache owns private
-CUDA allocations and logical resize never moves them.
+sessions. The managed API creates a matching fixed-capacity KV cache and owns
+its lifetime:
+
+```cpp
+#include "qwen3.hpp"
+
+using BF16 = __nv_bfloat16;
+using Session = Qwen3Session<BF16>;
+auto model = std::make_shared<Qwen3Model<BF16>>(weights, config);
+auto first = Session::create(model, 4096);
+auto second = first->new_session(1024);  // Shared weights, empty history.
+
+// Contiguous rank-one CUDA uint32_t tensors; next_input contains one token.
+auto prompt_logits = first->prefill(prompt);
+auto decode_logits = first->decode(next_input);
+const auto active_tokens = first->context_size();
+const auto capacity = first->context_capacity();
+first->reset();  // Empty history; retain KV and decode allocations.
+```
+
+The capacity must be positive and at most the model's position limit. Creation
+shares prepared weights and allocates private KV and execution buffers.
+`prefill()` starts a fresh history; `decode()` appends one token after prefill.
+Capacity overflow and invalid inputs reject before model writes. The default
+mode is eager; pass `true` as the final creation argument to use graph decode.
+Prefill remains eager in either mode. Calls are synchronous and logits borrow
+session storage until its next operation.
+
+The application or harness chooses summaries, truncation and retrieved history.
+After changing the token history, prefill the resulting tokens to rebuild the
+corresponding KV state. The runtime enforces storage limits and positions.
+KV quantization or other storage compression would be runtime mechanisms with
+separate numerical validation.
+
+The lower-level API still accepts a caller-owned cache. Each session binds to
+one fixed-capacity cache; logical resize never moves its CUDA allocations:
 
 ```cpp
 #include "qwen3.hpp"

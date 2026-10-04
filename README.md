@@ -10,6 +10,8 @@ inference foundation. Python bindings and the frontend are optional consumers.
 Models compose operators; the extension target is a model implementation plus
 configuration and weight mapping. Qwen3 separates shared prepared weights from
 dedicated execution sessions with private fixed decode storage and streams.
+Native sessions share prepared weights and own a caller-sized KV cache;
+see the [session API](docs/native-runtime.md#shared-qwen3-weights-and-dedicated-execution).
 The project explores BF16 and AWQ kernels, KV-cache management, CUDA Graphs and
 workspace planning. It is experimental and has not established full model parity.
 
