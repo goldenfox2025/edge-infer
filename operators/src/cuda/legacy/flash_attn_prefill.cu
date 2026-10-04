@@ -1,7 +1,7 @@
-#include <float.h>  // 用于 FLT_MAX
+#include <float.h>
 #include <mma.h>
 
-#include <stdexcept>  // 用于 std::runtime_error
+#include <stdexcept>
 #include <string>
 
 #include "cuda/legacy/legacy_cuda_api.cuh"
@@ -25,13 +25,6 @@ __device__ __forceinline__ float warpReduceMax(float val) {
 
 namespace cuda_OP {
 
-// T_r 是一个线程块负责的Q段长度
-// current_kv_cache_total_len 是当前线程块负责的token所需要处理的总kv长度
-// B_c 是单次加载的kv长度
-// B_r 是单次加载的Q段长度
-// WARP_NUM 是线程块内的warp数量
-// DQKV 是每个头的维度
-// 启动参数：[total_seq_len / T_r, n_heads]
 
 template <typename T, int B_c, int B_r, int T_r, int WARP_NUM = 4, int DQKV = 128>
 __global__ void flash_attn_prefill_kernel_v0(const T* __restrict__ q_global, const T* __restrict__ k_global,
@@ -39,20 +32,20 @@ __global__ void flash_attn_prefill_kernel_v0(const T* __restrict__ q_global, con
                                              int num_q_heads_total, int num_kv_heads_total, int GQA_n_group,
                                              int current_prefill_q_length, int current_kv_cache_total_len,
                                              int q_offset_in_kv_timeline, int q_stride) {
-    // 找到当前线程块负责的Q段和Q头
+
     const int q_segment_idx = blockIdx.x;
     const int q_head_idx_global = blockIdx.y;
     const int kv_head_idx_global = q_head_idx_global / GQA_n_group;
 
-    // 找到当前线程块内的线程和warp索引
+
     const int tid = threadIdx.x;
     const int warp_id = tid / warpSize;
     const int lane_id = tid % warpSize;
 
-    // 找到当前线程块负责的Q段起始索引
+
     const int q_segment_start_idx = q_segment_idx * T_r;
 
-    // 声明共享内存
+
     __shared__ T q_smem[B_r][DQKV];
     __shared__ T k_smem[B_c][DQKV];
     __shared__ T v_smem[B_c][DQKV];
@@ -61,9 +54,9 @@ __global__ void flash_attn_prefill_kernel_v0(const T* __restrict__ q_global, con
     __shared__ float m_stats[B_r];
     __shared__ float l_stats[B_r];
 
-    // 外循环：遍历当前线程块负责的Q段
+
     for (int q_block_offset = 0; q_block_offset < T_r; q_block_offset += B_r) {
-        // 初始化输出累加器
+
         for (int row_idx = tid; row_idx < B_r; row_idx += blockDim.x) {
             m_stats[row_idx] = -FLT_MAX;
             l_stats[row_idx] = 0.0f;
@@ -73,7 +66,7 @@ __global__ void flash_attn_prefill_kernel_v0(const T* __restrict__ q_global, con
         }
         __syncthreads();
 
-        // 从全局内存加载Q块到共享内存
+
         for (int q_smem_row = 0; q_smem_row < B_r; ++q_smem_row) {
             int q_token_idx = q_segment_start_idx + q_block_offset + q_smem_row;
 
@@ -89,9 +82,9 @@ __global__ void flash_attn_prefill_kernel_v0(const T* __restrict__ q_global, con
         }
         __syncthreads();
 
-        // 当前负责的、大小为B_c的kv块
+
         for (int kv_block_offset = 0; kv_block_offset < current_kv_cache_total_len; kv_block_offset += B_c) {
-            // 加载K, V块到共享内存
+
             for (int smem_row = 0; smem_row < B_c; ++smem_row) {
                 int k_token_idx = kv_block_offset + smem_row;
                 bool is_valid_k = (k_token_idx < current_kv_cache_total_len);
@@ -118,13 +111,12 @@ __global__ void flash_attn_prefill_kernel_v0(const T* __restrict__ q_global, con
             }
             __syncthreads();
 
-            // 计算注意力分数矩阵 S = Q * K^T
-            // 一个warp负责一段Q
+
             constexpr int Q_ROWS_PER_WARP = (B_r + WARP_NUM - 1) / WARP_NUM;
             for (int q_row_in_warp = 0; q_row_in_warp < Q_ROWS_PER_WARP; ++q_row_in_warp) {
-                // 找到当前warp负责的Q段
+
                 int q_smem_row = warp_id * Q_ROWS_PER_WARP + q_row_in_warp;
-                // 本次循环所负责B_r个Q范围
+
                 if (q_smem_row < B_r) {
                     int q_token_idx = q_segment_start_idx + q_block_offset + q_smem_row;
                     int q_abs_pos = q_offset_in_kv_timeline + q_token_idx;
@@ -154,8 +146,7 @@ __global__ void flash_attn_prefill_kernel_v0(const T* __restrict__ q_global, con
             }
             __syncthreads();
 
-            // 在线Softmax和累积输出 O = P * V
-            // 一个warp负责一个token
+
             for (int q_row_in_warp = 0; q_row_in_warp < Q_ROWS_PER_WARP; ++q_row_in_warp) {
                 int q_smem_row = warp_id * Q_ROWS_PER_WARP + q_row_in_warp;
                 if (q_smem_row >= B_r)
@@ -164,27 +155,26 @@ __global__ void flash_attn_prefill_kernel_v0(const T* __restrict__ q_global, con
                 int q_token_idx = q_segment_start_idx + q_block_offset + q_smem_row;
                 if (q_token_idx >= current_prefill_q_length)
                     continue;
-                // 本次迭代，取出上次存放的m和l
+
                 float m_prev = m_stats[q_smem_row];
                 float l_prev = l_stats[q_smem_row];
-                // 计算当前warp正在处理的token的m
+
                 float m_block = -FLT_MAX;
                 for (int col_idx = lane_id; col_idx < B_c; col_idx += warpSize) {
                     m_block = max(m_block, scores_smem[q_smem_row][col_idx]);
                 }
                 m_block = warpReduceMax(m_block);
 
-                // 计算新的全局最大值
+
                 float m_new = max(m_prev, m_block);
 
-                // 首先更新注意力分数并计算概率
-                // 写入本次迭代的结果
+
                 // online softmax
                 // m_new = max(m_old, m_block)
                 // scale = exp(m_old - m_new)
                 // l_new = new_scale * l_old + l_block_sum
 
-                // 计算本次迭代中，当前warp负责的token的l_block_sum
+
                 float l_block = 0.0f;
                 for (int col_idx = lane_id; col_idx < B_c; col_idx += warpSize) {
                     float s = scores_smem[q_smem_row][col_idx];
@@ -194,7 +184,7 @@ __global__ void flash_attn_prefill_kernel_v0(const T* __restrict__ q_global, con
                 }
                 l_block = warpReduceSum(l_block);
 
-                // 处理数值稳定性：避免极端情况
+
                 float scale_prev;
                 if (m_prev == -FLT_MAX) {
                     scale_prev = 0.0f;
@@ -204,23 +194,23 @@ __global__ void flash_attn_prefill_kernel_v0(const T* __restrict__ q_global, con
                     scale_prev = expf(m_prev - m_new);
                 }
 
-                // 更新全局统计量，确保数值稳定性
+
                 float l_new = l_prev * scale_prev + l_block;
 
-                // 先计算当前block的P*V贡献，使用更稳定的计算方式
+
                 for (int d_idx = lane_id; d_idx < DQKV; d_idx += warpSize) {
                     float pv_sum = 0.0f;
                     for (int k_smem_row = 0; k_smem_row < B_c; ++k_smem_row) {
                         pv_sum += scores_smem[q_smem_row][k_smem_row] * static_cast<float>(v_smem[k_smem_row][d_idx]);
                     }
 
-                    // 更稳定的输出更新：O_new = scale_prev * O_old + P_block * V_block
+
                     float o_old = static_cast<float>(o_smem[q_smem_row][d_idx]);
                     float o_new = o_old * scale_prev + pv_sum;
                     o_smem[q_smem_row][d_idx] = static_cast<T>(o_new);
                 }
 
-                // 更新统计量
+
                 if (lane_id == 0) {
                     m_stats[q_smem_row] = m_new;
                     l_stats[q_smem_row] = l_new;
@@ -229,8 +219,7 @@ __global__ void flash_attn_prefill_kernel_v0(const T* __restrict__ q_global, con
             __syncthreads();
         }
 
-        // 写回最终结果到全局内存 - 确保最终归一化的数值稳定性
-        // 我们还是要确认当前线程块负责的token
+
         constexpr int Q_ROWS_PER_WARP_WRITE = (B_r + WARP_NUM - 1) / WARP_NUM;
         for (int q_row_in_warp = 0; q_row_in_warp < Q_ROWS_PER_WARP_WRITE; ++q_row_in_warp) {
             int q_smem_row = warp_id * Q_ROWS_PER_WARP_WRITE + q_row_in_warp;
@@ -242,7 +231,7 @@ __global__ void flash_attn_prefill_kernel_v0(const T* __restrict__ q_global, con
 
             if (q_token_idx < current_prefill_q_length) {
                 float l_final = l_stats[q_smem_row];
-                // 确保l_final不为0，避免除零错误
+
                 float inv_l_final = (l_final > 1e-6f) ? (1.0f / l_final) : 0.0f;
                 T* out_global_ptr = out_global + (q_token_idx * num_q_heads_total + q_head_idx_global) * DQKV;
                 for (int d_idx = lane_id; d_idx < DQKV; d_idx += warpSize) {
@@ -261,7 +250,7 @@ __global__ void flash_attn_prefill_kernel_v1(const T* __restrict__ q_global, con
                                              int num_q_heads_total, int num_kv_heads_total, int GQA_n_group,
                                              int current_prefill_q_length, int current_kv_cache_total_len,
                                              int q_offset_in_kv_timeline, int q_stride) {
-    // 找到当前线程块负责的Q段和Q头
+
     const int q_segment_idx = blockIdx.x;
     const int q_head_idx_global = blockIdx.y;
     const int kv_head_idx_global = q_head_idx_global / GQA_n_group;
@@ -270,15 +259,15 @@ __global__ void flash_attn_prefill_kernel_v1(const T* __restrict__ q_global, con
     using FragmentB = wmma::fragment<wmma::matrix_b, 16, 16, 16, T, wmma::col_major>;
     using FragmentC = wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
 
-    // 找到当前线程块内的线程和warp索引
+
     const int tid = threadIdx.x;
     const int warp_id = tid / warpSize;
     const int lane_id = tid % warpSize;
 
-    // 找到当前线程块负责的Q段起始索引
+
     const int q_segment_start_idx = q_segment_idx * T_r;
 
-    // 声明共享内存
+
     __shared__ T q_smem[B_r][DQKV];
     __shared__ T k_smem[B_c][DQKV];
     __shared__ T v_smem[B_c][DQKV];
@@ -287,9 +276,9 @@ __global__ void flash_attn_prefill_kernel_v1(const T* __restrict__ q_global, con
     __shared__ float m_stats[B_r];
     __shared__ float l_stats[B_r];
 
-    // 外循环：遍历当前线程块负责的Q段
+
     for (int q_block_offset = 0; q_block_offset < T_r; q_block_offset += B_r) {
-        // 初始化输出累加器和统计量
+
         for (int row_idx = 0; row_idx < B_r; ++row_idx) {
             m_stats[row_idx] = -FLT_MAX;
             l_stats[row_idx] = 0.0f;
@@ -298,7 +287,7 @@ __global__ void flash_attn_prefill_kernel_v1(const T* __restrict__ q_global, con
             }
         }
 
-        // 从全局内存加载Q块到共享内存
+
         for (int q_smem_row = 0; q_smem_row < B_r; ++q_smem_row) {
             int q_token_idx = q_segment_start_idx + q_block_offset + q_smem_row;
             bool is_valid_q = (q_token_idx < current_prefill_q_length);
@@ -312,9 +301,9 @@ __global__ void flash_attn_prefill_kernel_v1(const T* __restrict__ q_global, con
             }
         }
 
-        // 内循环：遍历所有K/V块
+
         for (int kv_block_offset = 0; kv_block_offset < current_kv_cache_total_len; kv_block_offset += B_c) {
-            // 加载K, V块到共享内存
+
             for (int smem_row = 0; smem_row < B_c; ++smem_row) {
                 int k_token_idx = kv_block_offset + smem_row;
                 bool is_valid_kv = (k_token_idx < current_kv_cache_total_len);
@@ -332,13 +321,13 @@ __global__ void flash_attn_prefill_kernel_v1(const T* __restrict__ q_global, con
             }
             __syncthreads();
 
-            // 使用WMMA计算 S_block = Q_block * K_block^T
+
             const int WARP_M = B_r / 16;
             const int WARP_N = B_c / 16;
             const int warp_m_id = warp_id / WARP_N;
             const int warp_n_id = warp_id % WARP_N;
 
-            if (warp_m_id < WARP_M) {  // 确保warp_m_id在有效范围内
+            if (warp_m_id < WARP_M) {
                 FragmentC fragC;
                 wmma::fill_fragment(fragC, 0.0f);
 
@@ -349,9 +338,8 @@ __global__ void flash_attn_prefill_kernel_v1(const T* __restrict__ q_global, con
                     const T* smemB_ptr = &k_smem[warp_n_id * 16][k_step];
 
                     wmma::load_matrix_sync(fragA_load, smemA_ptr, DQKV);
-                    // 注意K在全局内存是row_major，加载到smem后，为了计算 Q * K^T,
-                    // smem里的K需要被当做col_major加载到WMMA fragment B。
-                    // 你的代码已经正确地使用了 wmma::col_major
+
+
                     wmma::load_matrix_sync(fragB_load, smemB_ptr, DQKV);
                     wmma::mma_sync(fragC, fragA_load, fragB_load, fragC);
                 }
@@ -370,7 +358,7 @@ __global__ void flash_attn_prefill_kernel_v1(const T* __restrict__ q_global, con
                 int q_token_idx_local = q_segment_start_idx + q_block_offset + q_smem_row;
                 int k_token_idx_local = kv_block_offset + k_smem_row;
 
-                // q_abs_pos 是Q token在整个序列中的绝对位置，用于causal判断
+
                 int q_abs_pos = q_offset_in_kv_timeline + q_token_idx_local;
 
                 bool is_q_padding = (q_token_idx_local >= current_prefill_q_length);
@@ -385,7 +373,7 @@ __global__ void flash_attn_prefill_kernel_v1(const T* __restrict__ q_global, con
             }
             __syncthreads();
 
-            // 在线Softmax和累积输出 O = P * V
+
             constexpr int Q_ROWS_PER_WARP = (B_r + WARP_NUM - 1) / WARP_NUM;
             for (int q_row_in_warp = 0; q_row_in_warp < Q_ROWS_PER_WARP; ++q_row_in_warp) {
                 int q_smem_row = warp_id * Q_ROWS_PER_WARP + q_row_in_warp;
@@ -410,9 +398,9 @@ __global__ void flash_attn_prefill_kernel_v1(const T* __restrict__ q_global, con
                 float l_block = 0.0f;
                 for (int col_idx = lane_id; col_idx < B_c; col_idx += warpSize) {
                     float s = scores_smem[q_smem_row][col_idx];
-                    // s=-FLT_MAX时，expf会下溢到0
+
                     float p = expf(s - m_new);
-                    scores_smem[q_smem_row][col_idx] = p;  // 保存中间概率值
+                    scores_smem[q_smem_row][col_idx] = p;
                     l_block += p;
                 }
                 l_block = warpReduceSum(l_block);
@@ -438,7 +426,7 @@ __global__ void flash_attn_prefill_kernel_v1(const T* __restrict__ q_global, con
             __syncthreads();
         }
 
-        // 写回最终结果到全局内存
+
         for (int q_smem_row = 0; q_smem_row < B_r; ++q_smem_row) {
             int q_token_idx = q_segment_start_idx + q_block_offset + q_smem_row;
 
@@ -461,7 +449,7 @@ __global__ void flash_attn_prefill_kernel_v2(const T* __restrict__ q_global, con
                                              int num_q_heads_total, int num_kv_heads_total, int GQA_n_group,
                                              int current_prefill_q_length, int current_kv_cache_total_len,
                                              int q_offset_in_kv_timeline, int q_stride) {
-    // 找到当前线程块负责的Q段和Q头
+
     const int q_segment_idx = blockIdx.x;
     const int q_head_idx_global = blockIdx.y;
     const int kv_head_idx_global = q_head_idx_global / GQA_n_group;
@@ -471,12 +459,12 @@ __global__ void flash_attn_prefill_kernel_v2(const T* __restrict__ q_global, con
     using FragmentB_t = wmma::fragment<wmma::matrix_b, 16, 16, 16, T, wmma::row_major>;
     using FragmentC = wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
 
-    // 找到当前线程块内的线程和warp索引
+
     const int tid = threadIdx.x;
     const int warp_id = tid / warpSize;
     const int lane_id = tid % warpSize;
 
-    // 找到当前线程块负责的Q段起始索引
+
     const int q_segment_start_idx = q_segment_idx * T_r;
 
     constexpr auto align_size = [](size_t size) { return ((size + 15) / 16) * 16; };
@@ -510,9 +498,9 @@ __global__ void flash_attn_prefill_kernel_v2(const T* __restrict__ q_global, con
     T* p_smem = reinterpret_cast<T*>(smem_buffer + p_smem_offset);
     float* pv_smem = reinterpret_cast<float*>(smem_buffer + pv_smem_offset);
 
-    // 外循环：遍历当前线程块负责的Q段
+
     for (int q_block_offset = 0; q_block_offset < T_r; q_block_offset += B_r) {
-        // 初始化输出累加器和统计量
+
         for (int row_idx = 0; row_idx < B_r; ++row_idx) {
             m_stats[row_idx] = -FLT_MAX;
             l_stats[row_idx] = 0.0f;
@@ -521,7 +509,7 @@ __global__ void flash_attn_prefill_kernel_v2(const T* __restrict__ q_global, con
             }
         }
 
-        // 从全局内存加载Q块到共享内存
+
         for (int q_smem_row = 0; q_smem_row < B_r; ++q_smem_row) {
             int q_token_idx = q_segment_start_idx + q_block_offset + q_smem_row;
             bool is_valid_q = (q_token_idx < current_prefill_q_length);
@@ -535,9 +523,9 @@ __global__ void flash_attn_prefill_kernel_v2(const T* __restrict__ q_global, con
             }
         }
 
-        // 内循环：遍历所有K/V块
+
         for (int kv_block_offset = 0; kv_block_offset < current_kv_cache_total_len; kv_block_offset += B_c) {
-            // 加载K, V块到共享内存
+
             for (int smem_row = 0; smem_row < B_c; ++smem_row) {
                 int k_token_idx = kv_block_offset + smem_row;
                 bool is_valid_kv = (k_token_idx < current_kv_cache_total_len);
@@ -555,7 +543,7 @@ __global__ void flash_attn_prefill_kernel_v2(const T* __restrict__ q_global, con
             }
             __syncthreads();
 
-            // 使用WMMA计算 S_block = Q_block * K_block^T
+
             const int WARP_M = B_r / 16;
             const int WARP_N = B_c / 16;
             const int warp_m_id = warp_id / WARP_N;
@@ -605,7 +593,7 @@ __global__ void flash_attn_prefill_kernel_v2(const T* __restrict__ q_global, con
             }
             __syncthreads();
 
-            // 在线Softmax计算
+
             __shared__ float scale_prev[B_r];
 
             for (int q_smem_row = warp_id; q_smem_row < B_r; q_smem_row += WARP_NUM) {
@@ -642,7 +630,7 @@ __global__ void flash_attn_prefill_kernel_v2(const T* __restrict__ q_global, con
             }
             __syncthreads();
 
-            // P×V矩阵乘法. Fixed: pv_smem is now separate from k_smem
+
             constexpr int cur_WARP_M = B_r / 16;
             constexpr int cur_WARP_N = DQKV / 16;
             const int cur_warp_m_id = warp_id / cur_WARP_N;
@@ -673,7 +661,7 @@ __global__ void flash_attn_prefill_kernel_v2(const T* __restrict__ q_global, con
             }
             __syncthreads();
 
-            // 更新输出累加器
+
             for (int q_smem_row = warp_id; q_smem_row < B_r; q_smem_row += WARP_NUM) {
                 for (int d_idx = lane_id; d_idx < DQKV; d_idx += warpSize) {
                     float current_o = o_smem[q_smem_row * DQKV + d_idx];
@@ -684,7 +672,7 @@ __global__ void flash_attn_prefill_kernel_v2(const T* __restrict__ q_global, con
             __syncthreads();
         }
 
-        // 写回最终结果到全局内存
+
         for (int q_smem_row = 0; q_smem_row < B_r; ++q_smem_row) {
             int q_token_idx = q_segment_start_idx + q_block_offset + q_smem_row;
             if (q_token_idx < current_prefill_q_length) {
@@ -707,7 +695,7 @@ __global__ void flash_attn_prefill_kernel_v3(const T* __restrict__ q_global, con
                                              int num_q_heads_total, int num_kv_heads_total, int GQA_n_group,
                                              int current_prefill_q_length, int current_kv_cache_total_len,
                                              int q_offset_in_kv_timeline, int q_stride, T* zero_vec) {
-    // 找到当前线程块负责的Q段和Q头
+
     const int q_segment_idx = blockIdx.x;
     const int q_head_idx_global = blockIdx.y;
     const int kv_head_idx_global = q_head_idx_global / GQA_n_group;
@@ -717,12 +705,12 @@ __global__ void flash_attn_prefill_kernel_v3(const T* __restrict__ q_global, con
     using FragmentB_t = wmma::fragment<wmma::matrix_b, 16, 16, 16, T, wmma::row_major>;
     using FragmentC = wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
 
-    // 找到当前线程块内的线程和warp索引
+
     const int tid = threadIdx.x;
     const int warp_id = tid / warpSize;
     const int lane_id = tid % warpSize;
 
-    // 找到当前线程块负责的Q段起始索引
+
     const int q_segment_start_idx = q_segment_idx * T_r;
 
     constexpr auto align_size = [](size_t size) { return ((size + 15) / 16) * 16; };
@@ -759,12 +747,12 @@ __global__ void flash_attn_prefill_kernel_v3(const T* __restrict__ q_global, con
     T* p_smem = reinterpret_cast<T*>(smem_buffer + p_smem_offset);
     float* pv_smem = reinterpret_cast<float*>(smem_buffer + pv_smem_offset);
     constexpr int VEC_SIZE = 16 / sizeof(T);
-    // 在线Softmax计算
+
     __shared__ float scale_prev[B_r];
 
-    // 外循环：遍历当前线程块负责的Q段
+
     for (int q_block_offset = 0; q_block_offset < T_r; q_block_offset += B_r) {
-        // 初始化输出累加器和统计量
+
         for (int load_idx = tid; load_idx < B_r; load_idx += blockDim.x) {
             m_stats[load_idx] = -FLT_MAX;
             l_stats[load_idx] = 0.0f;
@@ -795,7 +783,7 @@ __global__ void flash_attn_prefill_kernel_v3(const T* __restrict__ q_global, con
             }
         }
         // CP_ASYNC_COMMIT_GROUP();
-        // 预加载
+
         for (int load_stage = 0; load_stage < STAGE - 1; load_stage++) {
             for (int load_idx = tid * VEC_SIZE; load_idx < B_c * DQKV; load_idx += blockDim.x * VEC_SIZE) {
                 int smem_row = load_idx / DQKV;
@@ -823,7 +811,7 @@ __global__ void flash_attn_prefill_kernel_v3(const T* __restrict__ q_global, con
             CP_ASYNC_COMMIT_GROUP();
         }
 
-        // 内循环：遍历所有K/V块
+
         for (int kv_block_offset_load = (STAGE - 1) * B_c; kv_block_offset_load < current_kv_cache_total_len;
              kv_block_offset_load += B_c) {
             CP_ASYNC_WAIT_GROUP(STAGE - 2);
@@ -858,13 +846,13 @@ __global__ void flash_attn_prefill_kernel_v3(const T* __restrict__ q_global, con
             }
             CP_ASYNC_COMMIT_GROUP();
 
-            // 使用WMMA计算 S_block = Q_block * K_block^T
+
             const int WARP_M = B_r / 16;
             const int WARP_N = B_c / 16;
             const int warp_m_id = warp_id / WARP_N;
             const int warp_n_id = warp_id % WARP_N;
 
-            // 第一轮计算
+
             if (warp_m_id < WARP_M) {
                 FragmentC fragC;
                 wmma::fill_fragment(fragC, 0.0f);
@@ -943,7 +931,7 @@ __global__ void flash_attn_prefill_kernel_v3(const T* __restrict__ q_global, con
             }
             __syncthreads();
 
-            // P×V矩阵乘法
+
             constexpr int cur_WARP_M = B_r / 16;
             constexpr int cur_WARP_N = DQKV / 16;
             const int cur_warp_m_id = warp_id / cur_WARP_N;
@@ -968,7 +956,7 @@ __global__ void flash_attn_prefill_kernel_v3(const T* __restrict__ q_global, con
                 wmma::store_matrix_sync(pv_ptr, fragC, DQKV, wmma::mem_row_major);
             }
             __syncthreads();
-            // 更新输出累加器
+
             for (int q_smem_row = warp_id; q_smem_row < B_r; q_smem_row += WARP_NUM) {
                 for (int d_idx = lane_id; d_idx < DQKV; d_idx += warpSize) {
                     float current_o = o_smem[q_smem_row * DQKV + d_idx];
@@ -1004,7 +992,7 @@ __global__ void flash_attn_prefill_kernel_v3(const T* __restrict__ q_global, con
                     FragmentB fragB_load;
                     const T* smemA_ptr = &q_smem[warp_m_id * 16 * DQKV + k_step];
                     const T* smemB_ptr =
-                        &k_smem[warp_n_id * 16 * DQKV + k_step + smem_sel * kv_stage_size];  // 使用正确的 smem_sel
+                        &k_smem[warp_n_id * 16 * DQKV + k_step + smem_sel * kv_stage_size];
                     wmma::load_matrix_sync(fragA_load, smemA_ptr, DQKV);
                     wmma::load_matrix_sync(fragB_load, smemB_ptr, DQKV);
                     wmma::mma_sync(fragC, fragA_load, fragB_load, fragC);
@@ -1063,7 +1051,7 @@ __global__ void flash_attn_prefill_kernel_v3(const T* __restrict__ q_global, con
             }
             __syncthreads();
 
-            // P×V矩阵乘法
+
             constexpr int cur_WARP_M = B_r / 16;
             constexpr int cur_WARP_N = DQKV / 16;
             const int cur_warp_m_id = warp_id / cur_WARP_N;
@@ -1077,7 +1065,7 @@ __global__ void flash_attn_prefill_kernel_v3(const T* __restrict__ q_global, con
                     FragmentB_t fragB_load;
                     const T* smemA_ptr = &p_smem[cur_warp_m_id * 16 * B_c + k_base];
                     const T* smemB_ptr =
-                        &v_smem[k_base * DQKV + cur_warp_n_id * 16 + smem_sel * kv_stage_size];  // 使用正确的 smem_sel
+                        &v_smem[k_base * DQKV + cur_warp_n_id * 16 + smem_sel * kv_stage_size];
                     wmma::load_matrix_sync(fragA_load, smemA_ptr, B_c);
                     wmma::load_matrix_sync(fragB_load, smemB_ptr, DQKV);
                     wmma::mma_sync(fragC, fragA_load, fragB_load, fragC);
@@ -1089,7 +1077,7 @@ __global__ void flash_attn_prefill_kernel_v3(const T* __restrict__ q_global, con
             }
             __syncthreads();
 
-            // 更新输出累加器
+
             for (int q_smem_row = warp_id; q_smem_row < B_r; q_smem_row += WARP_NUM) {
                 for (int d_idx = lane_id; d_idx < DQKV; d_idx += warpSize) {
                     float current_o = o_smem[q_smem_row * DQKV + d_idx];
@@ -1125,7 +1113,7 @@ void flash_attention_prefill(const Tensor<T>& Q, const Tensor<T>& K, const Tenso
 
     int n_groups = n_heads / n_kv_heads;
 
-    auto& pool = GlobalCudaMemoryPool::instance();  // 获取全局内存池实例
+    auto& pool = GlobalCudaMemoryPool::instance();
     static std::once_flag init_flag;
     constexpr int VEC_SIZE = 16 / sizeof(T);
     T* zero_vec = static_cast<T*>(pool.allocate_tagged("zero_vec", VEC_SIZE * sizeof(T)));

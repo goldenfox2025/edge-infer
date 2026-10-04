@@ -1,0 +1,5 @@
+# Install a suitable torch wheel separately; see README.md.
+numpy==1.26.4
+safetensors==0.5.3
+transformers==4.51.3
+tokenizers==0.21.1

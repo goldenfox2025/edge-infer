@@ -44,7 +44,7 @@ inline void configure_backend(Device& device, OperatorPlatform& platform) {
       std::fprintf(stderr,
                    "CUDA runtime unavailable: %s. Falling back to CPU.\n",
                    cudaGetErrorString(count_status));
-      cudaGetLastError();  // 清理 runtime error 状态，避免污染后续调用
+      cudaGetLastError();  // Clear the runtime error before subsequent CPU fallback calls.
       device = Device::CPU;
       platform = OperatorPlatform::CPU;
       register_platform_operators<T>(platform);

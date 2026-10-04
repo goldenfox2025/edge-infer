@@ -1,95 +1,193 @@
-# LLM_infer Engine: 高性能推理引擎探索与实践
+# LLM_infer
 
-## 项目简介
+An experimental local LLM inference engine with a C++17/CUDA runtime and a
+Python frontend. The current development target is NVIDIA GPUs. It explores
+Qwen/Qwen3 inference, BF16 and AWQ kernels, KV-cache management, CUDA Graphs,
+and memory planning.
 
-`LLM_infer` 是一个旨在探索和实现大语言模型（LLM）本地化、高性能端侧推理的实验性项目。本项目的核心目标是通过自研推理引擎、应用量化技术以及实践前沿的解码算法，深入理解并优化LLM的推理性能。
+The repository began with the
+[LearningInfiniTensor Rust inference exercises](https://github.com/LearningInfiniTensor/learning-lm-rs)
+and evolved into this C++/CUDA implementation. Upstream exercises and external
+libraries must be distinguished from the engine's own implementation.
 
-在本项目中，我们依次完成了以下三个核心阶段的探索与评估。所有性能数据均为**五次测试中的最优结果**，以确保展示的是引擎在理想状态下的峰值性能。
+## Current status
 
----
+`master` is the maintained development branch. Historical source is preserved in Git history and the `legacy-before-restructure` tag. The
+repository name remains `LLM_infer`; the snapshot name does not define a new
+public project name.
 
-## 1. 核心引擎性能对决：`LLM_infer` vs. `llama.cpp`
+| Area | Status |
+| --- | --- |
+| Workspace planning and lifetime analysis | Standalone C++17 tests; no CUDA or Python dependency |
+| CUDA operators and `model_bridge` | CUDA build and direct operator tests validated; full model correctness remains pending |
+| Qwen/Qwen3 BF16 and AWQ paths | Implemented; not an established compatibility matrix |
+| Speculative decoding | Experimental; probability rejection/resampling needs a correctness review |
+| Desktop NVIDIA GPU | Current development target; historical measurements used RTX 4070 Laptop |
+| Jetson ARM64 / JetPack | Planned validation target; not verified or supported by this README |
 
-为了评估 `LLM_infer` 引擎的基础性能，我们将其与业界知名的 `llama.cpp` 在同等条件下进行了性能对比。
+Passing the workspace tests does not establish model correctness, GPU performance,
+or Jetson support. The existing Tensor-based operator test still requires the CUDA build
+because `Tensor` currently includes CUDA types. A CPU model product is not implied.
 
-**测试条件:**
-* **模型:** Qwen2.5 1.5B-Instruct-BF16
-* **硬件:** RTX4070Laptop
-* **参数:** `启用Flash Attention` `输出长度限制为201（包括prefill输出的1个token在内）` `top-k = 20`, `top-p = disabled`
+## Start with the workspace tests
 
+Requirements: CMake 3.20 or newer and a C++17 compiler. From this checkout:
 
+```sh
+cmake -S . -B build-cpu-tests \
+  -DLLM_INFER_BUILD_ENGINE=OFF -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Debug
+cmake --build build-cpu-tests --parallel 2
+ctest --test-dir build-cpu-tests --output-on-failure
+```
 
-| 性能指标 | `llama.cpp` | `LLM_infer` |
-| :--- | :--- | :--- |
-| **首次Prompt处理 (Prefill耗时)** | 23 tokens / 21.60 ms | **23 tokens / 17.94 ms** |
-| **首次Prompt处理速度 (Prefill)** | 1065.01 tokens/s | **1282.05 tokens/s (提速1.20x)** |
-| **内容生成 (Decoding耗时)** | 200 tokens / 2883.04 ms | **200 tokens / 2640.19 ms** |
-| **内容生成速度 (Decoding)** | 69.37 tokens/s | **75.75 tokens/s (提速1.09x)** |
-| | | |
-| **基准测试模式 (Prefill耗时)** | 200 tokens / 33.44 ms | **200 tokens / 28.02 ms (提速1.19x)** |
-| **基准测试模式 (Prefill速度)** | 5980.84 tokens/s | **7137.75 tokens/s** |
-| **基准测试模式 (Decoding速度)** | 69.47 tokens/s | **75.75 tokens/s (提速1.09x)** |
+On Linux or WSL, `bash scripts/test.sh` runs the same workflow. It does not fetch
+CUTLASS, install Python packages, download models, or initialize CUDA.
 
----
+Recorded check on 2026-10-04: three portable tests passed in WSL Ubuntu 24.04,
+using GCC 13.3 and CMake 3.28.3. The standalone CUDA library also built with
+GCC 12.4 / CUDA 12.0; all five tests passed, including float/BF16 GPU checks
+on RTX 4070 Laptop. See [validation](docs/validation-2026-10-04.md) for scope.
+The Docker recipe was not built.
 
-**附注**
+`scripts/test.sh` now runs these workspace unit tests instead of the historical matrix
+benchmark. That benchmark remains a separate target after an engine build:
 
-- **基准测试 (Benchmark) 模式**：指对于每个测试输入，都在正式计时前，先用完全相同的输入运行一遍，以充分预热缓存（如JIT编译缓存、cuBLAS算法缓存等）。
-- **内存分配**：以上所有测试数据，LLM_infer是在优化Prefill缓冲区参数的条件下获得，确保在处理过程中不会发生因VMM的缓冲区不足而触发的新的物理内存分配。
+```sh
+cmake --build build --target avx_matmul_bench --parallel 2
+./build/operators/benchmarks/avx_matmul_bench 1 512 512 512 3 5
+```
 
-**结论：**
-测试结果表明，`LLM_infer` 引擎在核心推理任务上表现出更高的性能。在处理输入提示的Prefill阶段，其速度是`llama.cpp`的 **1.20倍**；在持续生成内容的Decoding阶段，速度实现了 **1.09倍** 的提升。
+The historical target name is retained; it does not establish AVX acceleration
+or GPU inference performance.
 
----
+## CUDA development setup
 
-## 2. 量化技术探索：BF16 vs. AWQ 性能分析
+Use a Linux toolchain supported by the selected CUDA toolkit. The desktop
+container recipe uses CUDA 12.6.3 and Ubuntu 24.04. These are recipe inputs,
+and this CUDA 12.6 container configuration has not been validated. The recorded
+full engine build used CUDA 12.0; see the validation report above.
 
-在基础引擎之上，我们进一步探索了AWQ量化技术对性能的增益。
+Prerequisites: a suitable NVIDIA driver, CUDA toolkit with cuBLAS, CMake,
+a supported C++ compiler, Python development headers and a Python environment.
+The engine contains Linux-specific host code; native Windows support is not
+established. The compiler is selected by CMake instead of a hard-coded path.
 
-| 性能指标 (Performance Metric) | Qwen3 1.7B (BF16) | Qwen3 1.7B (AWQ) |
-| :--- | :--- | :--- |
-| **Prompt处理 (Prefill)** | 23 tokens / 24.26 ms | **23 tokens / 50.73 ms** |
-| **Prompt处理速度 (Prefill Speed)** | **956.31 tokens/s** | 453.38 tokens/s (0.47x) |
-| **内容生成 (Decoding)** | 200 tokens / 3104.76 ms | **200 tokens / 1980.37 ms** |
-| **内容生成速度 (Decoding Speed)**| 64.42 tokens/s | **100.99 tokens/s (1.57x)** |
+```sh
+git submodule update --init --recursive -- cutlass
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements-build.txt -r requirements-runtime.txt
+python -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+PYTHON_BIN=python bash scripts/build.sh -- -DCMAKE_CUDA_ARCHITECTURES=89
+ctest --test-dir build --output-on-failure
+```
 
-**结论分析：**
-* **解码性能显著提升：** AWQ量化将核心的解码速度提升至 **1.57倍**。这得益于模型体积减小带来的显存带宽优化。
-* **Prefill性能说明：** 本次测试中，AWQ版本的Prefill阶段性能有所下降。其主要原因是该阶段所依赖的GEMM实现为**朴素的WMMA版本**，优化尚不充分。我们相信在后续针对性地优化GEMM核后，此处的性能将得到大幅改善。
+The torch CPU wheel is sufficient for the current frontend's host-side weight
+loading; CUDA execution happens in the native module. Model quantization tools
+have additional dependencies and are outside this quickstart. Python versions
+and runtime dependency pins still need frontend and model-level validation.
+The Python 3.12 binding build and import have been checked.
 
-即使Prefill存在优化空间，AWQ在解码环节带来的巨大增益依然证明了其在提升LLM推理性能中的核心价值。
+`89` is the original Ada GPU target. Select the architecture for the actual
+device using `CMAKE_CUDA_ARCHITECTURES`; changing this number alone does not
+adapt the engine to Jetson. Jetson needs a matching JetPack/CUDA/compiler stack,
+ARM64 dependency wheels, model checks and measurements on the device.
 
----
+CUTLASS is pinned by the repository's gitlink. `scripts/build.sh` initializes that
+checkout when its headers are absent. An exported source tree can use an
+existing pinned checkout through `CUTLASS_DIR=/path/to/cutlass`. Build directories
+are reused; `--clean` invokes the build system's clean target.
 
-### 3. 投机解码性能评估
+## Model smoke test
 
-#### 3.1 实验概述
+After validating the full engine build, provide a local model directory with
+`config.json`, tokenizer files and safetensors weights. No model is downloaded
+by the build. This is a suggested manual smoke test, not a recorded passing run:
 
-我们评估了 `Qwen3 0.6B AWQ` 草稿模型对 `Qwen3 1.7B AWQ` 目标模型的加速效果。本节将基于实测数据，量化分析其性能表现。
+```sh
+PYTHON_BIN=python bash scripts/run.sh \
+  --model_path /absolute/path/to/Qwen3-1.7B \
+  --model_type qwen3_bf16 --device cuda \
+  --top_k 1 --temperature 1.0 --max_length 32
+```
 
-#### 3.2 核心性能数据分析
+Compare greedy outputs/logits with a reference implementation before making
+performance claims. AWQ and speculative decoding need separate numerical and
+sampling-distribution checks.
 
-要理解投机解码的效益，关键在于比较其单次迭代成本与收益。从日志中，我们提取了三个核心耗时数据：
+## Desktop container
 
-1.  **目标模型单Token解码耗时 (`T_baseline`)**: 约 **9ms**。
-    * 这是标准自回归解码（无投机）生成一个 token 的时间，是我们的性能基线。
+Initialize CUTLASS first so the Docker build uses the recorded revision:
 
-2.  **草稿生成耗时 (`T_draft`)**: 约 **30ms**。
-    * 这是草稿模型一次性生成 6-8 个候选 token 的总时间。
+```sh
+git submodule update --init --recursive -- cutlass
+docker build --build-arg CUDA_ARCHITECTURES=89 -t llm-infer-dev .
+docker run --rm -it --gpus all -v /absolute/path/to/models:/models:ro llm-infer-dev
+```
 
-3.  **目标模型验证耗时 (`T_verify`)**: 约 **55ms**。
-    * 这是目标模型一次并行处理全部草稿并且完成验证的开销。
+The recipe copies `operators/` and its test sources, and does not clone a moving
+CUTLASS revision. It has not been built as part of the standalone test check.
+It is a desktop development image, not a Jetson image.
 
-投机解码一次迭代的总成本是 `T_draft + T_verify ≈ 30ms + 55ms = 85ms`。
+## Code map and next work
 
-要实现加速，这次迭代的收益（`N_accepted` 个 token）必须高于基线成本：
+- `core/`: shared tensors, weight views, CUDA memory and portable workspace planning.
+- `runtime/include/execution/`: model execution programs and CUDA workspace integration.
+- `runtime/src/`: models, inference flow, KV-cache and CUDA Graph integration.
+- `operators/`: operator interfaces, CPU utilities, CUDA implementations and legacy kernels.
+- `bindings/python/`: model initialization, weight conversion and Python bindings.
+- `frontend/`: local model loading and terminal interaction.
+- `operators/tests/`: portable workspace and static reference checks, plus CUDA-dependent Tensor tests.
+- `tools/`: model analysis, quantization and manual reference checks.
+- `scripts/`: build, test, run and profiling entry points.
+- `docs/`: architecture, development directions and historical measurements.
 
-$$T_{draft} + T_{verify} < N_{accepted} \times T_{baseline}$$
-$$85ms < N_{accepted} \times 9ms$$
+Keep execution planning separate from model logic and CUDA kernel implementation.
+The next release gates are repeatable CUDA CI, broader GPU operator coverage,
+model-level greedy parity, a review of speculative resampling, and reproducible
+benchmarks. Platform-specific changes should follow measurements on the chosen
+NVIDIA device instead of speculative abstraction work.
 
-解得：
-$$N_{accepted} > 9.4$$
+## Measurements and license
 
-**结论：** 这意味着，平均每次迭代至少需要成功**接受 9 个**以上的草稿 token，投机解码才能实现正向收益。
+The [2025 experiment report](docs/benchmarks-2025.md) is preserved as historical
+material. It reported the best of five runs, without a complete baseline version
+and command record. Its speedups have not been reproduced for the maintained revision and
+are not current performance guarantees.
 
-然而完全无法达到这样的接受率。
+The project currently has no top-level license. Third-party components retain
+their own terms; the engine's license and attribution need to be resolved before
+a release intended for reuse.
+
+## Standalone operator library
+
+Build the portable API without the inference runtime, Python or CUDA:
+
+```sh
+cmake -S operators -B build-operators \
+  -DLLM_OPERATORS_ENABLE_CUDA=OFF -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Debug
+cmake --build build-operators --parallel 2
+ctest --test-dir build-operators --output-on-failure
+```
+
+This build uses the sibling `core/` directory. `operators_core` exposes
+non-owning views and inline reference functions. `unified_operators` contains
+CUDA kernels and the existing Tensor adapters. Direct CUDA calls are available for add, multiply, SiLU and RMSNorm.
+Those eager facade calls avoid factory lookup and virtual dispatch. Matmul and
+prepared-node execution retain dynamic dispatch. The static API adds no required
+shared ownership or operand allocation; CUDA launch overhead still applies. See [architecture](docs/architecture.md) and [roadmap](docs/roadmap.md).
+
+Keep documentation, comments and diagnostics in English. Model input data may
+contain any language. Develop against `master`, and validate fused operations
+against unfused references before replacing production calls.
+
+## Profiling
+
+Use the same model arguments as the run script; reports go to `data/` or the
+`PROFILE_DIR` you provide. The tools need the appropriate profiler permissions
+on your system.
+
+```sh
+bash scripts/profile.sh nsys --model_path /absolute/path/to/model --model_type qwen3_bf16
+bash scripts/profile.sh ncu --model_path /absolute/path/to/model --model_type qwen3_bf16
+```

@@ -1,59 +1,38 @@
-# --- 单阶段开发镜像 Dockerfile ---
-FROM nvidia/cuda:12.4.0-devel-ubuntu22.04
+# Desktop Linux development image. Jetson requires a JetPack-matched image.
+FROM nvidia/cuda:12.6.3-devel-ubuntu24.04
 
-# 安装系统依赖和开发工具
-RUN apt-get update && apt-get install -y \
-    cmake \
-    build-essential \
-    git \
-    software-properties-common \
-    curl \
-    python3.12 \
-    python3.12-dev \
-    python3.12-distutils && \
-    rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake python3 python3-dev python3-venv \
+    && rm -rf /var/lib/apt/lists/*
 
-# 设置 Python 3.12 为默认版本
-RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 && \
-    update-alternatives --set python3 /usr/bin/python3.12
+ENV VIRTUAL_ENV=/opt/venv
+RUN python3 -m venv "$VIRTUAL_ENV"
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-# 安装 pip 并升级 pip
-RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 && \
-    python3 -m pip install --no-cache-dir --upgrade pip
-
-# 安装开发所需的 Python 库（这里使用清华大学的镜像可以加速下载）
-RUN python3 -m pip install --no-cache-dir --ignore-installed --timeout=600 -i https://pypi.tuna.tsinghua.edu.cn/simple/ \
-    pybind11 safetensors tokenizers flask transformers numpy==1.26.4 && \
-    python3 -m pip install --no-cache-dir --ignore-installed --timeout=600 torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124 && \
-    python3 -m pip install --no-cache-dir --ignore-installed --timeout=600 -i https://pypi.tuna.tsinghua.edu.cn/simple/ autoawq==0.2.8
-
-# 设置工作目录为 /build_src，存放源码和编译过程
-WORKDIR /build_src
-
-# 复制工程源码到容器中
-COPY CMakeLists.txt CMakeLists.txt
-COPY backend/ backend/
-COPY frontend/ frontend/
-COPY interface/ interface/
-
-# 拉取 CUTLASS（固定版本更稳定）
-RUN git clone --recursive https://github.com/NVIDIA/cutlass.git
-
-# 编译阶段：自动获取 pybind11 的 CMake 配置路径传给 cmake，然后编译工程
-RUN mkdir build && cd build && \
-    cmake .. \
-        -DCMAKE_BUILD_TYPE=Release \
-        -Dpybind11_DIR="$(python3 -c 'import pybind11; print(pybind11.get_cmake_dir())')" && \
-    make -j$(nproc)
-
-# 整理产物：将生成的 .so 文件和 frontend 代码复制到 /app 下以便运行和调试
-# RUN mkdir -p /app && \
-#     cp build/model_bridge*.so /app/ && \
-#     cp -r frontend /app/
-
-# 设置最终工作目录为 /app，并设置 PYTHONPATH，保证 Python 能找到模块
 WORKDIR /app
-ENV PYTHONPATH=/app:/app/frontend:${PYTHONPATH}
+COPY requirements-build.txt requirements-runtime.txt ./
+# PyTorch is used here to read weights/tokenize input on the host. The native
+# inference module owns CUDA execution; quantization tooling is not included.
+RUN python -m pip install --no-cache-dir -r requirements-build.txt -r requirements-runtime.txt \
+    && python -m pip install --no-cache-dir torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
 
-# 进入开发容器后启动 bash
-CMD ["/bin/bash"]
+COPY CMakeLists.txt ./
+COPY core/ core/
+COPY runtime/ runtime/
+COPY operators/ operators/
+COPY bindings/ bindings/
+COPY frontend/ frontend/
+COPY scripts/ scripts/
+# Initialize the recorded CUTLASS submodule on the host before docker build.
+COPY cutlass/ cutlass/
+
+ARG CUDA_ARCHITECTURES=89
+ARG BUILD_JOBS=2
+RUN cmake -S . -B build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHITECTURES" \
+    -Dpybind11_DIR="$(python -m pybind11 --cmakedir)" \
+    && cmake --build build --parallel "$BUILD_JOBS"
+
+ENV PYTHONPATH=/app/build:/app/bindings/python
+CMD ["bash"]

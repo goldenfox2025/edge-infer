@@ -1,3 +1,4 @@
+// Attention entry points used during CUDA Graph execution. Sequence offsets are read from device state.
 // #define MULTIST
 
 #ifdef MULTIST
@@ -371,23 +372,21 @@ constexpr int WARP_SIZE = 32;
 
 namespace cuda_OP {
 
-// CUDA图优化版本的flash attention kernel
-// 直接从连续的KV缓存中读取数据，仿照flash_attention_variable的模式
+
 template <typename T>
 __global__ void flash_attention_kernel_decode(T *q,
-                                              const T *total_k,  // 连续的K缓存 [total_seq_len, n_kv_h, dqkv]
-                                              const T *total_v,  // 连续的V缓存 [total_seq_len, n_kv_h, dqkv]
-                                              T **output_ptrs,   // 固定的输出指针数组
+                                              const T *total_k,
+                                              const T *total_v,
+                                              T **output_ptrs,
                                               int *segment_info, int n_q_h, int n_kv_h, int dqkv, int B_c, int B_r,
                                               int n_groups, int T_r, float softmax_scale, int *pingpong_index) {
-    // 从设备内存读取分段信息
-    int total_seq_len = segment_info[*pingpong_index];
-    // segment_info[1] (active_branches) 已经无用，始终使用固定3分支
 
-    // 固定使用3分支模式，blockIdx.y就是分支索引(0,1,2)
+    int total_seq_len = segment_info[*pingpong_index];
+
+
     const int FIXED_BRANCHES = 3;
 
-    // 检查分支ID是否有效
+
     if (blockIdx.y >= FIXED_BRANCHES)
         return;
 
@@ -408,14 +407,14 @@ __global__ void flash_attention_kernel_decode(T *q,
 
     int cache_length = end_idx - start_idx;
 
-    // 如果分支长度为0，直接退出
+
     if (cache_length <= 0)
         return;
 
     int T_c = (cache_length + B_c - 1) / B_c;
     T *att_output = output_ptrs[blockIdx.y];
 
-    // 验证参数
+
     if (dqkv != DQKV_VALUE || B_c != B_C_VALUE)
         return;
 
@@ -450,7 +449,7 @@ __global__ void flash_attention_kernel_decode(T *q,
     float &global_m = s_lm[0];
     float &global_l = s_lm[1];
 
-    // 遍历 KV 分块
+
     for (int j = 0; j < T_c; ++j) {
         int token_index = j * B_c + token_tid;
         bool valid = (token_index < cache_length);
@@ -480,7 +479,7 @@ __global__ void flash_attention_kernel_decode(T *q,
 
         __syncthreads();
 
-        // Warp 内归约 QK Score
+
         int absolute_token_idx = start_idx + token_index;
         bool absolutely_valid = valid && (absolute_token_idx < total_seq_len);
 
@@ -525,7 +524,7 @@ __global__ void flash_attention_kernel_decode(T *q,
 
         __syncthreads();
 
-        // 求和归约
+
         unsigned int mask_sum = 0xFFFFFFFF;
         for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
             warp_val_l += __shfl_down_sync(mask_sum, warp_val_l, offset);
@@ -536,9 +535,9 @@ __global__ void flash_attention_kernel_decode(T *q,
         __syncthreads();
         float cur_l = cur_l_s;
 
-        // 计算部分输出
+
         if (j == 0) {
-            // 第一个块: 计算并直接写入 s_o
+
             if (token_tid == 0) {
                 for (int k_dim = d_tid; k_dim < DQKV_VALUE; k_dim += blockDim.x) {
                     float current_dim_partial_out = 0.0f;
@@ -555,7 +554,7 @@ __global__ void flash_attention_kernel_decode(T *q,
                 global_l = cur_l;
             }
         } else {
-            // 后续块: Online update
+
             float old_global_m = global_m;
             float old_global_l = global_l;
             float new_global_m = fmaxf(old_global_m, cur_m);
@@ -585,7 +584,7 @@ __global__ void flash_attention_kernel_decode(T *q,
         __syncthreads();
     }
 
-    // 写回 att_output
+
     if (threadIdx.y == 0) {
         int out_offset = head_id * (dqkv + 2);
         for (int i = d_tid; i < DQKV_VALUE; i += blockDim.x) {
@@ -598,13 +597,13 @@ __global__ void flash_attention_kernel_decode(T *q,
     }
 }
 
-// CUDA图优化版本：使用固定内存地址和分段信息的flash attention
+
 template <typename T>
 void flash_attention_graph_fixed(Tensor<T> &Q, const Tensor<T> &total_K, const Tensor<T> &total_V, T **d_output_ptrs,
                                  int *d_segment_info, int n_kv_heads, cudaStream_t stream, int *pingpong_index) {
     int dqkv = Q.sizes()[2];
     if (dqkv != DQKV_VALUE) {
-        throw std::runtime_error("dqkv 不匹配预定义的值");
+        throw std::runtime_error("dqkv does not match a supported specialization");
     }
 
     float softmax_scale = 1.0f / sqrtf(static_cast<float>(dqkv));
@@ -614,24 +613,24 @@ void flash_attention_graph_fixed(Tensor<T> &Q, const Tensor<T> &total_K, const T
     int T_r = 1;
     int B_c = B_C_VALUE;
 
-    // 设置kernel参数 - 强制使用3分支，类似flash_attention.cu的稳定模式
+
     const int FIXED_BRANCHES = 3;
     dim3 grid(n_q_h, FIXED_BRANCHES);
     dim3 block(32, B_c);
 
-    // 启动kernel
+
     flash_attention_kernel_decode<T><<<grid, block, 0, stream>>>(
         Q.data_ptr(), total_K.data_ptr(), total_V.data_ptr(), d_output_ptrs, d_segment_info, n_q_h, n_kv_heads, dqkv,
         B_c, B_r, n_groups, T_r, (softmax_scale), pingpong_index);
 
-    // 检查错误
+
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         throw std::runtime_error("CUDA error in flash_attention_graph_fixed: " + std::string(cudaGetErrorString(err)));
     }
 }
 
-// 显式模板实例化
+
 template void flash_attention_graph_fixed<float>(Tensor<float> &Q, const Tensor<float> &total_K,
                                                  const Tensor<float> &total_V, float **d_output_ptrs,
                                                  int *d_segment_info, int n_kv_heads, cudaStream_t stream,

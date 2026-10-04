@@ -82,7 +82,7 @@ __global__ void gqa_gemm_wmma_kernel(
             int load_col = load_idx % BK;
             int global_q_seq = block_q_seq_start + load_row;
             int global_q_dim = k_tile + load_col;
-            
+
             if (global_q_seq < seq_len && global_q_dim < head_dim) {
                 smemQ[load_idx] = q_head_ptr[global_q_seq * q_stride_seq + global_q_dim];
             } else {
@@ -96,7 +96,7 @@ __global__ void gqa_gemm_wmma_kernel(
             int load_col = load_idx % BK;
             int global_k_seq = block_k_seq_start + load_row;
             int global_k_dim = k_tile + load_col;
-            
+
             if (global_k_seq < total_seq_len && global_k_dim < head_dim) {
                 // Load K^T: transpose K matrix
                 smemK[load_col * BN + load_row] = k_head_ptr[global_k_seq * k_stride_seq + global_k_dim];
@@ -111,15 +111,15 @@ __global__ void gqa_gemm_wmma_kernel(
         for (int k_step = 0; k_step < BK; k_step += WMMA_K) {
             FragmentA fragA;
             FragmentB fragB;
-            
+
             // Load A fragment (Q)
             const T *smemA_ptr = smemQ + (warp_m * WMMA_M * BK) + k_step;
             wmma::load_matrix_sync(fragA, smemA_ptr, BK);
-            
+
             // Load B fragment (K^T)
             const T *smemB_ptr = smemK + (k_step * BN) + (warp_n * WMMA_N);
             wmma::load_matrix_sync(fragB, smemB_ptr, BN);
-            
+
             // Perform WMMA
             wmma::mma_sync(fragC, fragA, fragB, fragC);
         }
@@ -131,19 +131,19 @@ __global__ void gqa_gemm_wmma_kernel(
     const int out_m_base = warp_m * WMMA_M;
     const int out_n_base = warp_n * WMMA_N;
     wmma::store_matrix_sync(&smem_out[out_m_base * BN + out_n_base], fragC, BN, wmma::mem_row_major);
-    
+
     __syncthreads();
 
     // Write back to global memory with scaling
     for (int write_idx = threadIdx.x; write_idx < BM * BN; write_idx += blockDim.x) {
         int m_local = write_idx / BN;
         int n_local = write_idx % BN;
-        
+
         int global_q_seq = block_q_seq_start + m_local;
         int global_k_seq = block_k_seq_start + n_local;
-        
+
         if (global_q_seq < seq_len && global_k_seq < total_seq_len) {
-            int scores_offset = global_q_seq * (n_q_heads * total_seq_len) + 
+            int scores_offset = global_q_seq * (n_q_heads * total_seq_len) +
                                q_head_idx * total_seq_len + global_k_seq;
             float result = smem_out[write_idx] * scale;
             scores[scores_offset] = static_cast<T>(result);
@@ -208,9 +208,9 @@ __global__ void att_output_wmma_kernel(
             int load_col = load_idx % BK;
             int global_seq = block_seq_start + load_row;
             int global_cache = k_tile + load_col;
-            
+
             if (global_seq < seq_len && global_cache < cache_length) {
-                int att_idx = global_seq * (n_q_heads * cache_length) + 
+                int att_idx = global_seq * (n_q_heads * cache_length) +
                              q_head_idx * cache_length + global_cache;
                 smemA[load_idx] = att_probs[att_idx];
             } else {
@@ -224,9 +224,9 @@ __global__ void att_output_wmma_kernel(
             int load_col = load_idx % BN;
             int global_cache = k_tile + load_row;
             int global_dim = block_dim_start + load_col;
-            
+
             if (global_cache < cache_length && global_dim < head_dim) {
-                int v_idx = global_cache * (n_kv_heads * head_dim) + 
+                int v_idx = global_cache * (n_kv_heads * head_dim) +
                            kv_head_idx * head_dim + global_dim;
                 smemB[load_idx] = V[v_idx];
             } else {
@@ -240,15 +240,15 @@ __global__ void att_output_wmma_kernel(
         for (int k_step = 0; k_step < BK; k_step += WMMA_K) {
             FragmentA fragA;
             FragmentB fragB;
-            
+
             // Load A fragment (attention probabilities)
             const T *smemA_ptr = smemA + (warp_m * WMMA_M * BK) + k_step;
             wmma::load_matrix_sync(fragA, smemA_ptr, BK);
-            
+
             // Load B fragment (V)
             const T *smemB_ptr = smemB + (k_step * BN) + (warp_n * WMMA_N);
             wmma::load_matrix_sync(fragB, smemB_ptr, BN);
-            
+
             // Perform WMMA
             wmma::mma_sync(fragC, fragA, fragB, fragC);
         }
@@ -260,19 +260,19 @@ __global__ void att_output_wmma_kernel(
     const int out_m_base = warp_m * WMMA_M;
     const int out_n_base = warp_n * WMMA_N;
     wmma::store_matrix_sync(&smem_out[out_m_base * BN + out_n_base], fragC, BN, wmma::mem_row_major);
-    
+
     __syncthreads();
 
     // Write back to global memory
     for (int write_idx = threadIdx.x; write_idx < BM * BN; write_idx += blockDim.x) {
         int m_local = write_idx / BN;
         int n_local = write_idx % BN;
-        
+
         int global_seq = block_seq_start + m_local;
         int global_dim = block_dim_start + n_local;
-        
+
         if (global_seq < seq_len && global_dim < head_dim) {
-            int output_idx = global_seq * (n_q_heads * head_dim) + 
+            int output_idx = global_seq * (n_q_heads * head_dim) +
                            q_head_idx * head_dim + global_dim;
             att_output[output_idx] = static_cast<T>(smem_out[write_idx]);
         }
@@ -290,27 +290,27 @@ void launch_gqa_gemm_wmma(
     // Extract dimensions
     const auto &q_sizes = Q.sizes();
     const auto &k_sizes = K.sizes();
-    
+
     int seq_len = q_sizes[0];
     int n_q_heads = q_sizes[1];
     int head_dim = q_sizes[2];
     int total_seq_len = k_sizes[0];
     int n_kv_heads = k_sizes[1];
     int ratio = n_q_heads / n_kv_heads;
-    
+
     // WMMA configuration
     constexpr int BM = 64, BN = 64, BK = 32;
     constexpr int WMMA_M = 16, WMMA_N = 16, WMMA_K = 16;
     constexpr int WARP_CNT = (BM / WMMA_M) * (BN / WMMA_N);
-    
+
     // Launch configuration
     dim3 blockDim(WARP_CNT * WARP_SIZE);
-    dim3 gridDim((total_seq_len + BN - 1) / BN, 
-                 (seq_len + BM - 1) / BM, 
+    dim3 gridDim((total_seq_len + BN - 1) / BN,
+                 (seq_len + BM - 1) / BM,
                  n_q_heads);
-    
+
     float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-    
+
     // Launch kernel
     if constexpr (std::is_same_v<T, __nv_bfloat16> || std::is_same_v<T, __half>) {
         gqa_gemm_wmma_kernel<T, BM, BN, BK, WMMA_M, WMMA_N, WMMA_K, WARP_CNT>
@@ -320,10 +320,10 @@ void launch_gqa_gemm_wmma(
     } else {
         throw std::runtime_error("WMMA requires half or bfloat16 precision");
     }
-    
+
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        throw std::runtime_error("WMMA GQA GEMM launch failed: " + 
+        throw std::runtime_error("WMMA GQA GEMM launch failed: " +
                                 std::string(cudaGetErrorString(err)));
     }
 }
@@ -343,18 +343,18 @@ void launch_att_output_wmma(
     int seq_len = att_probs.sizes()[0];
     int cache_length = att_probs.sizes()[2];
     int head_dim = V.sizes()[2];
-    
+
     // WMMA configuration
     constexpr int BM = 32, BN = 64, BK = 32;
     constexpr int WMMA_M = 16, WMMA_N = 16, WMMA_K = 16;
     constexpr int WARP_CNT = (BM / WMMA_M) * (BN / WMMA_N);
-    
+
     // Launch configuration
     dim3 blockDim(WARP_CNT * WARP_SIZE);
-    dim3 gridDim((seq_len + BM - 1) / BM, 
-                 (head_dim + BN - 1) / BN, 
+    dim3 gridDim((seq_len + BM - 1) / BM,
+                 (head_dim + BN - 1) / BN,
                  n_q_heads);
-    
+
     // Launch kernel
     if constexpr (std::is_same_v<T, __nv_bfloat16> || std::is_same_v<T, __half>) {
         att_output_wmma_kernel<T, BM, BN, BK, WMMA_M, WMMA_N, WMMA_K, WARP_CNT>
@@ -364,10 +364,10 @@ void launch_att_output_wmma(
     } else {
         throw std::runtime_error("WMMA requires half or bfloat16 precision");
     }
-    
+
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        throw std::runtime_error("WMMA attention output launch failed: " + 
+        throw std::runtime_error("WMMA attention output launch failed: " +
                                 std::string(cudaGetErrorString(err)));
     }
 }
@@ -388,7 +388,7 @@ void compute_attention_scores_prefill_wmma(
             return;
         }
     }
-    
+
     // Fallback to original implementation
     launch_gqa_gemm(Q, K, att_scores, stream);
 }
@@ -411,7 +411,7 @@ void compute_att_output_prefill_wmma(
             return;
         }
     }
-    
+
     // Fallback to original implementation
     compute_att_output_prefill(att_probs, V, att_output, n_q_heads, head_dim, total_seq_len, n_kv_heads, stream);
 }
@@ -423,17 +423,17 @@ template void compute_attention_scores_prefill_wmma<__half>(
     const Tensor<__half> &, const Tensor<__half> &, Tensor<__half> &, size_t, cudaStream_t);
 
 template void compute_att_output_prefill_wmma<__nv_bfloat16>(
-    const Tensor<__nv_bfloat16> &, const Tensor<__nv_bfloat16> &, Tensor<__nv_bfloat16> &, 
+    const Tensor<__nv_bfloat16> &, const Tensor<__nv_bfloat16> &, Tensor<__nv_bfloat16> &,
     size_t, size_t, size_t, size_t, cudaStream_t);
 template void compute_att_output_prefill_wmma<__half>(
-    const Tensor<__half> &, const Tensor<__half> &, Tensor<__half> &, 
+    const Tensor<__half> &, const Tensor<__half> &, Tensor<__half> &,
     size_t, size_t, size_t, size_t, cudaStream_t);
 
 // Add missing float template instantiation for WMMA functions
 template void compute_attention_scores_prefill_wmma<float>(
     const Tensor<float> &, const Tensor<float> &, Tensor<float> &, size_t, cudaStream_t);
 template void compute_att_output_prefill_wmma<float>(
-    const Tensor<float> &, const Tensor<float> &, Tensor<float> &, 
+    const Tensor<float> &, const Tensor<float> &, Tensor<float> &,
     size_t, size_t, size_t, size_t, cudaStream_t);
 
 }  // namespace cuda_OP

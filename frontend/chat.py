@@ -10,7 +10,6 @@ from pathlib import Path
 from safetensors import safe_open
 import torch
 
-# 检查是否安装了可选依赖
 TRANSFORMERS_AVAILABLE = False
 try:
     from transformers import AutoTokenizer
@@ -18,7 +17,6 @@ try:
 except ImportError:
     pass
 
-# 检查是否安装了tokenizers库
 TOKENIZERS_AVAILABLE = False
 try:
     from tokenizers import Tokenizer
@@ -27,28 +25,26 @@ except ImportError:
     pass
 
 # -------------------------------
-# 模型加载相关函数
+
 # -------------------------------
 
 def load_llama_model(model_path: str):
-    """加载 Llama 模型及配置"""
+    """Load the Llama model weights and configuration."""
     model_path = Path(model_path)
     weights = {}
 
-    # 加载模型权重
     with safe_open(model_path / "model.safetensors", framework="pt") as f:
         for key in f.keys():
             tensor = f.get_tensor(key)
-            # 如果是 bfloat16，则转换为 float32
+            # if bfloat16, then convert to float32
             if tensor.dtype == torch.bfloat16:
                 tensor = tensor.to(torch.float32)
             weights[key] = tensor
             print(f"Loaded tensor {key} with shape {weights[key].shape}")
 
-    # 加载配置文件
     with open(model_path / "config.json", 'r') as f:
         config = json.load(f)
-        # 若缺少 embedding_table，则采用 lm_head 权重
+
         if "model.embed_tokens.weight" not in weights:
             config["tie_word_embeddings"] = True
             weights["model.embed_tokens.weight"] = weights["lm_head.weight"]
@@ -57,31 +53,29 @@ def load_llama_model(model_path: str):
     return config, weights, "llama"
 
 def load_qwen_model(model_path: str, keep_bf16=True, is_awq=False):
-    """加载 Qwen 模型及配置，可选保持 BF16 精度或加载 AWQ 量化模型"""
+    """Load Qwen weights and configuration, preserving BF16 or AWQ when requested."""
     model_path = Path(model_path)
     weights = {}
 
-    # 加载模型权重
     with safe_open(model_path / "model.safetensors", framework="pt") as f:
         for key in f.keys():
             tensor = f.get_tensor(key)
 
-            # 如果是AWQ量化模型，需要区分量化权重和非量化权重
             if is_awq:
-                # 检查是否是量化权重（qweight、scales、qzeros）
+
                 if any(suffix in key for suffix in [".qweight", ".scales", ".qzeros"]):
-                    # 量化权重保持原始格式
+                    # Keep quantized weights in their original representation
                     weights[key] = tensor
                     print(f"Loaded AWQ quantized tensor {key} with shape {tensor.shape} and dtype {tensor.dtype}")
                 else:
-                    # 非量化权重根据keep_bf16参数决定是否转换
+
                     if tensor.dtype == torch.bfloat16 and keep_bf16:
                         weights[key] = tensor
                         print(f"Loaded AWQ non-quantized bf16 tensor {key} with shape {tensor.shape}")
                     else:
                         weights[key] = tensor.to(torch.float32)
                         print(f"Loaded AWQ non-quantized fp32 tensor {key} with shape {weights[key].shape}")
-            # 非AWQ模型处理
+
             elif tensor.dtype == torch.bfloat16 and keep_bf16:
                 weights[key] = tensor
                 print(f"Loaded bf16 tensor {key} with shape {tensor.shape}")
@@ -89,7 +83,6 @@ def load_qwen_model(model_path: str, keep_bf16=True, is_awq=False):
                 weights[key] = tensor.to(torch.float32)
                 print(f"Loaded tensor {key} with shape {weights[key].shape}")
 
-    # 加载配置文件
     with open(model_path / "config.json", 'r') as f:
         config = json.load(f)
         expected_keys = [
@@ -103,22 +96,20 @@ def load_qwen_model(model_path: str, keep_bf16=True, is_awq=False):
                 print(f"Warning: {key} not found in config")
         print("Config loaded:", config)
 
-        # 如果是AWQ模型，添加量化相关配置
         if is_awq:
-            # 检查是否有AWQ相关配置
+
             if "quantization_config" in config:
                 quant_config = config["quantization_config"]
                 if "group_size" in quant_config:
                     config["group_size"] = quant_config["group_size"]
                     print(f"Using group_size from config: {config['group_size']}")
                 else:
-                    config["group_size"] = 128  # 默认值
+                    config["group_size"] = 128 # Default value
                     print(f"Using default group_size: {config['group_size']}")
             else:
-                config["group_size"] = 128  # 默认值
+                config["group_size"] = 128 # Default value
                 print(f"Using default group_size: {config['group_size']}")
 
-    # 根据模型类型返回不同的标识符
     if is_awq:
         model_type = "qwen_awq"
     else:
@@ -127,176 +118,160 @@ def load_qwen_model(model_path: str, keep_bf16=True, is_awq=False):
     return config, weights, model_type
 
 def load_qwen3_model(model_path: str, keep_bf16=True, is_awq=False):
-    """加载 Qwen3 模型及配置，可选保持 BF16 精度或加载 AWQ 量化模型"""
+    """Load Qwen3 weights and configuration, preserving BF16 or AWQ when requested."""
     model_path = Path(model_path)
     weights = {}
     verbose_weights = os.environ.get("LLM_INFER_VERBOSE_WEIGHTS") == "1"
 
-    # 首先检查和加载索引文件
     index_path = model_path / "model.safetensors.index.json"
     if index_path.exists():
-        print(f"找到模型索引文件: {index_path}")
+        print(f"Found the model index file: {index_path}")
         with open(index_path, 'r') as f:
             index_data = json.load(f)
             weight_map = index_data.get("weight_map", {})
-            
-        # 按文件分组权重，以便一次性加载每个文件的所有权重
+
         weights_by_file = {}
         for key, file_name in weight_map.items():
             if file_name not in weights_by_file:
                 weights_by_file[file_name] = []
             weights_by_file[file_name].append(key)
-            
-        # 加载每个文件中的权重
+
         for file_name, keys in weights_by_file.items():
             file_path = model_path / file_name
             if verbose_weights:
-                print(f"从文件加载权重: {file_path}")
-            
+                print(f"Load weights from a file: {file_path}")
+
             with safe_open(file_path, framework="pt") as f:
                 for key in keys:
                     tensor = f.get_tensor(key)
-                    
-                    # 如果是AWQ量化模型，需要区分量化权重和非量化权重
+
                     if is_awq:
-                        # 检查是否是量化权重（qweight、scales、qzeros）
+
                         if any(suffix in key for suffix in [".qweight", ".scales", ".qzeros"]):
-                            # 量化权重保持原始格式
+                            # Keep quantized weights in their original representation
                             weights[key] = tensor
                             if verbose_weights:
-                                print(f"加载AWQ量化张量 {key}，形状 {tensor.shape}，数据类型 {tensor.dtype}")
+                                print(f"Load AWQ quantized tensor {key}, Shape {tensor.shape}, Data type {tensor.dtype}")
                         else:
-                            # 非量化权重根据keep_bf16参数决定是否转换
+
                             if tensor.dtype == torch.bfloat16 and keep_bf16:
                                 weights[key] = tensor
                                 if verbose_weights:
-                                    print(f"加载AWQ非量化bf16张量 {key}，形状 {tensor.shape}")
+                                    print(f"Load AWQ non-quantized bf16 Tensor {key}, Shape {tensor.shape}")
                             else:
                                 weights[key] = tensor.to(torch.float32)
                                 if verbose_weights:
-                                    print(f"加载AWQ非量化fp32张量 {key}，形状 {weights[key].shape}")
-                    # 非AWQ模型处理
+                                    print(f"Load AWQ non-quantized fp32 Tensor {key}, Shape {weights[key].shape}")
+
                     elif tensor.dtype == torch.bfloat16 and keep_bf16:
                         weights[key] = tensor
                         if verbose_weights:
-                            print(f"加载bf16张量 {key}，形状 {tensor.shape}")
+                            print(f"Load bf16 Tensor {key}, Shape {tensor.shape}")
                     else:
                         weights[key] = tensor.to(torch.float32)
                         if verbose_weights:
-                            print(f"加载张量 {key}，形状 {weights[key].shape}")
+                            print(f"Load tensor {key}, Shape {weights[key].shape}")
     else:
-        # 尝试从单个文件加载，保持向后兼容性
+
         safetensors_path = model_path / "model.safetensors"
         if not safetensors_path.exists():
-            raise FileNotFoundError(f"未找到模型权重文件: 既没有索引文件 {index_path}，也没有单一权重文件 {safetensors_path}")
-            
+            raise FileNotFoundError(f"Model weight file not found: Neither an index file {index_path}, and no single weight file {safetensors_path}")
+
         if verbose_weights:
-            print(f"未找到索引文件，尝试从单一文件加载: {safetensors_path}")
+            print(f"Index file not found, Trying to load from a single file: {safetensors_path}")
         with safe_open(safetensors_path, framework="pt") as f:
             for key in f.keys():
                 tensor = f.get_tensor(key)
 
-                # 如果是AWQ量化模型，需要区分量化权重和非量化权重
                 if is_awq:
-                    # 检查是否是量化权重（qweight、scales、qzeros）
+
                     if any(suffix in key for suffix in [".qweight", ".scales", ".qzeros"]):
-                        # 量化权重保持原始格式
+                        # Keep quantized weights in their original representation
                         weights[key] = tensor
                         if verbose_weights:
-                            print(f"加载AWQ量化张量 {key}，形状 {tensor.shape}，数据类型 {tensor.dtype}")
+                            print(f"Load AWQ quantized tensor {key}, Shape {tensor.shape}, Data type {tensor.dtype}")
                     else:
-                        # 非量化权重根据keep_bf16参数决定是否转换
+
                         if tensor.dtype == torch.bfloat16 and keep_bf16:
                             weights[key] = tensor
                             if verbose_weights:
-                                print(f"加载AWQ非量化bf16张量 {key}，形状 {tensor.shape}")
+                                print(f"Load AWQ non-quantized bf16 Tensor {key}, Shape {tensor.shape}")
                         else:
                             weights[key] = tensor.to(torch.float32)
                             if verbose_weights:
-                                print(f"加载AWQ非量化fp32张量 {key}，形状 {weights[key].shape}")
-                # 非AWQ模型处理
+                                print(f"Load AWQ non-quantized fp32 Tensor {key}, Shape {weights[key].shape}")
+
                 elif tensor.dtype == torch.bfloat16 and keep_bf16:
                     weights[key] = tensor
                     if verbose_weights:
-                        print(f"加载bf16张量 {key}，形状 {tensor.shape}")
+                        print(f"Load bf16 Tensor {key}, Shape {tensor.shape}")
                 else:
                     weights[key] = tensor.to(torch.float32)
                     if verbose_weights:
-                        print(f"加载张量 {key}，形状 {weights[key].shape}")
+                        print(f"Load tensor {key}, Shape {weights[key].shape}")
 
-    # 加载配置文件
     config_path = model_path / "config.json"
     if verbose_weights:
-        print(f"正在读取配置文件: {config_path}")
+        print(f"Reading the configuration file: {config_path}")
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
             config_str = f.read()
             if verbose_weights:
-                print(f"原始配置内容的前100个字符: {config_str[:100]}...")
+                print(f"First 100 characters: {config_str[:100]}...")
             config = json.loads(config_str)
             if verbose_weights:
-                print("成功加载配置文件")
+                print("Configuration loaded successfully")
     except Exception as e:
-        print(f"加载配置文件时出错: {e}")
+        print(f"Failed to load the configuration file: {e}")
         raise
 
-    # 打印原始配置内容
     if verbose_weights:
-        print("原始配置内容:")
+        print("Original configuration:")
         for key, value in config.items():
             print(f"  {key}: {value}")
 
-    # 创建C++接口所需的配置字典
     cpp_config = {}
-    
-    # 直接复制所有原始配置（确保所有键都存在）
+
     for key, value in config.items():
         cpp_config[key] = value
-    
-    # 特殊映射键名，同时保留原键名和映射后的键名
+
     key_mapping = {
         "num_hidden_layers": "n_layers",
         "num_attention_heads": "n_heads",
         "num_key_value_heads": "n_kv_heads"
     }
-    
-    # 添加映射后的键名
+
     for orig_key, new_key in key_mapping.items():
         if orig_key in config:
             cpp_config[new_key] = config[orig_key]
             if verbose_weights:
-                print(f"添加映射键: {orig_key} -> {new_key}: {config[orig_key]}")
+                print(f"Add mapped key: {orig_key} -> {new_key}: {config[orig_key]}")
 
-    
-    # 添加量化相关配置
     if is_awq:
         cpp_config["quant_type"] = 1
-        
-        # 检查是否有AWQ相关配置
+
         if "quantization_config" in config:
             quant_config = config["quantization_config"]
             if "group_size" in quant_config:
                 cpp_config["group_size"] = quant_config["group_size"]
                 if verbose_weights:
-                    print(f"使用配置中的group_size: {cpp_config['group_size']}")
+                    print(f"Using the configured group_size: {cpp_config['group_size']}")
             else:
-                cpp_config["group_size"] = 128  # 默认值
+                cpp_config["group_size"] = 128 # Default value
                 if verbose_weights:
-                    print("使用默认group_size: 128")
+                    print("Using the default group_size: 128")
         else:
-            cpp_config["group_size"] = 128  # 默认值
+            cpp_config["group_size"] = 128 # Default value
             if verbose_weights:
-                print("使用默认group_size: 128")
+                print("Using the default group_size: 128")
     else:
         cpp_config["quant_type"] = 0
-    
-    # 打印最终配置
+
     if verbose_weights:
-        print("最终配置:")
+        print("Final configuration:")
         for key, value in cpp_config.items():
             print(f"  {key}: {value}")
 
-    # 根据模型类型返回不同的标识符
     if is_awq:
         model_type = "qwen3_awq"
     else:
@@ -305,7 +280,7 @@ def load_qwen3_model(model_path: str, keep_bf16=True, is_awq=False):
     return cpp_config, weights, model_type
 
 def load_tokenizer(model_path: str, model_type: str):
-    """根据模型类型加载对应的 tokenizer"""
+    """Load the tokenizer for the selected model type."""
     model_path = Path(model_path)
 
     if model_type.startswith("qwen"):
@@ -325,17 +300,13 @@ def load_tokenizer(model_path: str, model_type: str):
     return tokenizer
 
 # -------------------------------
-# 回调函数：仅返回 token_id（轻量化回调）
+
 # -------------------------------
 def create_callback(q: queue.Queue):
-    """
-    创建用于处理生成 token 的回调函数。
-    该回调函数只将 token_id 放入队列，不进行解码和统计。
-    """
+    """Enqueue generated token IDs without decoding or collecting statistics."""
     def token_callback(token_id):
         q.put(token_id)
     return token_callback
-
 
 def decode_stream_incremental(tokenizer, token_ids, rendered_text: str):
     decode_kwargs = {"skip_special_tokens": False}
@@ -359,23 +330,22 @@ def decode_stream_incremental(tokenizer, token_ids, rendered_text: str):
     return pending_suffix, decoded_text
 
 # -------------------------------
-# 终端聊天实现
+
 # -------------------------------
 def main():
-    parser = argparse.ArgumentParser(description='LLaMA/Qwen/Qwen3 模型聊天')
-    parser.add_argument('--model_path', type=str, default="./models/Qwen3-1.7B-AWQ", help='模型路径')
-    parser.add_argument('--model_type', type=str, default="qwen3_awq", 
-                       choices=['llama', 'qwen', 'qwen_bf16', 'qwen_awq', 'qwen3_bf16', 'qwen3_awq'], 
-                       help='模型类型')
-    parser.add_argument('--device', type=str, default="cuda", choices=['cuda', 'cpu'], help='运行设备 (cuda 或 cpu)') # qwen不支持cpu 会强制使用cuda
-    parser.add_argument('--system_prompt', type=str, default="You are a helpful AI assistant.", help='系统提示词')
-    parser.add_argument('--max_length', type=int, default=424, help='生成文本的最大长度')
-    parser.add_argument('--temperature', type=float, default=0.7, help='生成温度')
-    parser.add_argument('--top_p', type=float, default=1, help='top-p 采样阈值')
-    parser.add_argument('--top_k', type=int, default=20, help='top-k 采样阈值')
+    parser = argparse.ArgumentParser(description="LLaMA/Qwen/Qwen3 model chat")
+    parser.add_argument('--model_path', type=str, default="./models/Qwen3-1.7B-AWQ", help="Model path")
+    parser.add_argument('--model_type', type=str, default="qwen3_awq",
+                       choices=['llama', 'qwen', 'qwen_bf16', 'qwen_awq', 'qwen3_bf16', 'qwen3_awq'],
+                       help="Model type")
+    parser.add_argument('--device', type=str, default="cuda", choices=['cuda', 'cpu'], help="Execution device (cuda or cpu)")
+    parser.add_argument('--system_prompt', type=str, default="You are a helpful AI assistant.", help="System prompt")
+    parser.add_argument('--max_length', type=int, default=424, help="Maximum generated-text length")
+    parser.add_argument('--temperature', type=float, default=0.7, help="Sampling temperature")
+    parser.add_argument('--top_p', type=float, default=1, help="top-p sampling threshold")
+    parser.add_argument('--top_k', type=int, default=20, help="top-k sampling threshold")
     args = parser.parse_args()
 
-    # 加载模型和 tokenizer
     if args.model_type == "llama":
         config, weights, model_type = load_llama_model(args.model_path)
     elif args.model_type == "qwen":
@@ -394,12 +364,10 @@ def main():
 
     tokenizer = load_tokenizer(args.model_path, model_type)
 
-    # 计算并打印模型大小
     total_params = sum(t.numel() for t in weights.values())
     total_bytes = sum(t.element_size() * t.numel() for t in weights.values())
     print("\nModel size: {} parameters, {:.2f} MB".format(total_params, total_bytes / (1024 * 1024)))
 
-    # 打印模型配置信息
     print("\nModel Configuration:")
     print(f"Model Type: {model_type}")
     if model_type.startswith("qwen"):
@@ -407,8 +375,7 @@ def main():
         if "awq" in model_type:
             precision += " (AWQ Quantized)"
         print(f"Precision: {precision}")
-    
-    # 显示模型配置
+
     if model_type.startswith("qwen3"):
         print(f"Hidden Size: {config['hidden_size']}")
         print(f"Num Layers: {config['n_layers']}")
@@ -420,36 +387,31 @@ def main():
         print(f"Num Attention Heads: {config['num_attention_heads']}")
         print(f"Num Key Value Heads: {config['num_key_value_heads']}")
         print(f"Head Dimension: {config['hidden_size'] // config['num_attention_heads']}")
-    
+
     print(f"Requested Device: {args.device}")
 
-    # 导入 C++ 模型桥接接口
-    sys.path.append("./build")
+    repo_root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, os.environ.get("BUILD_DIR", str(repo_root / "build")))
     from model_bridge import init_model, generate_text_stream, set_default_device, get_default_device
 
-    # 导入设备配置模块
-    sys.path.append("./interface")
+    sys.path.insert(0, str(repo_root / "bindings" / "python"))
     import device_config
 
-    # 设置默认设备
-    print(f"\n设置默认设备为: {args.device}")
+    print(f"\nSet the default device to: {args.device}")
     if not set_default_device(args.device):
-        print(f"设置设备 {args.device} 失败，使用默认设备", file=sys.stderr)
+        print(f"Failed to set device {args.device}; using the default device", file=sys.stderr)
 
-    # 打印当前设备
     current_device = get_default_device()
-    print(f"当前使用设备: {current_device}")
+    print(f"Current device: {current_device}")
 
-    # 初始化模型
     if not init_model(config, weights, model_type):
         print("Model initialization failed.", file=sys.stderr)
         exit(1)
     print("\nModel initialized successfully.\n")
 
-    # 记录是否是首次对话
     first_chat = True
 
-    print("聊天已启动。输入'quit'或'exit'退出。\n")
+    print("Chat started. Type 'quit' or 'exit' to quit.\n")
 
     while True:
         user_message = input("User: ").strip()
@@ -458,7 +420,6 @@ def main():
         if not user_message:
             continue
 
-        # 根据模型类型构造对话文本（仅传输当前消息，历史记录由本地维护 kvcache）
         if model_type.startswith("qwen"):
             if first_chat:
                 messages = [
@@ -469,7 +430,6 @@ def main():
             else:
                 messages = [{"role": "user", "content": user_message}]
 
-            # 使用 apply_chat_template 应用聊天模板
             text = tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
@@ -494,7 +454,6 @@ def main():
                 model_inputs = tokenizer([conversation], return_tensors="pt")
                 input_ids = model_inputs["input_ids"][0].tolist()
 
-        # 生成回复：使用 minimal callback 只返回 token_id
         q = queue.Queue()
         callback = create_callback(q)
 
@@ -508,14 +467,14 @@ def main():
                 top_p=args.top_p,
                 top_k=args.top_k
             )
-            q.put(None)  # 生成结束标记
+            q.put(None)
 
         thread = threading.Thread(target=run_generation)
         thread.start()
 
         print("Assistant: ", end="", flush=True)
 
-        # 在主线程中累积 token_id 并进行解码与统计
+        # Decode tokens and collect timing statistics in the main thread.
         accumulated_tokens = []
         rendered_text = ""
         start_time = None
@@ -529,10 +488,10 @@ def main():
             current_time = time.monotonic()
             if start_time is None:
                 start_time = current_time
-            # 计算每个token的生成时间（仅用于调试）
+
             if last_token_time is not None:
                 token_time = current_time - last_token_time
-                # 如果需要打印每个token的生成时间，可以取消下面的注释
+
                 # print(f"Token time: {token_time:.4f}s", end="\r", flush=True)
             last_token_time = current_time
 

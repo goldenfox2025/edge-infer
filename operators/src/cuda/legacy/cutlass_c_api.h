@@ -17,7 +17,7 @@ extern "C" {
 void cutlass_gemm_c_api(int m, int n, int k, my_cutlass_dtype_t dtype, const void* ptr_a, const void* ptr_b,
                         const void* ptr_bias, void* ptr_d, cudaStream_t stream);
 
-// 辅助函数：将状态码转换为字符串
+
 const char* cutlass_status_to_string(my_cutlass_status_t status);
 
 #ifdef __cplusplus

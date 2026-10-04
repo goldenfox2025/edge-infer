@@ -1,4 +1,10 @@
 .git
+**/.git
 build/
+build-*/
+.venv/
+models/
+__pycache__/
+**/__pycache__/
 .vscode/
 *~

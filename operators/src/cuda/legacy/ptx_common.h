@@ -1,3 +1,4 @@
+// PTX matrix-multiply helpers. The m16n16k16 operation is assembled from two m16n8k16 instructions.
 
 
 #define INT4(value) (reinterpret_cast<int4 *>(&(value))[0])
@@ -77,7 +78,7 @@
         : "=r"(RD0), "=r"(RD1), "=r"(RD2), "=r"(RD3)                                        \
         : "r"(RA0), "r"(RA1), "r"(RA2), "r"(RA3), "r"(RB0), "r"(RB1), "r"(RC0), "r"(RC1), "r"(RC2), "r"(RC3))
 
-// mma m16n16k16 - 使用两个16x8x16指令来实现
+
 #define MMA161616_BF16(RD0, RD1, RD2, RD3, RD4, RD5, RD6, RD7, RA0, RA1, RA2, RA3, RB0, RB1, RB2, RB3, RC0, RC1, RC2, \
                        RC3, RC4, RC5, RC6, RC7)                                                                       \
     do {                                                                                                              \

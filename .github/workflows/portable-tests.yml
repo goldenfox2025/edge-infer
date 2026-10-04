@@ -1,0 +1,36 @@
+name: Portable tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  portable:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build portable project tests
+        run: |
+          cmake -S . -B build-cpu-tests -DLLM_INFER_BUILD_ENGINE=OFF -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build-cpu-tests --parallel 2
+          ctest --test-dir build-cpu-tests --output-on-failure
+      - name: Build standalone operator tests
+        run: |
+          cmake -S operators -B build-operators -DLLM_OPERATORS_ENABLE_CUDA=OFF -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build-operators --parallel 2
+          ctest --test-dir build-operators --output-on-failure
+      - name: Check Python and shell syntax
+        run: |
+          python3 - <<'PY'
+          import ast
+          from pathlib import Path
+          for directory in ('frontend', 'bindings', 'tools'):
+              for source in Path(directory).rglob('*.py'):
+                  ast.parse(source.read_text(encoding='utf-8'), filename=str(source))
+          PY
+          for script in scripts/*.sh; do bash -n "$script"; done

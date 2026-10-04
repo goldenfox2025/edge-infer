@@ -7,16 +7,15 @@
 
 namespace op {
 
-// 实现MatmulCPUOperator的operator()方法
 template <typename T>
 void MatmulCPUOperator<T>::operator()(Tensor<T>* output, Tensor<T>* input, const WeightTensor<T>& weight,
                                       const Tensor<T>* bias, cudaStream_t stream) {
-    // 确保权重不是量化的
+
     if (weight.is_quantized()) {
         throw std::runtime_error("CPU MatMul does not support quantized weights");
     }
 
-    // 检查是否是BF16类型，CPU不支持BF16
+    // These compatibility adapters do not support BF16 on the CPU.
     if constexpr (std::is_same_v<T, __nv_bfloat16>) {
         throw std::runtime_error("MatMul operator for __nv_bfloat16 not supported on CPU platform");
     } else {
@@ -74,7 +73,6 @@ void MatmulCPUOperator<T>::operator()(Tensor<T>* output, Tensor<T>* input, const
     }
 }
 
-// 显式模板实例化
 template class MatmulCPUOperator<float>;
 template class MatmulCPUOperator<__nv_bfloat16>;
 

@@ -1,3 +1,4 @@
+// Fused residual addition and RMS normalization. Reduce the squared sum before applying the shared inverse RMS.
 #include <cuda_bf16.h>  // Required for nv_bfloat16, nv_bfloat162, __hadd2 (though hadd2 is unused correctly now)
 #include <cuda_runtime.h>
 #include <math.h>
@@ -14,7 +15,7 @@
 #include "cuda/legacy/legacy_cuda_api.cuh"
 
 namespace cuda_OP {
-// warp_reduce_sum 函数保持不变
+
 __device__ inline float warp_reduce_sum(float val) {
     for (int offset = 32 / 2; offset > 0; offset /= 2) {
         val += __shfl_down_sync(__activemask(), val, offset);
@@ -24,7 +25,7 @@ __device__ inline float warp_reduce_sum(float val) {
 
 template <typename T>
 __global__ void add_rms_kernel(T *output, T *input, const T *add_, const T *weight, float eps, size_t row_size) {
-    // 获取当前 block 和 thread 的 ID
+
     int row = blockIdx.x;
     int tid = threadIdx.x;
     int nthreads = blockDim.x;
@@ -40,7 +41,7 @@ __global__ void add_rms_kernel(T *output, T *input, const T *add_, const T *weig
     for (size_t i = tid; i < row_size; i += nthreads) {
         val[flag++] = static_cast<float>(in_row[i] + add_row[i]);
 
-        // 累加平方和
+
         local_sum += val[flag - 1] * val[flag - 1];
     }
 
@@ -68,7 +69,7 @@ __global__ void add_rms_kernel(T *output, T *input, const T *add_, const T *weig
         s_inv_rms = rsqrtf(rsqrt_arg);
     }
     __syncthreads();
-    float inv_rms = s_inv_rms;  // 所有线程获取计算好的 inv_rms
+    float inv_rms = s_inv_rms;
     flag = 0;
     for (size_t i = tid; i < row_size; i += nthreads) {
         if (i < row_size) {
@@ -90,7 +91,7 @@ void add_rms(Tensor<T> *output, Tensor<T> *input, const Tensor<T> *add_, const T
     size_t d = input->sizes()[1];  // row_size
 
     int threads_per_block = 1024;
-    // 简单的启发式：如果 d 较小，减少线程数以避免浪费
+
     if (d < 1024) {
         if (d <= 32)
             threads_per_block = 32;
@@ -112,12 +113,12 @@ void add_rms(Tensor<T> *output, Tensor<T> *input, const Tensor<T> *add_, const T
 
     add_rms_kernel<T><<<grid_dim, block_dim, 0, stream>>>(output->data_ptr(), input->data_ptr(), add_->data_ptr(),
                                                           weight->data_ptr(), eps, d);
-   
+
 
     checkCudaError(cudaGetLastError());
 }
 
-// 模板实例化保持不变
+
 template void add_rms<float>(Tensor<float> *, Tensor<float> *, const Tensor<float> *, const Tensor<float> *, float,
                              cudaStream_t);
 template void add_rms<nvbf16>(Tensor<nvbf16> *, Tensor<nvbf16> *, const Tensor<nvbf16> *, const Tensor<nvbf16> *, float,

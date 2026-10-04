@@ -1,0 +1,2 @@
+# The Python binding's build dependency. CMake/C++/CUDA come from the toolchain.
+pybind11==2.13.6

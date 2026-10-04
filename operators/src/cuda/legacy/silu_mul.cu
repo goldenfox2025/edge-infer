@@ -17,9 +17,7 @@ __global__ void silu_multiply_kernel(T *output, const T *input, const T *input2,
     }
 }
 
-// 方便起见，我们默认这个仅适用于mlp融合和非mlp融合状态
-// 也就是两个输入的第一维可能连续可能不连续，别的都连续
-// 解耦total和线程块参数试试看
+
 template <typename T>
 void silu_multiply(Tensor<T> *output, const Tensor<T> *input, const Tensor<T> *input2, cudaStream_t stream) {
     int in1_stride0 = input->strides()[0];

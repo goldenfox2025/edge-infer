@@ -1,7 +1,9 @@
 #include <cuda_runtime.h>
 
 #include <stdexcept>
+#include <limits>
 
+#include "operators/cuda/direct.hpp"
 #include "operators/cuda/silu_cuda.cuh"
 
 namespace op {
@@ -18,26 +20,25 @@ __global__ void silu_kernel(T* output, const T* input, int total) {
 
 // Implementation of SiLU CUDA operator
 template <typename T>
-void SiluCUDAOperator<T>::operator()(Tensor<T>* output, Tensor<T>* input,
-                                     cudaStream_t stream) {
-  // 获取输入张量的大小
-  size_t total = input->numel();
+void cuda::silu(ArrayView<const T> input, ArrayView<T> output, cudaStream_t stream) {
 
-  // 如果输入和输出不是同一个张量，需要复制数据
-  if (output->data_ptr() != input->data_ptr()) {
-    cudaMemcpyAsync(output->data_ptr(), input->data_ptr(), total * sizeof(T),
-                    cudaMemcpyDeviceToDevice, stream);
+  size_t total = input.size;
+  if (output.size != total) {
+    throw std::runtime_error("SiLU operator: input and output views must have the same size");
+  }
+  if (total == 0) {
+    return;
+  }
+  if (total > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    throw std::runtime_error("SiLU CUDA view extent exceeds the kernel index range");
   }
 
-  // 配置CUDA核函数的启动参数
-  int threads_per_block = 256;  // 可以根据需要调整
+  int threads_per_block = 256;
   int blocks = (total + threads_per_block - 1) / threads_per_block;
 
-  // 启动核函数
   silu_kernel<T><<<blocks, threads_per_block, 0, stream>>>(
-      output->data_ptr(), input->data_ptr(), total);
+      output.data, input.data, total);
 
-  // 错误检查
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
     throw std::runtime_error("CUDA error in SiLU kernel: " +
@@ -45,7 +46,16 @@ void SiluCUDAOperator<T>::operator()(Tensor<T>* output, Tensor<T>* input,
   }
 }
 
-// 显式模板实例化
+template <typename T>
+void SiluCUDAOperator<T>::operator()(Tensor<T>* output, Tensor<T>* input,
+                                    cudaStream_t stream) {
+  cuda::silu<T>({input->data_ptr(), input->numel()},
+                {output->data_ptr(), output->numel()}, stream);
+}
+
+template void cuda::silu<float>(ArrayView<const float>, ArrayView<float>, cudaStream_t);
+template void cuda::silu<__nv_bfloat16>(ArrayView<const __nv_bfloat16>, ArrayView<__nv_bfloat16>, cudaStream_t);
+
 template class SiluCUDAOperator<float>;
 template class SiluCUDAOperator<__nv_bfloat16>;
 

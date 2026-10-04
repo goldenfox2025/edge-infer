@@ -34,6 +34,13 @@ int main() {
   expect_near(out.data_ptr()[0], 5.0f, 1e-6f, "add[0]");
   expect_near(out.data_ptr()[2], 9.0f, 1e-6f, "add[2]");
 
+  Tensor<float> norm_input(std::vector<float>{1.0f, 3.0f, 0.0f, 0.0f}, {2, 2});
+  Tensor<float> norm_weight(std::vector<float>{2.0f, 0.5f}, {2});
+  ops.rms_norm(&norm_input, &norm_input, &norm_weight, 1e-6f);
+  expect_near(norm_input.data_ptr()[0], 0.8944271f, 1e-5f, "static CPU RMSNorm feature scale");
+  expect_near(norm_input.data_ptr()[1], 0.6708203f, 1e-5f, "static CPU RMSNorm second scale");
+  expect_near(norm_input.data_ptr()[2], 0.0f, 1e-6f, "static CPU RMSNorm zero row");
+
   Tensor<float> silu_input(std::vector<float>{1.0f, 2.0f}, {2});
   Tensor<float> mul_input(std::vector<float>{3.0f, 4.0f}, {2});
   Tensor<float> silu_out({2}, Device::CPU);

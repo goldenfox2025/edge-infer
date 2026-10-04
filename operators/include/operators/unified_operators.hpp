@@ -9,13 +9,13 @@
 #include "tensor.hpp"
 #include "weight_tensor.hpp"
 #include "operators/operator_factory.hpp"
+#include "operators/cuda/direct.hpp"
 #include "operators/unified/composite_ops.hpp"
 #include "operators/unified/runtime_bridge.hpp"
 #include "operators/unified/support.hpp"
 
 namespace op {
 
-// 统一算子接口
 template <typename T>
 class UnifiedOperators {
  public:
@@ -27,7 +27,6 @@ class UnifiedOperators {
     runtime_bridge_.set_platform(platform_);
   }
 
-  // 切换到CUDA设备
   void cuda() {
     if (device_ == Device::CUDA) return;
     device_ = Device::CUDA;
@@ -35,7 +34,6 @@ class UnifiedOperators {
     runtime_bridge_.set_platform(platform_);
   }
 
-  // 切换到CPU设备
   void cpu() {
     if (device_ == Device::CPU) return;
     device_ = Device::CPU;
@@ -55,7 +53,6 @@ class UnifiedOperators {
     return static_cast<bool>(get_operator_base(op_name));
   }
 
-  // RoPE算子
   void rope(Tensor<T>* tensor, size_t offset, float theta,
             cudaStream_t stream = nullptr) {
     auto op = detail::require_operator<T>(
@@ -63,41 +60,62 @@ class UnifiedOperators {
     (*op)(tensor, offset, theta, stream);
   }
 
-  // RMS Norm算子
   void rms_norm(Tensor<T>* output, Tensor<T>* input, Tensor<T>* weight,
                 float eps, cudaStream_t stream = nullptr) {
-    auto op = detail::require_operator<T>(
-        OperatorFactory<T>::getRmsNormOperator(platform_), platform_,
-        "RMS Norm");
-    (*op)(output, input, weight, eps, stream);
+    if (platform_ == OperatorPlatform::CPU) {
+      RmsNormCPUOperator<T> adapter;
+      adapter.RmsNormCPUOperator<T>::operator()(output, input, weight, eps, stream);
+      return;
+    }
+    const auto& sizes = input->sizes();
+    if (sizes.empty()) {
+      throw std::runtime_error("RMSNorm CUDA input requires a feature dimension");
+    }
+    size_t rows = 1;
+    for (size_t i = 0; i + 1 < sizes.size(); ++i) {
+      rows *= sizes[i];
+    }
+    cuda::rms_norm<T>({input->data_ptr(), input->numel()},
+                      {weight->data_ptr(), weight->numel()},
+                      {output->data_ptr(), output->numel()},
+                      rows, sizes.back(), eps, stream);
   }
 
-  // Multiply算子
   void multiply(Tensor<T>* output, Tensor<T>* input_a, Tensor<T>* input_b,
                 cudaStream_t stream = nullptr) {
-    auto op = detail::require_operator<T>(
-        OperatorFactory<T>::getMultiplyOperator(platform_), platform_,
-        "Multiply");
-    (*op)(output, input_a, input_b, stream);
+    if (platform_ == OperatorPlatform::CPU) {
+      MultiplyCPUOperator<T> adapter;
+      adapter.MultiplyCPUOperator<T>::operator()(output, input_a, input_b, stream);
+      return;
+    }
+    cuda::multiply<T>({input_a->data_ptr(), input_a->numel()},
+                      {input_b->data_ptr(), input_b->numel()},
+                      {output->data_ptr(), output->numel()}, stream);
   }
 
-  // SiLU算子
   void silu(Tensor<T>* output, Tensor<T>* input,
             cudaStream_t stream = nullptr) {
-    auto op = detail::require_operator<T>(
-        OperatorFactory<T>::getSiluOperator(platform_), platform_, "SiLU");
-    (*op)(output, input, stream);
+    if (platform_ == OperatorPlatform::CPU) {
+      SiluCPUOperator<T> adapter;
+      adapter.SiluCPUOperator<T>::operator()(output, input, stream);
+      return;
+    }
+    cuda::silu<T>({input->data_ptr(), input->numel()},
+                  {output->data_ptr(), output->numel()}, stream);
   }
 
-  // Add算子
   void add(Tensor<T>* output, Tensor<T>* input_a, Tensor<T>* input_b,
            cudaStream_t stream = nullptr) {
-    auto op = detail::require_operator<T>(
-        OperatorFactory<T>::getAddOperator(platform_), platform_, "Add");
-    (*op)(output, input_a, input_b, stream);
+    if (platform_ == OperatorPlatform::CPU) {
+      AddCPUOperator<T> adapter;
+      adapter.AddCPUOperator<T>::operator()(output, input_a, input_b, stream);
+      return;
+    }
+    cuda::add<T>({input_a->data_ptr(), input_a->numel()},
+                 {input_b->data_ptr(), input_b->numel()},
+                 {output->data_ptr(), output->numel()}, stream);
   }
 
-  // 组合算子：residual += update; hidden_states = rms_norm(residual)
   void add_rms(Tensor<T>* hidden_states, Tensor<T>* residual, Tensor<T>* update,
                Tensor<T>* norm_weight, float eps,
                cudaStream_t stream = nullptr) {
@@ -105,7 +123,6 @@ class UnifiedOperators {
         *this, hidden_states, residual, update, norm_weight, eps, stream);
   }
 
-  // 组合算子：output = silu(input_a) * input_b
   void silu_multiply(Tensor<T>* output, Tensor<T>* input_a, Tensor<T>* input_b,
                      cudaStream_t stream = nullptr) {
     detail::UnifiedCompositeOps<T, UnifiedOperators>::silu_multiply(
@@ -121,7 +138,7 @@ class UnifiedOperators {
   }
 
  public:
-  // 从嵌入表中根据索引获取嵌入向量
+
   void gather(Tensor<T>* output, const Tensor<uint32_t>* input,
               const Tensor<T>* embedding_table, cudaStream_t stream = nullptr) {
     auto op = detail::require_operator<T>(
@@ -129,7 +146,6 @@ class UnifiedOperators {
     (*op)(output, input, embedding_table, stream);
   }
 
-  // 从logits中采样下一个token
   uint32_t* sample(Tensor<T>&& logits, float temperature, float top_p,
                    size_t top_k, curandState* d_states,
                    cudaStream_t stream = nullptr) {
@@ -139,7 +155,6 @@ class UnifiedOperators {
                  stream);
   }
 
-  // CPU版本的sample方法
   uint32_t sample_cpu(Tensor<T>&& logits, float temperature, float top_p,
                       size_t top_k) {
     return runtime_bridge_.sample_cpu(std::move(logits), temperature, top_p,
@@ -190,7 +205,6 @@ class UnifiedOperators {
                                                  stream);
   }
 
-  // 动态Flash Attention包装函数
   void dynamic_flash_attention(Tensor<T>& Q, const Tensor<T>& K,
                                const Tensor<T>& V, Tensor<T>& output,
                                int n_kv_heads, cudaStream_t stream = nullptr) {
@@ -209,7 +223,6 @@ class UnifiedOperators {
     (*op)(Q, K, V, output, n_kv_heads, stream);
   }
 
-  // Prefill阶段计算注意力分数
   void compute_attention_scores_prefill(const Tensor<T>& Q, const Tensor<T>& K,
                                         Tensor<T>& att_scores, size_t head_dim,
                                         cudaStream_t stream = nullptr) {
@@ -219,7 +232,6 @@ class UnifiedOperators {
     (*op)(Q, K, att_scores, head_dim, stream);
   }
 
-  // Prefill阶段计算注意力输出
   void compute_attention_output_prefill(const Tensor<T>& att_scores,
                                         const Tensor<T>& V,
                                         Tensor<T>& att_output, size_t n_heads,
@@ -233,7 +245,6 @@ class UnifiedOperators {
           n_kv_heads, stream);
   }
 
-  // Softmax算子
   void softmax(Tensor<T>* output, const Tensor<T>* input, int dim,
                bool mask = false, int offset = 0,
                cudaStream_t stream = nullptr) {
@@ -243,7 +254,6 @@ class UnifiedOperators {
     (*op)(output, input, dim, mask, offset, stream);
   }
 
-  // Flash Attention Prefill算子
   void flash_attention_prefill(const Tensor<T>& Q, const Tensor<T>& K,
                                const Tensor<T>& V, Tensor<T>& output,
                                int n_heads, int n_kv_heads, int head_dim,
@@ -274,7 +284,7 @@ class UnifiedOperators {
           total_seq_len, offset, stream);
   }
 
-  // CUDA 图/融合路径保留桥接，模型层不再直接调用 cuda_OP
+  // Bridge for CUDA graph/fused paths; model code calls this layer instead of cuda_OP.
   void gemv_qkv_rope(Tensor<T>* hidden_states, const Tensor<T>* merged_qkv_weight,
                      Tensor<T>* q_buf, Tensor<T>* k_buf, Tensor<T>* v_buf,
                      const Tensor<T>* merged_qkv_bias, size_t* d_rope_offset,

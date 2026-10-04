@@ -9,7 +9,7 @@
 
 namespace cuda_OP {
 // --------------------------------------------------
-// SiLU 内核与包装函数（模板化）
+
 // --------------------------------------------------
 template <typename T>
 __global__ void silu_kernel(T *data, int total) {
