@@ -20,33 +20,41 @@ class GraphRunner {
     }
 
     size_t num_nodes = 0;
-    cudaGraphGetNodes(runtime.cuda_graph, nullptr, &num_nodes);
+    check(cudaGraphGetNodes(runtime.cuda_graph, nullptr, &num_nodes));
 
     std::vector<cudaGraphNode_t> nodes(num_nodes);
-    cudaGraphGetNodes(runtime.cuda_graph, nodes.data(), &num_nodes);
+    check(cudaGraphGetNodes(runtime.cuda_graph, nodes.data(), &num_nodes));
 
-    runtime.kv_copy_nodes.clear();
+    // CUDA node enumeration has no layer order. Identify each copy by its
+    // fixed source address and store deterministic [K0, V0, K1, V1, ...] slots.
+    runtime.kv_copy_nodes.assign(n_layers * 2, nullptr);
     for (size_t i = 0; i < num_nodes; ++i) {
       cudaGraphNodeType node_type;
-      cudaGraphNodeGetType(nodes[i], &node_type);
+      check(cudaGraphNodeGetType(nodes[i], &node_type));
       if (node_type != cudaGraphNodeTypeMemcpy) {
         continue;
       }
 
       cudaMemcpy3DParms params;
-      cudaGraphMemcpyNodeGetParams(nodes[i], &params);
+      check(cudaGraphMemcpyNodeGetParams(nodes[i], &params));
 
       for (size_t layer = 0; layer < n_layers; ++layer) {
         Tensor<T> k_buf =
-            runtime.fixed_k_buffers[layer].view({1, n_kv_heads, head_dim});
+            static_cast<const Tensor<T>&>(runtime.fixed_k_buffers[layer]).view({1, n_kv_heads, head_dim});
         Tensor<T> v_buf =
-            runtime.fixed_v_buffers[layer].view({1, n_kv_heads, head_dim});
-        if (params.srcPtr.ptr == k_buf.data_ptr() ||
-            params.srcPtr.ptr == v_buf.data_ptr()) {
-          runtime.kv_copy_nodes.push_back(nodes[i]);
+            static_cast<const Tensor<T>&>(runtime.fixed_v_buffers[layer]).view({1, n_kv_heads, head_dim});
+        if (params.srcPtr.ptr == k_buf.data_ptr()) {
+          runtime.kv_copy_nodes[2 * layer] = nodes[i];
+          break;
+        }
+        if (params.srcPtr.ptr == v_buf.data_ptr()) {
+          runtime.kv_copy_nodes[2 * layer + 1] = nodes[i];
           break;
         }
       }
+    }
+    for (auto node : runtime.kv_copy_nodes) {
+      if (!node) throw std::runtime_error("Missing CUDA graph KV copy node");
     }
   }
 
@@ -92,10 +100,12 @@ class GraphRunner {
                                std::string(cudaGetErrorString(result)));
     }
 
+    bool capture_active = true;
     try {
       runtime.graph_output_tensor = capture_fn();
 
       result = cudaStreamEndCapture(runtime.graph_stream, &runtime.cuda_graph);
+      capture_active = false;
       if (result != cudaSuccess) {
         throw std::runtime_error("Failed to end " + label +
                                  " CUDA graph capture: " +
@@ -112,7 +122,10 @@ class GraphRunner {
 
       runtime.graph_initialized = true;
     } catch (...) {
-      cudaStreamEndCapture(runtime.graph_stream, &runtime.cuda_graph);
+      if (capture_active) {
+        cudaStreamEndCapture(runtime.graph_stream, &runtime.cuda_graph);
+      }
+      runtime.release_graph_objects();
       throw;
     }
   }
@@ -127,16 +140,21 @@ class GraphRunner {
   }
 
  private:
+  static void check(cudaError_t result) {
+    if (result != cudaSuccess) {
+      throw std::runtime_error(std::string("CUDA graph operation failed: ") +
+                               cudaGetErrorString(result));
+    }
+  }
+
   static void update_memcpy_node(CudaGraphRuntime<T>& runtime,
                                  cudaGraphNode_t node,
                                  Tensor<T>& target_slice) {
     cudaMemcpy3DParms params;
     cudaError_t get_param_err = cudaGraphMemcpyNodeGetParams(node, &params);
-    if (get_param_err != cudaSuccess) {
-      return;
-    }
+    check(get_param_err);
 
     params.dstPtr.ptr = target_slice.data_ptr();
-    cudaGraphExecMemcpyNodeSetParams(runtime.graph_exec, node, &params);
+    check(cudaGraphExecMemcpyNodeSetParams(runtime.graph_exec, node, &params));
   }
 };

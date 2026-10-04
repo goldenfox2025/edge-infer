@@ -32,6 +32,11 @@ void dynamic_flash_attention(Tensor<T>& Q, const Tensor<T>& K,
                              int n_kv_heads, cudaStream_t stream = nullptr);
 
 template <typename T>
+void dynamic_flash_attention_with_workspace(
+    Tensor<T>& Q, const Tensor<T>& K, const Tensor<T>& V, Tensor<T>& output,
+    int n_kv_heads, Tensor<T>& workspace, cudaStream_t stream = nullptr);
+
+template <typename T>
 void flash_attention_prefill(const Tensor<T>& Q, const Tensor<T>& K,
                              const Tensor<T>& V, Tensor<T>& output,
                              int n_heads, int n_kv_heads, int head_dim,

@@ -2,8 +2,9 @@
 
 #include <cstddef>
 #include <stdexcept>
+#include <string>
+#include <cuda_runtime.h>
 
-#include "CudaMemoryPool.hpp"
 #include "execution/workspace_plan.hpp"
 
 class CudaWorkspaceArena {
@@ -27,9 +28,11 @@ class CudaWorkspaceArena {
             return false;
         }
 
-        void* new_ptr = GlobalCudaMemoryPool::instance().allocate(bytes);
-        if (!new_ptr) {
-            throw std::runtime_error("Failed to allocate CUDA workspace arena");
+        void* new_ptr = nullptr;
+        const auto result = cudaMalloc(&new_ptr, bytes);
+        if (result != cudaSuccess) {
+            throw std::runtime_error("Failed to allocate CUDA workspace arena: " +
+                                     std::string(cudaGetErrorString(result)));
         }
 
         release();
@@ -42,9 +45,10 @@ class CudaWorkspaceArena {
         return reserve(plan.total_bytes());
     }
 
-    void release() {
+    // The owner must finish work on its stream before resizing or releasing.
+    void release() noexcept {
         if (base_ptr_ != nullptr) {
-            GlobalCudaMemoryPool::instance().free(base_ptr_);
+            cudaFree(base_ptr_);
             base_ptr_ = nullptr;
         }
         capacity_bytes_ = 0;
@@ -83,7 +87,7 @@ class CudaWorkspaceArena {
         if (base_ptr_ == nullptr) {
             throw std::runtime_error("CUDA workspace arena is not allocated");
         }
-        if (offset_bytes > capacity_bytes_) {
+        if (offset_bytes >= capacity_bytes_) {
             throw std::runtime_error("CUDA workspace arena offset out of range");
         }
     }

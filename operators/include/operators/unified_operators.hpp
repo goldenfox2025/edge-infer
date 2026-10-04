@@ -2,8 +2,10 @@
 
 #include <cuda_bf16.h>
 
+#include <algorithm>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <optional>
 
 #include "tensor.hpp"
@@ -23,22 +25,33 @@ class UnifiedOperators {
       : device_(device),
         platform_(detail::platform_from_device(device)),
         runtime_bridge_(platform_) {
-    detail::configure_backend<T>(device_, platform_);
-    runtime_bridge_.set_platform(platform_);
+    configure_backend();
+  }
+
+  // Dense CUDA matmul borrows this handle. Its owner must keep the handle alive
+  // for this facade and any prepared operator returned by get_operator_base("matmul"),
+  // and serialize calls that share it. Other legacy backend state is unchanged.
+  UnifiedOperators(Device device, cublasHandle_t borrowed_handle)
+      : device_(device),
+        platform_(detail::platform_from_device(device)),
+        runtime_bridge_(platform_) {
+    if (device != Device::CUDA) {
+      throw std::invalid_argument("A borrowed cuBLAS handle requires Device::CUDA");
+    }
+    bound_cuda_matmul_ = std::make_shared<MatmulCUDAOperator<T>>(borrowed_handle);
+    configure_backend();
   }
 
   void cuda() {
     if (device_ == Device::CUDA) return;
     device_ = Device::CUDA;
-    detail::configure_backend<T>(device_, platform_);
-    runtime_bridge_.set_platform(platform_);
+    configure_backend();
   }
 
   void cpu() {
     if (device_ == Device::CPU) return;
     device_ = Device::CPU;
-    detail::configure_backend<T>(device_, platform_);
-    runtime_bridge_.set_platform(platform_);
+    configure_backend();
   }
 
   Device device() const { return device_; }
@@ -46,6 +59,10 @@ class UnifiedOperators {
 
   std::shared_ptr<OperatorBase> get_operator_base(
       const std::string& op_name) const {
+    if (platform_ == OperatorPlatform::CUDA && bound_cuda_matmul_ &&
+        op_name == "matmul") {
+      return bound_cuda_matmul_;
+    }
     return OperatorFactory<T>::getOperatorBaseByName(op_name, platform_);
   }
 
@@ -60,11 +77,14 @@ class UnifiedOperators {
     (*op)(tensor, offset, theta, stream);
   }
 
-  void rms_norm(Tensor<T>* output, Tensor<T>* input, Tensor<T>* weight,
+  void rms_norm(Tensor<T>* output, Tensor<T>* input, const Tensor<T>* weight,
                 float eps, cudaStream_t stream = nullptr) {
     if (platform_ == OperatorPlatform::CPU) {
       RmsNormCPUOperator<T> adapter;
-      adapter.RmsNormCPUOperator<T>::operator()(output, input, weight, eps, stream);
+      // The compatibility signature is mutable, but this adapter only reads
+      // weights through the const CPU reference input view.
+      adapter.RmsNormCPUOperator<T>::operator()(output, input,
+                                               const_cast<Tensor<T>*>(weight), eps, stream);
       return;
     }
     const auto& sizes = input->sizes();
@@ -132,6 +152,10 @@ class UnifiedOperators {
   void matmul(Tensor<T>* output, Tensor<T>* input,
               const WeightTensor<T>& weight, const Tensor<T>* bias = nullptr,
               cudaStream_t stream = nullptr) {
+    if (platform_ == OperatorPlatform::CUDA && bound_cuda_matmul_) {
+      (*bound_cuda_matmul_)(output, input, weight, bias, stream);
+      return;
+    }
     auto op = detail::require_operator<T>(
         OperatorFactory<T>::getMatmulOperator(platform_), platform_, "MatMul");
     (*op)(output, input, weight, bias, stream);
@@ -170,6 +194,7 @@ class UnifiedOperators {
                        float temperature, float top_p, size_t top_k,
                        curandState* d_states,
                        cudaStream_t stream = nullptr) {
+    top_k = validated_cuda_top_k(logits, top_k);
     runtime_bridge_.sample_to_fixed(std::move(logits), output_ptr, temperature,
                                     top_p, top_k, d_states, stream);
   }
@@ -178,6 +203,7 @@ class UnifiedOperators {
                              float temperature, float top_p, size_t top_k,
                              curandState* d_states,
                              cudaStream_t stream = nullptr) {
+    top_k = validated_cuda_top_k(logits, top_k);
     runtime_bridge_.sample_batch_to_fixed(std::move(logits), output_ptr,
                                           temperature, top_p, top_k, d_states,
                                           stream);
@@ -188,6 +214,7 @@ class UnifiedOperators {
                                  float top_p, size_t top_k,
                                  curandState* d_states,
                                  cudaStream_t stream = nullptr) {
+    top_k = validated_cuda_top_k(logits, top_k);
     runtime_bridge_.sample_to_fixed_with_prob(std::move(logits), token_ptr,
                                               prob_ptr, temperature, top_p,
                                               top_k, d_states, stream);
@@ -337,9 +364,45 @@ class UnifiedOperators {
   }
 
  private:
+  size_t validated_cuda_top_k(const Tensor<T>& logits, size_t top_k) const {
+    if (platform_ != OperatorPlatform::CUDA) return top_k;
+    if (top_k == 0) {
+      throw std::runtime_error("top_k must be at least 1");
+    }
+    const auto& shape = logits.sizes();
+    if (shape.size() != 2 || shape[0] == 0 || shape[1] == 0) {
+      throw std::runtime_error("Input tensor must be 2D with nonzero dimensions [seq_len, vocab_size]");
+    }
+    top_k = std::min(top_k, shape[1]);
+    // Keep fixed-output entry points within the existing sampling kernel's
+    // MAX_TOPK=1024 shared-memory candidate capacity, matching sample().
+    constexpr size_t max_top_k = 1024;
+    if (top_k > max_top_k) {
+      throw std::runtime_error("Requested top_k (" + std::to_string(top_k) +
+                               ") exceeds Kernel 2 MAX_TOPK (1024) and cannot fit in shared memory");
+    }
+    return top_k;
+  }
+
+  void configure_backend() {
+    // Serialize facade registration during concurrent session construction.
+    // Borrowed handles are already initialized by their owner; leave the
+    // compatibility resource manager untouched on this path.
+    static std::mutex registration_mutex;
+    std::lock_guard<std::mutex> lock(registration_mutex);
+    if (device_ == Device::CUDA && bound_cuda_matmul_) {
+      platform_ = OperatorPlatform::CUDA;
+      detail::register_platform_operators<T>(platform_);
+    } else {
+      detail::configure_backend<T>(device_, platform_);
+    }
+    runtime_bridge_.set_platform(platform_);
+  }
+
   Device device_;
   OperatorPlatform platform_;
   detail::UnifiedRuntimeBridge<T> runtime_bridge_;
+  std::shared_ptr<MatmulCUDAOperator<T>> bound_cuda_matmul_;
 };
 
 }  // namespace op

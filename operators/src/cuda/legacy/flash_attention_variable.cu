@@ -693,10 +693,40 @@ void dynamic_flash_attention_wrapper(Tensor<T>& Q,
                                    Tensor<T>& att_output,
                                    int n_kv_heads,
                                    cudaStream_t stream) {
+  // Compatibility callers have no persistent workspace. Keep this allocation
+  // alive until the asynchronous branch/gather kernels have finished.
+  T* scratch = nullptr;
+  const size_t count = MAX_BRANCHES * Q.sizes()[1] * (Q.sizes()[2] + 2);
+  auto status = cudaMalloc(reinterpret_cast<void**>(&scratch), count * sizeof(T));
+  if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+  auto workspace = Tensor<T>::from_external_buffer(scratch, {count}, Device::CUDA);
+  try {
+    dynamic_flash_attention_with_workspace(Q, total_K, total_V, att_output,
+                                           n_kv_heads, workspace, stream);
+    status = cudaStreamSynchronize(stream);
+    if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+  } catch (...) {
+    cudaStreamSynchronize(stream);
+    cudaFree(scratch);
+    throw;
+  }
+  cudaFree(scratch);
+}
+
+template <typename T>
+void dynamic_flash_attention_with_workspace(
+    Tensor<T>& Q, const Tensor<T>& total_K, const Tensor<T>& total_V,
+    Tensor<T>& att_output, int n_kv_heads, Tensor<T>& workspace,
+    cudaStream_t stream) {
 
   size_t n_q_h = Q.sizes()[1];
   size_t dqkv = Q.sizes()[2];
   size_t total_seq_len = total_K.sizes()[0];
+  const size_t branch_elements = n_q_h * (dqkv + 2);
+  if (total_seq_len == 0 || workspace.device() != Device::CUDA ||
+      workspace.numel() < MAX_BRANCHES * branch_elements) {
+    throw std::invalid_argument("Invalid dynamic attention workspace or empty KV cache");
+  }
 
 
   int branches_needed = (total_seq_len + B_C_VALUE - 1) / B_C_VALUE;
@@ -726,7 +756,8 @@ void dynamic_flash_attention_wrapper(Tensor<T>& Q,
                                     {end_idx, static_cast<size_t>(n_kv_heads), dqkv}));
 
 
-    branch_outputs.push_back(Tensor<T>({n_q_h * (dqkv + 2)}, Device::CUDA));
+    branch_outputs.push_back(Tensor<T>::from_external_buffer(
+        workspace.data_ptr() + i * branch_elements, {branch_elements}, Device::CUDA));
   }
 
 
@@ -752,7 +783,8 @@ void dynamic_flash_attention_wrapper(Tensor<T>& Q,
   }
 
 
-  gather_fa_variable(branch_outputs, att_output, stream);
+  auto output_heads = static_cast<const Tensor<T>&>(att_output).view({n_q_h, dqkv});
+  gather_fa_variable(branch_outputs, output_heads, stream);
 }
 
 
@@ -861,5 +893,12 @@ template void dynamic_flash_attention_wrapper<nvbf16>(
     Tensor<nvbf16>& att_output,
     int n_kv_heads,
     cudaStream_t stream);
+
+template void dynamic_flash_attention_with_workspace<float>(
+    Tensor<float>&, const Tensor<float>&, const Tensor<float>&, Tensor<float>&,
+    int, Tensor<float>&, cudaStream_t);
+template void dynamic_flash_attention_with_workspace<nvbf16>(
+    Tensor<nvbf16>&, const Tensor<nvbf16>&, const Tensor<nvbf16>&, Tensor<nvbf16>&,
+    int, Tensor<nvbf16>&, cudaStream_t);
 
 }  // namespace cuda_OP

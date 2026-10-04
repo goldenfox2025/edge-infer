@@ -1,155 +1,133 @@
 # Architecture
 
-The responsibilities are organized as `core -> operators -> runtime -> bindings`.
-Core, operators and the native runtime have independent build targets. The
-`EdgeInfer::runtime` static library depends on CUDA, operators and native threads;
-it has no Python or pybind11 dependency. The optional Python module links that
-library and owns Python callback/GIL handling. The Python frontend calls the
-bindings; development tools do not belong in operator or model execution code.
+The dependency direction is `core -> operators -> runtime -> bindings`.
+Operators can be built independently. The native runtime links CUDA and native
+threads; Python, Torch and tokenization belong to optional consumers.
 
-## Shared core
+```mermaid
+flowchart LR
+    Core[Tensor views and memory] --> Ops[Independent operators]
+    Ops --> Model[Configuration and prepared weights]
+    Model --> A[Session A: buffers, cache binding, stream, graph]
+    Model --> B[Session B: buffers, cache binding, stream, graph]
+    A --> App[Native application or Python binding]
+    B --> App
+```
 
-`core/include/execution/` owns portable workspace planning and lifetime analysis.
-`core_headers` exposes these without CUDA or Python. Tensor, WeightTensor and
-the CUDA memory pool also share one implementation in `core/`. `core_cuda` owns
-the pool's out-of-line definitions and links the CUDA runtime and driver.
-The owning Tensor API retains its allocation and shared-ownership costs.
+## Operators
 
-## Operator library
+`operators_core` provides portable non-owning views and inline reference
+operations. `unified_operators` adds CUDA implementations and compatibility
+adapters. Neither depends on a model or frontend.
 
-`operators_core` exposes non-owning reference operations through headers. Calls
-use concrete types and inline functions rather than a registry, virtual methods
-or shared ownership. This API introduces no required dispatch or ownership
-machinery; optimized code and production performance still need measurement.
+Concrete CUDA buffer functions cover add, multiply, SiLU and RMSNorm.
+`conditioning.hpp` provides float/BF16 linear projections and embedding sums
+with borrowed weights, buffers, FP32 scratch, cuBLAS handle and stream.
+These interfaces require no registry lookup, virtual dispatch or operand
+allocation. CUDA launches and GEMM execution still have their ordinary costs;
+end-to-end overhead and performance require measurement.
 
-`unified_operators` retains CUDA kernels and Tensor-based adapters. It consumes
-core and CUDA/CUTLASS without depending on models, Python or frontend code.
-OperatorFactory and UnifiedOperators remain dynamic compatibility APIs.
-Add, multiply, SiLU and RMSNorm also expose direct borrowed-buffer CUDA calls;
-their existing eager facade methods use these calls. `conditioning.hpp` adds
-concrete float/BF16 linear projections and multi-table embedding sums with
-caller-owned FP32 scratch. Speech model code composes these directly, without
-factory lookup or virtual dispatch. Existing text matmul adapters and
-prepared-node execution retain dynamic dispatch.
+Fused kernels live beside primitives and declare layout and workspace
+requirements. Validate a fusion against an unfused reference before replacing a
+model call. Kernels in `operators/src/cuda/legacy/` remain necessary where
+adapters still consume them.
 
-Fused kernels belong beside primitive kernels. A fused projection/RoPE/KV-write
-operation should declare its layout and workspace requirements rather than hide
-model state in a global registry. Validate a fusion against an unfused reference
-before replacing a call site.
+## Qwen3 model and sessions
 
-`operators/src/cuda/legacy/` contains kernels still used by adapters. These
-sources remain necessary until their consumers are migrated and validated.
+`Qwen3Model<T>` is prepared once on the current CUDA device. It owns configuration,
+private uploaded weight storage, read-only RoPE data and resolved layer weight
+descriptors. Required shapes and supported prepared layouts are checked during
+construction. The source weight map can then be released. Sessions share the
+model through `shared_ptr<const Qwen3Model<T>>`.
 
-## Runtime and bindings
+`Qwen3Session<T>` owns a nonblocking execution stream, cuBLAS handle, fixed
+decode buffers, attention branch scratch, retained prefill arena, sampled-token
+output and private CUDA graph resources. These allocations use direct owned
+CUDA arenas, independent of process-global tags and the legacy prefill phase.
+The compatibility inference engine skips global prefill reservation for this
+executor.
 
-`runtime/` owns model sequencing, cache state, execution programs, graph capture
-and decoding. Model code may select an operation but must not become a dependency
-of that operation's implementation. `bindings/python/` owns weight preprocessing,
-initialization and Python exposure.
+The decoder is an explicit typed operator sequence in `qwen3_forward.cpp`:
+embedding, attention norm/projections, Q/K norm and RoPE, KV write, attention,
+output projection, residual, MLP, final norm and output head. Eager prefill and
+decode use the same layer loop. There is no parallel execution IR, prepared-node
+argument packing or per-node string lookup. Intermediate buffers are reused
+across layers. Dense matmul retains a compatibility facade bound to the
+session's cuBLAS handle; AWQ still uses existing kernel dispatch.
 
-The native `model_factory.hpp` belongs to `runtime/include/` and consumes Tensor
-weight maps rather than Python dictionaries. The current frontend and bindings
-still load/convert checkpoint weights. The native library exposes the existing
-LLM model classes and C++ token callback interface. `runtime/include/speech/`
-adds a separate typed conditioning API. Native checkpoint loading and complete
-speech decoding remain future work.
+Decode buffers are reserved during session construction. Attention uses
+caller-owned branch scratch. Prefill can grow a separate session arena after
+previous work finishes. Returned logits borrow session storage and remain valid
+until that session's next operation; they cannot outlive the owner.
 
-The current Python module owns one process-global model/decoder session. It
-releases the GIL during native generation and reacquires it for Python callbacks.
-Overlapping generation, initialization and device mutation are rejected before
-changing that session. Native callbacks are joined before return, and callback
-exceptions retain their Python type and traceback at the binding boundary.
-Applications must serialize operations on a native engine instance; independent
-concurrent sessions and stream-safe global CUDA pool use remain future work.
+The native engine supplies one `KVCache<T>` per executor. CUDA cache storage now
+has private persistent arenas, including when another legacy caller has enabled
+the global prefill phase. Logical resize/reset retains capacity. Qwen3 binds to
+one cache and its backing addresses on first execution. Changed capacity,
+replacement caches, invalid token IDs and incompatible dimensions are rejected
+before model writes. Graph attention captures these addresses; changing only
+copy destinations cannot rebind it. Use another session for another cache.
+
+Graph capture remains a separate decode adapter. Fixed tensors have private
+addresses, copy nodes are matched to actual K/V sources, and teardown completes
+stream work before releasing memory. `set_graph_enabled()` or
+`EDGE_INFER_ENABLE_QWEN3_GRAPH=1` selects graph decode for sampled `forward()`.
+The logits APIs select their path explicitly: `forward_eager()` stays eager,
+and `forward_for_graph_logits_only()` uses the graph adapter. Keep the bound
+cache alive during all calls and finish outstanding work before destroying it.
+
+Public Qwen3 operations complete GPU work before returning. Serialize calls on
+one session. Synthetic regressions check interleaved eager/graph isolation;
+the dense matmul test separately submits concurrent work using independent
+handles and streams. Probabilistic sampling scratch still uses the global
+allocator, so this validation does not establish simultaneous full generation
+across sessions. The Python binding retains its single-session busy guard.
 
 ## Adding a model
 
-The extension target is a model implementation (`.cpp` and its public `.hpp`),
-typed configuration and weight mapping, plus a small build/registration entry.
-A model covered by existing operations should not require edits to core memory
-code, operator implementations, execution scheduling or generic bindings.
-Architecture variants that only change dimensions or checkpoint names should
-reuse an existing model implementation through configuration and weight mapping.
+A model defines configuration, weight mapping and operator sequencing. Reuse
+operators when semantics and layouts match. Add a generic primitive with a
+numerical reference when a concrete new architecture needs one. Dimension or
+checkpoint-name variants should use configuration/mapping. Registration and
+CMake entries remain explicit.
 
-Keep model sequencing and variant-specific decisions in its runtime component.
-Use concrete operator calls in the hot path; registration happens once at
-initialization. When a model introduces a genuinely new operation, add that
-generic primitive to operators with a numerical reference. Avoid duplicating
-kernels per model or adding speculative plugin machinery. Model-level parity
-fixtures accompany new implementations.
+Qwen3 accepts token IDs and produces logits or sampled tokens. Speech needs an
+embedding-to-hidden-state entry point, separate output heads and task-specific
+cache lifetimes. Extract that common computation from validated implementations
+when adding the next concrete model. A single `.cpp` addition is an extension
+goal, not a guarantee for arbitrary architectures. Qwen2 and speculative
+sampling retain legacy paths.
 
-The current text factory and per-model Python weight processors still require
-explicit edits when registering a new language model. The embedding-to-hidden
-backbone and declarative weight mapping are the next steps toward the extension
-target; a single-file model addition is not yet guaranteed by the current API.
+## Memory budgets
 
-## Dedicated sessions and fixed decode storage
-
-The intended runtime separates an immutable model (configuration, weights and
-read-only prepared data) from mutable session state. Sessions share model weights
-and each owns its KV cache, current positions, decode workspace, sampling state,
-CUDA stream/events, cuBLAS handle and graph execution state. Model classes
-compose operators; session management does not belong in the operator library.
-
-Prepare each session once with explicit model/precision, maximum context, batch
-capacity and decode workspace sizes. Allocate KV capacity and decode scratch
-before generation; addresses remain stable during each session's decode loop.
-Capacity exhaustion returns an error or ends the session instead of silently
-reallocating while graph pointers remain live. Reset positions and transient
-state for a new request after outstanding GPU work completes; reuse allocations.
-Release the session only after its streams and consumers finish.
-
-Fixed decode scratch and persistent KV storage have different size rules. A
-one-token decode shape can reuse scratch, while KV storage is reserved up to a
-configured maximum context. Prefill needs a separate bounded budget or prompt
-chunks, and TTS needs a persistent talker cache plus a short predictor cache
-reset each frame. Sequential talker/predictor scratch can share a session-local
-arena when their lifetimes are proven disjoint. Waveform buffers and codec state
-are accounted for when the codec is implemented.
-
-For batch-one dense KV storage, bytes are
+Batch-one dense KV bytes are
 `2 * layers * context_capacity * kv_heads * head_dim * sizeof(dtype)`.
-The recorded 0.6B TTS talker uses 112 KiB per BF16 context position: a 4096-position
-session reserves 448 MiB, while 32768 positions reserve 3.5 GiB, before weights
-and scratch. Its five-layer code predictor needs at most 16 cached positions
-for a frame's residual prediction, or 320 KiB BF16 KV. Reserve these actual
-session bounds instead of each stage's checkpoint maximum position setting.
+Decode scratch depends on a one-token shape; KV memory depends on context
+capacity. Prefill has a separate arena and should eventually support bounded
+prompt chunks. Budget shared weights plus each session's KV, intermediates and
+auxiliary storage before selecting a session count.
 
-Device memory is budgeted as shared model weights plus each session's KV,
-workspace and auxiliary storage, plus the permitted concurrent prefill budget.
-Separate streams provide isolation and potential overlap; faster total decoding
-requires measurements on the selected GPU and concurrent session count.
+The recorded 0.6B TTS talker uses 112 KiB per BF16 context position: 4096
+positions reserve 448 MiB; 32768 positions reserve 3.5 GiB before weights and
+scratch. Its five-layer code predictor needs at most 16 cached positions per
+frame, or 320 KiB BF16 KV. Sequential talker/predictor scratch can share storage
+when lifetimes are proven disjoint. More streams do not guarantee faster total
+decoding; measure the chosen GPU and workload.
 
-The existing Qwen3 path already preplans a fixed one-token workspace, but it is
-owned by the model object and uses the global CUDA pool. The current bindings
-also own one global session. Moving mutable state and allocator/graph resources
-to explicit sessions is required before claiming concurrent full-model support.
-Current Qwen3 graph capture binds attention to a particular KV cache, and
-global allocation tags can resolve different model instances to the same
-storage. Each session therefore needs its own captured graph and private arena;
-removing the binding's busy guard alone would make these shared states unsafe.
-The new speech conditioning stage already accepts caller-owned buffers, handles
-and streams and stores only immutable configuration/borrowed weights.
+## Speech and bindings
 
-## Speech models
+`edge_infer::speech::QwenTtsConditioner<T>` implements native text projection
+and audio-codebook embedding composition with aligned text. It borrows explicit
+weights, buffers and execution resources. Torch is only a reference exporter.
+The talker, per-frame code predictor, codec and waveform output remain to be
+implemented and compared with the pinned reference.
 
-[Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) includes an audio tokenizer/codec
-and streaming speech generation. The first native stage is
-`edge_infer::speech::QwenTtsConditioner<T>`: text projection and composition of
-audio-codebook embeddings with aligned text. Model dimensions and borrowed
-weights belong to this runtime component; its generic linear and embedding
-operations belong to operators. Torch is used only by the developer reference
-exporter, never by this native stage.
+Checkpoint loading/conversion and tokenization currently belong to the Python
+frontend. The binding releases the GIL during generation, reacquires it for
+callbacks and rejects overlapping generation or mutation. Native callbacks are
+joined before return. These compatibility interfaces remain separate from
+immutable weights and session execution state.
 
-The next shared transformer boundary should accept `inputs_embeds` and return
-normalized hidden states with explicit caller-owned cache state. Token lookup
-and task-specific output heads belong outside that backbone. The current text
-`BaseModel` returns sampled token IDs and is not the speech execution contract.
-Qwen TTS needs a talker hidden state and first code, then a short per-frame
-predictor session with a different output head for each residual codebook.
-Its explicit attention head dimension must remain independent of hidden width.
-
-The [speech integration plan](speech-integration.md) records the pinned model
-configuration and staged migration. A later waveform output API will need
-chunk ownership, sample-rate metadata, cancellation and bounded buffering;
-these are added with the codec and streaming implementation.
+See [native integration](native-runtime.md),
+[session validation](validation-qwen3-sessions-2026-10-04.md) and
+[speech integration](speech-integration.md) for contracts and validation gates.

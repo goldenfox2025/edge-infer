@@ -25,6 +25,9 @@ __device__ __forceinline__ float warpReduceMax(float val) {
 
 namespace cuda_OP {
 
+// Module-owned global padding is initialized before any kernel launches and
+// is read-only after loading. It does not depend on allocator tags or streams.
+__device__ __align__(16) unsigned char flash_prefill_zero_padding[16] = {};
 
 template <typename T, int B_c, int B_r, int T_r, int WARP_NUM = 4, int DQKV = 128>
 __global__ void flash_attn_prefill_kernel_v0(const T* __restrict__ q_global, const T* __restrict__ k_global,
@@ -1113,14 +1116,12 @@ void flash_attention_prefill(const Tensor<T>& Q, const Tensor<T>& K, const Tenso
 
     int n_groups = n_heads / n_kv_heads;
 
-    auto& pool = GlobalCudaMemoryPool::instance();
-    static std::once_flag init_flag;
-    constexpr int VEC_SIZE = 16 / sizeof(T);
-    T* zero_vec = static_cast<T*>(pool.allocate_tagged("zero_vec", VEC_SIZE * sizeof(T)));
-    std::call_once(init_flag, [zero_vec, stream]() mutable {
-        std::vector<T> vec(VEC_SIZE, static_cast<T>(0.0f));
-        cudaMemcpyAsync(zero_vec, vec.data(), VEC_SIZE * sizeof(T), cudaMemcpyHostToDevice, stream);
-    });
+    void* padding = nullptr;
+    const auto padding_status = cudaGetSymbolAddress(&padding, flash_prefill_zero_padding);
+    if (padding_status != cudaSuccess) {
+        throw std::runtime_error(cudaGetErrorString(padding_status));
+    }
+    T* zero_vec = static_cast<T*>(padding);
 
     constexpr int B_c = 16;
     constexpr int B_r = 16;

@@ -10,7 +10,12 @@ void DynamicFlashAttentionCUDAOperator<T>::operator()(Tensor<T>& Q,
                                                       Tensor<T>& output,
                                                       int n_kv_heads,
                                                       cudaStream_t stream) {
-  legacy::dynamic_flash_attention(Q, K, V, output, n_kv_heads, stream);
+  if (workspace_.data_ptr()) {
+    legacy::dynamic_flash_attention_with_workspace(Q, K, V, output,
+                                                   n_kv_heads, workspace_, stream);
+  } else {
+    legacy::dynamic_flash_attention(Q, K, V, output, n_kv_heads, stream);
+  }
 }
 
 template class DynamicFlashAttentionCUDAOperator<float>;

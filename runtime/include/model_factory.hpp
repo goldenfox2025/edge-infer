@@ -71,7 +71,7 @@ class ModelFactory {
                 return model;
             }
             case ModelType::QWEN3_BF16: {
-                auto model = std::make_shared<Qwen3Model<__nv_bfloat16>>(weights, config);
+                auto model = std::make_shared<Qwen3Session<__nv_bfloat16>>(weights, config);
                 model->print_model_info();
                 if (!model->verify_params()) {
                     throw std::runtime_error("Model parameter verification failed");
@@ -100,7 +100,7 @@ class ModelFactory {
                 return model;
             }
             case ModelType::QWEN3_AWQ: {
-                auto model = std::make_shared<Qwen3Model<__nv_bfloat16>>(weights, qweight_params, scales_params,
+                auto model = std::make_shared<Qwen3Session<__nv_bfloat16>>(weights, qweight_params, scales_params,
                                                                          qzeros_params, config);
                 model->print_model_info();
                 if (!model->verify_params()) {

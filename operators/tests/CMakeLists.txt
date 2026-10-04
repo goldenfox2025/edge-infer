@@ -9,6 +9,14 @@ endforeach()
 # The current Tensor/operator API still depends on the CUDA toolkit even
 # for CPU tensors. Build this test with the CUDA compatibility library.
 if(TARGET unified_operators)
+  find_package(Threads REQUIRED)
+  add_executable(operators_cuda_context_test operators_cuda_context_test.cu)
+  target_link_libraries(operators_cuda_context_test PRIVATE unified_operators Threads::Threads)
+  set_target_properties(operators_cuda_context_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+  add_test(NAME operators_cuda_context_test COMMAND operators_cuda_context_test)
+  set_tests_properties(operators_cuda_context_test PROPERTIES
+    LABELS "operators;cuda;gpu" SKIP_RETURN_CODE 77 TIMEOUT 60)
+
   add_executable(operators_cuda_conditioning_test operators_cuda_conditioning_test.cu)
   target_link_libraries(operators_cuda_conditioning_test PRIVATE unified_operators)
   set_target_properties(operators_cuda_conditioning_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)

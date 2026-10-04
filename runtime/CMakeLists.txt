@@ -41,6 +41,12 @@ target_link_libraries(inference_runtime PUBLIC
 set_target_properties(inference_runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if(BUILD_TESTING)
+  add_executable(qwen3_session_test tests/qwen3_session_test.cpp)
+  target_link_libraries(qwen3_session_test PRIVATE EdgeInfer::runtime)
+  add_test(NAME qwen3_session_test COMMAND qwen3_session_test)
+  set_tests_properties(qwen3_session_test PROPERTIES
+    LABELS "runtime;cuda;gpu;session" SKIP_RETURN_CODE 77 TIMEOUT 120)
+
   add_executable(qwen_tts_conditioning_parity tests/qwen_tts_conditioning_parity.cpp)
   target_link_libraries(qwen_tts_conditioning_parity PRIVATE EdgeInfer::runtime)
   set(EDGE_INFER_QWEN_TTS_FIXTURES "" CACHE PATH "Optional Torch conditioning reference fixture directory")

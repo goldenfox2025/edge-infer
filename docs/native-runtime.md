@@ -60,8 +60,8 @@ The ordinary engine runs model generation on a worker and invokes token
 callbacks on the calling thread. Generation joins its worker before returning,
 including on callback/worker exceptions. A callback failure currently waits for
 the worker to finish; early cancellation and bounded buffering are future work.
-Serialize calls and state changes on an engine instance. Shared CUDA pool
-concurrency and independent request sessions have not been validated.
+Serialize calls and state changes on an engine instance. Simultaneous full
+generation using legacy sampling scratch has not been validated.
 
 Python bindings manage the GIL outside this library. Their current process-global
 session rejects overlapping generation, initialization or device changes. Python
@@ -71,3 +71,58 @@ The token-oriented API does not model audio frames or PCM chunks. A Qwen TTS
 implementation can consume the same core/operators and execution mechanisms
 while introducing speech-specific model state and outputs as described in the
 [speech integration plan](speech-integration.md).
+
+## Shared Qwen3 weights and dedicated execution
+
+For direct logits integration, prepare weights once and create separate native
+sessions. Each session binds to one fixed-capacity cache; the cache owns private
+CUDA allocations and logical resize never moves them.
+
+```cpp
+#include "qwen3.hpp"
+
+using BF16 = __nv_bfloat16;
+auto model = std::make_shared<Qwen3Model<BF16>>(weights, config);
+const auto& dimensions = model->config();
+const size_t capacity = 4096;  // Must not exceed max_position_embeddings.
+KVCache<BF16> cache(dimensions.n_layers, capacity,
+                    dimensions.n_kv_heads * dimensions.head_dim, Device::CUDA);
+Qwen3Session<BF16> session(model, false);  // Explicit eager mode.
+
+// prompt and next_input are contiguous rank-one CUDA uint32_t tensors.
+cache.resize(prompt.numel());
+auto prompt_logits = session.prefill_eager(&prompt, &cache);
+cache.resize(cache.size() + 1);
+auto decode_logits = session.forward_eager(&next_input, &cache);
+```
+
+Create another cache/session pair with the same model to serve another history.
+The model owns copies of prepared weights, retaining supported contiguous or
+two-dimensional transposed layouts. Required dimensions are checked before
+execution. Dense linear weights have logical shape `[input, output]` and may
+use a transposed view. Token embeddings must be contiguous `[vocabulary, hidden]`,
+with hidden width divisible by eight. The current attention path requires BF16
+and head dimension 128.
+
+The current AWQ kernel consumes contiguous N-major packed weights:
+`qweight[output, ceil(input/8)]`, `qzeros[output, ceil(groups/8)]` and
+`scales[output, padded_groups]`, where `groups = input / group_size` and
+`padded_groups >= groups`. The input width must divide into whole groups.
+These are prepared native layouts; standard AWQ checkpoint layouts may need
+conversion before construction.
+
+Logits borrow session storage. Consume them before its next operation or copy
+them into application-owned output. Calls complete GPU work before returning;
+serialize access to one session. A cache must retain its object, device,
+capacity and backing addresses throughout execution. After `cache.clear()`,
+prefill starts another history in the same allocations. CUDA graph mode uses
+the same binding. `session.set_graph_enabled(true)` selects graph decode for
+the sampled `forward()` method. For logits, call
+`forward_for_graph_logits_only()` to use graph decode; `forward_eager()` always
+uses the eager decoder.
+
+The token factory returns a Qwen3 session through the legacy `BaseModel`
+interface. Python continues to expose one guarded session. Native interleaved
+logits/KV isolation and greedy sampling are tested with synthetic weights;
+full checkpoint parity, asynchronous generation and probabilistic sampling
+isolation still require separate validation.

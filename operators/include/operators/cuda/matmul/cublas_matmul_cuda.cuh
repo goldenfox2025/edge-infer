@@ -12,6 +12,9 @@ template <typename T>
 class CublasMatmulCUDAOperator : public MatmulOperatorImpl<T> {
    public:
     CublasMatmulCUDAOperator();
+    // The caller owns this handle and must keep it alive for all submissions.
+    // Calls sharing a handle must be serialized by the caller.
+    explicit CublasMatmulCUDAOperator(cublasHandle_t borrowed_handle);
     ~CublasMatmulCUDAOperator() override;
 
     void operator()(Tensor<T>* output, Tensor<T>* input, const WeightTensor<T>& weight, const Tensor<T>* bias = nullptr,
@@ -27,6 +30,8 @@ class CublasMatmulCUDAOperator : public MatmulOperatorImpl<T> {
 
    private:
     bool initialized_;
+
+    cublasHandle_t borrowed_handle_ = nullptr;
 
     // Retained for API compatibility; handle ownership lives in CUDAResourceManager.
 

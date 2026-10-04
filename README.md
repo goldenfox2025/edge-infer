@@ -8,8 +8,8 @@ followed by a specific Jetson/JetPack configuration.
 Shared memory utilities, independent operators and a native C++ runtime form the
 inference foundation. Python bindings and the frontend are optional consumers.
 Models compose operators; the extension target is a model implementation plus
-configuration and weight mapping. Dedicated sessions with shared read-only
-weights and private preallocated decode/KV storage are the next runtime boundary.
+configuration and weight mapping. Qwen3 separates shared prepared weights from
+dedicated execution sessions with private fixed decode storage and streams.
 The project explores BF16 and AWQ kernels, KV-cache management, CUDA Graphs and
 workspace planning. It is experimental and has not established full model parity.
 
@@ -28,7 +28,7 @@ Git history and the `legacy-before-restructure` tag.
 | --- | --- |
 | Workspace planning and lifetime analysis | Standalone C++17 tests; no CUDA or Python dependency |
 | Native C++ runtime | Separate `EdgeInfer::runtime` target; Python bindings are optional |
-| Dedicated decoding sessions | Planned state separation; the current Python API has one guarded session |
+| Dedicated decoding sessions | Native Qwen3 model/session split, fixed decode buffers and private cache storage; Python still exposes one guarded session |
 | CUDA operators and `model_bridge` | CUDA build and direct operator tests validated; full model correctness remains pending |
 | Qwen/Qwen3 BF16 and AWQ paths | Implemented; not an established compatibility matrix |
 | Speculative decoding | Experimental; probability rejection/resampling needs a correctness review |
@@ -65,6 +65,8 @@ callback suite passed eight cases without CUDA. See the
 [native runtime validation](docs/validation-native-runtime-2026-10-04.md).
 The first speech migration has its own
 [conditioning validation record](docs/validation-qwen-tts-2026-10-04.md).
+The operator-based Qwen3 decoder and session isolation are covered in the
+[session refactor validation](docs/validation-qwen3-sessions-2026-10-04.md).
 The Docker recipe was not built.
 
 `scripts/test.sh` now runs these workspace unit tests instead of the historical matrix
@@ -190,7 +192,7 @@ It is a desktop development image, not a Jetson image.
 
 Keep execution planning separate from model logic and CUDA kernel implementation.
 The next release gates are repeatable CUDA CI, broader GPU operator coverage,
-model/session separation, model-level greedy parity, a review of speculative resampling, and reproducible
+model-level greedy parity, session integration for other models, a review of speculative resampling, and reproducible
 benchmarks. Platform-specific changes should follow measurements on the chosen
 NVIDIA device instead of speculative abstraction work.
 
@@ -240,8 +242,10 @@ non-owning views and inline reference functions. `unified_operators` contains
 CUDA kernels and the existing Tensor adapters. Direct CUDA calls are available
 for add, multiply, SiLU, RMSNorm, biased linear projection and multi-table
 embedding sums.
-Those eager facade calls avoid factory lookup and virtual dispatch. Matmul and
-prepared-node execution retain dynamic dispatch. The static API adds no required
+Those eager facade calls avoid factory lookup and virtual dispatch. Qwen3 eager
+and prefill share one explicit typed operator sequence without execution IR or
+packed prepared-node arguments. Dense matmul retains a compatibility facade bound
+to the session's cuBLAS handle. The static API adds no required
 shared ownership or operand allocation; CUDA launch overhead still applies. See [architecture](docs/architecture.md) and [roadmap](docs/roadmap.md).
 
 Keep documentation, comments and diagnostics in English. Model input data may

@@ -41,6 +41,14 @@ void dynamic_flash_attention(Tensor<T>& Q, const Tensor<T>& K,
 }
 
 template <typename T>
+void dynamic_flash_attention_with_workspace(
+    Tensor<T>& Q, const Tensor<T>& K, const Tensor<T>& V, Tensor<T>& output,
+    int n_kv_heads, Tensor<T>& workspace, cudaStream_t stream) {
+  cuda_OP::dynamic_flash_attention_with_workspace(Q, K, V, output,
+                                                  n_kv_heads, workspace, stream);
+}
+
+template <typename T>
 void flash_attention_prefill(const Tensor<T>& Q, const Tensor<T>& K,
                              const Tensor<T>& V, Tensor<T>& output,
                              int n_heads, int n_kv_heads, int head_dim,
@@ -130,6 +138,9 @@ void gemv_mlp_fused(Tensor<T>* hidden_states,
   template void dynamic_flash_attention<T>(Tensor<T>&, const Tensor<T>&,      \
                                            const Tensor<T>&, Tensor<T>&, int, \
                                            cudaStream_t);                     \
+  template void dynamic_flash_attention_with_workspace<T>(                    \
+      Tensor<T>&, const Tensor<T>&, const Tensor<T>&, Tensor<T>&, int,           \
+      Tensor<T>&, cudaStream_t);                                               \
   template void flash_attention_prefill<T>(                                   \
       const Tensor<T>&, const Tensor<T>&, const Tensor<T>&, Tensor<T>&, int, \
       int, int, int, int, int, cudaStream_t);                                \

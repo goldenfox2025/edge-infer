@@ -26,8 +26,16 @@ CublasMatmulCUDAOperator<T>::CublasMatmulCUDAOperator() : initialized_(false) {
 }
 
 template <typename T>
+CublasMatmulCUDAOperator<T>::CublasMatmulCUDAOperator(cublasHandle_t borrowed_handle)
+    : initialized_(false), borrowed_handle_(borrowed_handle) {
+    if (!borrowed_handle_) {
+        throw std::invalid_argument("Borrowed cuBLAS handle must not be null");
+    }
+}
+
+template <typename T>
 CublasMatmulCUDAOperator<T>::~CublasMatmulCUDAOperator() {
-    // The shared handle is released by CUDAResourceManager.
+    // CUDAResourceManager or the caller owns the handle.
 }
 
 // Compatibility method; CUDAResourceManager owns the actual handle.
@@ -94,9 +102,11 @@ void CublasMatmulCUDAOperator<T>::operator()(Tensor<T> *output, Tensor<T> *input
 
     initialized_ = true;
 
-    cublasHandle_t handle = CUDAResourceManager::instance().getCublasHandle();
-
-    if (stream) {
+    cublasHandle_t handle = borrowed_handle_;
+    if (handle) {
+        CHECK_CUBLAS(cublasSetStream(handle, stream));
+    } else {
+        handle = CUDAResourceManager::instance().getCublasHandle();
         CUDAResourceManager::instance().setCublasStream(stream);
     }
 

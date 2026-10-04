@@ -166,8 +166,22 @@ __global__ void flash_attention_kernel_decode(T *q, const T *total_k, const T *t
     }
 
     int cache_length = end_idx - start_idx;
-    if (cache_length <= 0)
+    // A shorter request can leave a branch empty after an earlier replay used
+    // it. Publish a neutral softmax contribution instead of retaining stale
+    // output, which the fixed three-branch gather always consumes.
+    if (cache_length <= 0) {
+        T* empty_output = output_ptrs[blockIdx.y] + blockIdx.x * (dqkv + 2);
+        const int linear_tid = threadIdx.y * blockDim.x + threadIdx.x;
+        const int threads = blockDim.x * blockDim.y;
+        for (int index = linear_tid; index < dqkv; index += threads) {
+            empty_output[index] = static_cast<T>(0.0f);
+        }
+        if (linear_tid == 0) {
+            empty_output[dqkv] = static_cast<T>(-INFINITY);
+            empty_output[dqkv + 1] = static_cast<T>(0.0f);
+        }
         return;
+    }
 
     int T_c = (cache_length + B_c - 1) / B_c;
     T *att_output = output_ptrs[blockIdx.y];
@@ -408,8 +422,20 @@ __global__ void flash_attention_kernel_decode(T *q,
     int cache_length = end_idx - start_idx;
 
 
-    if (cache_length <= 0)
+    // The gather consumes every fixed branch, even after a context shrinks.
+    if (cache_length <= 0) {
+        T* empty_output = output_ptrs[blockIdx.y] + blockIdx.x * (dqkv + 2);
+        const int linear_tid = threadIdx.y * blockDim.x + threadIdx.x;
+        const int threads = blockDim.x * blockDim.y;
+        for (int index = linear_tid; index < dqkv; index += threads) {
+            empty_output[index] = static_cast<T>(0.0f);
+        }
+        if (linear_tid == 0) {
+            empty_output[dqkv] = static_cast<T>(-INFINITY);
+            empty_output[dqkv + 1] = static_cast<T>(0.0f);
+        }
         return;
+    }
 
     int T_c = (cache_length + B_c - 1) / B_c;
     T *att_output = output_ptrs[blockIdx.y];

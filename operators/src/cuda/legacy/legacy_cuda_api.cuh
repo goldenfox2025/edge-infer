@@ -289,6 +289,11 @@ template <typename T>
 void dynamic_flash_attention_wrapper(Tensor<T> &Q, const Tensor<T> &total_K, const Tensor<T> &total_V,
                                      Tensor<T> &att_output, int n_kv_heads, cudaStream_t stream = nullptr);
 
+template <typename T>
+void dynamic_flash_attention_with_workspace(
+    Tensor<T>& Q, const Tensor<T>& K, const Tensor<T>& V, Tensor<T>& output,
+    int n_kv_heads, Tensor<T>& workspace, cudaStream_t stream = nullptr);
+
 
 template <typename T>
 void flash_attention_graph_fixed(Tensor<T> &Q, const Tensor<T> &total_K, const Tensor<T> &total_V, T **d_output_ptrs,

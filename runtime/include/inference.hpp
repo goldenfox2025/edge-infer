@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "kvcache_base.hpp"
+#include "execution/cuda_workspace_arena.hpp"
 #include "tensor.hpp"
 #include "thread_pool.hpp"
 
@@ -97,6 +98,9 @@ class KVCache : public KVCacheBase {
   std::pair<Tensor<T>, Tensor<T>> get_layer_view(size_t layer);
 
  private:
+  // Persistent CUDA storage must never come from a global prefill arena.
+  CudaWorkspaceArena k_storage_;
+  CudaWorkspaceArena v_storage_;
   // Store all layers contiguously with shape [n_layers, max_seq_len, head_dim].
   Tensor<T> k_cache_contiguous_;
   Tensor<T> v_cache_contiguous_;

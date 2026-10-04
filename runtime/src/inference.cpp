@@ -3,6 +3,7 @@
 #include <chrono>
 #include <iomanip>
 #include <numeric>
+#include <limits>
 #include <vector>
 
 #include "base_model.hpp"
@@ -105,17 +106,54 @@ size_t estimate_prefill_arena_bytes(const BaseModel* model, size_t token_count,
   return estimated_bytes + slack_bytes;
 }
 
+class LegacyPrefillPhase {
+ public:
+  LegacyPrefillPhase(bool enabled, const BaseModel* model, size_t tokens,
+                     size_t element_size) : active_(enabled) {
+    if (active_) {
+      GlobalCudaMemoryPool::prepare_prefill_capacity(
+          estimate_prefill_arena_bytes(model, tokens, element_size));
+      GlobalCudaMemoryPool::set_prefill_phase(true);
+    }
+  }
+  ~LegacyPrefillPhase() { finish(); }
+  void finish() {
+    if (active_) {
+      GlobalCudaMemoryPool::set_prefill_phase(false);
+      active_ = false;
+    }
+  }
+  LegacyPrefillPhase(const LegacyPrefillPhase&) = delete;
+  LegacyPrefillPhase& operator=(const LegacyPrefillPhase&) = delete;
+ private:
+  bool active_;
+};
+
 }  // namespace
 
 template <typename T>
 KVCache<T>::KVCache(size_t n_layers, size_t max_seq_len, size_t head_dim, Device device, size_t initial_size)
     : n_layers_(n_layers), max_seq_len_(max_seq_len), head_dim_(head_dim), current_len_(0), device_(device) {
 
-    // Contiguous cache layout: [n_layers, max_seq_len, head_dim].
-    // KV cache allocations must outlive the temporary prefill workspace.
-    // Pass is_prefill=false to keep these buffers outside the prefill arena.
-    k_cache_contiguous_ = Tensor<T>({n_layers_, max_seq_len_, head_dim_}, device_, false);
-    v_cache_contiguous_ = Tensor<T>({n_layers_, max_seq_len_, head_dim_}, device_, false);
+    if (!n_layers_ || !max_seq_len_ || !head_dim_ ||
+        n_layers_ > std::numeric_limits<size_t>::max() / max_seq_len_ ||
+        n_layers_ * max_seq_len_ > std::numeric_limits<size_t>::max() / head_dim_ / sizeof(T)) {
+        throw std::invalid_argument("KVCache dimensions are empty or exceed addressable storage");
+    }
+    if (initial_size > max_seq_len_) {
+        throw std::invalid_argument("Initial size cannot exceed max_seq_len");
+    }
+    const std::vector<size_t> shape{n_layers_, max_seq_len_, head_dim_};
+    if (device_ == Device::CUDA) {
+        const size_t bytes = n_layers_ * max_seq_len_ * head_dim_ * sizeof(T);
+        k_storage_.reserve(bytes);
+        v_storage_.reserve(bytes);
+        k_cache_contiguous_ = Tensor<T>::from_external_buffer(k_storage_.template ptr_at<T>(0), shape, device_);
+        v_cache_contiguous_ = Tensor<T>::from_external_buffer(v_storage_.template ptr_at<T>(0), shape, device_);
+    } else {
+        k_cache_contiguous_ = Tensor<T>(shape, device_);
+        v_cache_contiguous_ = Tensor<T>(shape, device_);
+    }
 
     k_cache_slices_.resize(n_layers_ * max_seq_len_);
     v_cache_slices_.resize(n_layers_ * max_seq_len_);
@@ -178,10 +216,23 @@ KVCache<T>& KVCache<T>::cuda() {
     if (device_ == Device::CUDA)
         return *this;
 
+    // Tensor::nbytes() is a legacy int API. Persistent cache capacities can
+    // exceed 2 GiB per buffer, so compute allocation/copy sizes in size_t.
+    const size_t k_bytes = k_cache_contiguous_.numel() * sizeof(T);
+    const size_t v_bytes = v_cache_contiguous_.numel() * sizeof(T);
+    k_storage_.reserve(k_bytes);
+    v_storage_.reserve(v_bytes);
+    auto next_k = Tensor<T>::from_external_buffer(k_storage_.template ptr_at<T>(0),
+                                                 k_cache_contiguous_.sizes(), Device::CUDA);
+    auto next_v = Tensor<T>::from_external_buffer(v_storage_.template ptr_at<T>(0),
+                                                 v_cache_contiguous_.sizes(), Device::CUDA);
+    checkCudaErrors(cudaMemcpy(next_k.data_ptr(), k_cache_contiguous_.data_ptr(),
+                               k_bytes, cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpy(next_v.data_ptr(), v_cache_contiguous_.data_ptr(),
+                               v_bytes, cudaMemcpyHostToDevice));
+    k_cache_contiguous_ = std::move(next_k);
+    v_cache_contiguous_ = std::move(next_v);
     device_ = Device::CUDA;
-
-    k_cache_contiguous_ = k_cache_contiguous_.cuda();
-    v_cache_contiguous_ = v_cache_contiguous_.cuda();
 
     // Rebuild views after the underlying storage pointer changes.
     for (size_t layer = 0; layer < n_layers_; layer++) {
@@ -203,6 +254,8 @@ KVCache<T>& KVCache<T>::cpu() {
 
     k_cache_contiguous_ = k_cache_contiguous_.cpu();
     v_cache_contiguous_ = v_cache_contiguous_.cpu();
+    k_storage_.release();
+    v_storage_.release();
 
     // Rebuild views after the underlying storage pointer changes.
     for (size_t layer = 0; layer < n_layers_; layer++) {
@@ -271,6 +324,8 @@ InferenceEngine<T>::InferenceEngine(std::shared_ptr<BaseModel> model, Device dev
         int seed = std::chrono::system_clock::now().time_since_epoch().count();
         operators_->cuda();
         operators_->init_curand(d_states, seed, 0, nullptr);
+        // Nonblocking session streams must observe initialized RNG state.
+        checkCudaErrors(cudaStreamSynchronize(nullptr));
         this->cuda();
     }
 
@@ -338,10 +393,8 @@ void InferenceEngine<T>::warmup(size_t warmup_tokens, bool force_warmup, float t
             GpuTimer warmup_timer;
             warmup_timer.start();
 
-            GlobalCudaMemoryPool::prepare_prefill_capacity(
-                estimate_prefill_arena_bytes(model_.get(), warmup_input.size(), sizeof(T)));
-
-            GlobalCudaMemoryPool::set_prefill_phase(true);
+            LegacyPrefillPhase prefill_phase(!model_->owns_execution_workspaces(),
+                                             model_.get(), warmup_input.size(), sizeof(T));
 
             kv_cache_.resize(warmup_input.size());
 
@@ -350,7 +403,7 @@ void InferenceEngine<T>::warmup(size_t warmup_tokens, bool force_warmup, float t
 
             uint32_t* warmup_token =
                 model_->prefill(&input_tensor, thread_pool_, &kv_cache_, top_k, temperature, top_p, d_states);
-            GlobalCudaMemoryPool::set_prefill_phase(false);
+            prefill_phase.finish();
 
             // Initialize the Qwen CUDA graph through a decode call during warmup.
             // This lets graph capture use the active KV cache.
@@ -382,7 +435,7 @@ void InferenceEngine<T>::warmup(size_t warmup_tokens, bool force_warmup, float t
 
             kv_cache_.clear();
 
-            GlobalCudaMemoryPool::reset_prefill_buffer();
+            if (!model_->owns_execution_workspaces()) GlobalCudaMemoryPool::reset_prefill_buffer();
 
             if (!force_warmup) {
                 has_warmed_up_ = true;
@@ -440,11 +493,9 @@ void InferenceEngine<T>::generate_with_callback(const std::vector<uint32_t>& inp
             total_prefill_timer.start();
 
             {
-                if (this->device_ == Device::CUDA) {
-                    GlobalCudaMemoryPool::prepare_prefill_capacity(
-                        estimate_prefill_arena_bytes(this->model_.get(), input_size, sizeof(T)));
-                    GlobalCudaMemoryPool::set_prefill_phase(true);
-                }
+                LegacyPrefillPhase prefill_phase(
+                    this->device_ == Device::CUDA && !this->model_->owns_execution_workspaces(),
+                    this->model_.get(), input_size, sizeof(T));
                 std::cerr << "Entering prefill; sequence length: " << input_size << std::endl;
 
                 DeviceTimer prefill_timer(this->device_);
@@ -458,9 +509,7 @@ void InferenceEngine<T>::generate_with_callback(const std::vector<uint32_t>& inp
 
                 prefill_timer.stop();
 
-                if (this->device_ == Device::CUDA) {
-                    GlobalCudaMemoryPool::set_prefill_phase(false);
-                }
+                prefill_phase.finish();
 
                 std::cout << "Prefill completed in: " << std::fixed << std::setprecision(2)
                           << prefill_timer.milliseconds() << " ms" << std::endl
@@ -598,7 +647,7 @@ void InferenceEngine<T>::generate_with_callback(const std::vector<uint32_t>& inp
 
     // Reset the prefill workspace cursor and retain its storage for reuse.
 
-    if (device_ == Device::CUDA) {
+    if (device_ == Device::CUDA && !model_->owns_execution_workspaces()) {
         GlobalCudaMemoryPool::reset_prefill_buffer();
     }
 }
@@ -632,6 +681,7 @@ InferenceEngine<T>& InferenceEngine<T>::cuda() {
         }
         int seed = std::chrono::system_clock::now().time_since_epoch().count();
         operators_->init_curand(d_states, seed, 0, nullptr);
+        checkCudaErrors(cudaStreamSynchronize(nullptr));
     }
 
     device_ = Device::CUDA;

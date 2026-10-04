@@ -42,6 +42,7 @@ struct CudaGraphRuntime {
     }
 
     void release_graph_objects() {
+        synchronize_streams();
         if (graph_exec) {
             cudaGraphExecDestroy(graph_exec);
             graph_exec = nullptr;
@@ -51,6 +52,7 @@ struct CudaGraphRuntime {
             cuda_graph = nullptr;
         }
         graph_initialized = false;
+        kv_copy_nodes.clear();
     }
 
     void release_streams() {
@@ -67,6 +69,7 @@ struct CudaGraphRuntime {
     }
 
     void release_fixed_memory() {
+        synchronize_streams();
         if (d_rope_offset) {
             cudaFree(d_rope_offset);
             d_rope_offset = nullptr;
@@ -85,9 +88,15 @@ struct CudaGraphRuntime {
     }
 
     void release_pingpong() {
+        synchronize_streams();
         if (pingpong) {
             cudaFree(pingpong);
             pingpong = nullptr;
         }
+    }
+
+    void synchronize_streams() noexcept {
+        if (graph_stream) cudaStreamSynchronize(graph_stream);
+        if (prep_stream) cudaStreamSynchronize(prep_stream);
     }
 };

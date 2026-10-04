@@ -62,6 +62,9 @@ class BaseModel {
     return 0;
   }
 
+  // Compatibility engines need the global arena only for legacy executors.
+  virtual bool owns_execution_workspaces() const { return false; }
+
   // Print the model device.
   void print_device_info() const {
     std::cout << "Current model device: " << (device() == Device::CUDA ? "CUDA" : "CPU")
