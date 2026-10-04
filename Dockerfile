@@ -23,8 +23,6 @@ COPY operators/ operators/
 COPY bindings/ bindings/
 COPY frontend/ frontend/
 COPY scripts/ scripts/
-# Initialize the recorded CUTLASS submodule on the host before docker build.
-COPY cutlass/ cutlass/
 
 ARG CUDA_ARCHITECTURES=89
 ARG BUILD_JOBS=2

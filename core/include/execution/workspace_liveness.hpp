@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -32,6 +33,12 @@ class WorkspaceLivenessBuilder {
         }
         if (values_.find(name) != values_.end()) {
             throw std::runtime_error("Duplicate workspace value: " + name);
+        }
+        for (size_t extent : shape) {
+            if (!extent) throw std::invalid_argument("Workspace value has an empty extent: " + name);
+        }
+        if (!alignment || (alignment & (alignment - 1))) {
+            throw std::invalid_argument("Workspace value alignment must be a power of two: " + name);
         }
         values_[name] = {std::move(shape), alignment};
     }
@@ -100,6 +107,9 @@ class WorkspaceLivenessBuilder {
     static size_t bytes_for(const std::vector<size_t>& shape) {
         size_t bytes = sizeof(T);
         for (size_t dim : shape) {
+            if (!dim || bytes > std::numeric_limits<size_t>::max() / dim) {
+                throw std::overflow_error("Workspace value byte extent overflow");
+            }
             bytes *= dim;
         }
         return bytes;

@@ -13,6 +13,8 @@
 #include "base_model.hpp"
 #include "execution/cuda_workspace_arena.hpp"
 #include "weight_tensor.hpp"
+#include "tensor_view_adapter.hpp"
+#include "operators/cuda/execution.hpp"
 
 struct Qwen3Config {
     size_t vocab_size;
@@ -29,6 +31,17 @@ struct Qwen3Config {
     float rope_theta;
     int quant_type;
     int group_size;
+    bool qk_norm;
+};
+
+// Checkpoint layout is resolved once. Only the intrinsic weight-format branch
+// remains for mixed dense/AWQ checkpoints; there is no operator lookup.
+template <typename T>
+struct PreparedLinear {
+    op::cuda::DenseLinearWeight<T> dense;
+    op::cuda::AwqLinearWeight<T> awq;
+    bool quantized = false;
+    bool is_quantized() const noexcept { return quantized; }
 };
 
 // A prepared CUDA model. Execution state belongs to Qwen3Session, never here.
@@ -39,19 +52,13 @@ class Qwen3Model {
     using Parameters = std::unordered_map<std::string, Tensor<T>>;
     using IntegerParameters = std::unordered_map<std::string, Tensor<int32_t>>;
 
+    static Qwen3Config parse_configuration(const ModelConfig& source, bool quantized = false) {
+        return parse_config(source, quantized);
+    }
+
     struct Layer {
-        op::WeightTensor<T> q, k, v, o, gate, up, down;
-        const Tensor<T>* attention_norm;
-        const Tensor<T>* ffn_norm;
-        const Tensor<T>* q_norm;
-        const Tensor<T>* k_norm;
-        const Tensor<T>* q_bias;
-        const Tensor<T>* k_bias;
-        const Tensor<T>* v_bias;
-        const Tensor<T>* o_bias;
-        const Tensor<T>* gate_bias;
-        const Tensor<T>* up_bias;
-        const Tensor<T>* down_bias;
+        PreparedLinear<T> q, k, v, o, gate, up, down;
+        TensorView<const T, 1> attention_norm, ffn_norm, q_norm, k_norm;
     };
 
     Qwen3Model(const Parameters& params, const ModelConfig& config)
@@ -86,7 +93,10 @@ class Qwen3Model {
     const std::vector<Layer>& layers() const { return layers_; }
     const Tensor<T>& embedding() const { return params_.at("token_embeddings.weight"); }
     const Tensor<T>& output_norm() const { return params_.at("rms_out_w"); }
-    const op::WeightTensor<T>& output_weight() const { return *output_weight_; }
+    const PreparedLinear<T>& output_weight() const { return *output_weight_; }
+    TensorView<const T, 2> embedding_view() const noexcept { return embedding_view_; }
+    TensorView<const T, 1> output_norm_view() const noexcept { return output_norm_view_; }
+    TensorView<const float, 2> rope_view() const noexcept { return rope_view_; }
 
     op::WeightTensor<T> get_weight(const std::string& key) const {
         if (config_.quant_type == 1) {
@@ -112,9 +122,11 @@ class Qwen3Model {
             (void)get_weight("lm_head");
             for (size_t layer = 0; layer < config_.n_layers; ++layer) {
                 const auto suffix = std::to_string(layer);
-                for (const char* prefix : {"rms_att_w", "rms_ffn_w", "q_norm", "k_norm"}) {
+                for (const char* prefix : {"rms_att_w", "rms_ffn_w"}) {
                     if (!params_.count(std::string(prefix) + suffix)) return false;
                 }
+                if (config_.qk_norm && (!params_.count("q_norm" + suffix) ||
+                                       !params_.count("k_norm" + suffix))) return false;
                 for (const char* prefix : {"wq", "wk", "wv", "wo", "w_gate", "w_up", "w_down"}) {
                     (void)get_weight(std::string(prefix) + suffix);
                 }
@@ -166,6 +178,7 @@ class Qwen3Model {
         result.rms_norm_eps = static_cast<float>(source.at("rms_norm_eps"));
         result.rope_theta = static_cast<float>(source.at("rope_theta"));
         result.quant_type = quantized ? 1 : 0;
+        result.qk_norm = !source.count("qk_norm") || source.at("qk_norm") != 0;
         const size_t group_size = source.count("group_size")
                                       ? positive_size(source, "group_size") : 128;
         if (group_size > static_cast<size_t>(std::numeric_limits<int>::max())) {
@@ -189,9 +202,6 @@ class Qwen3Model {
         }
         if (result.hidden_size > 10240 || result.head_dim > 10240) {
             throw std::invalid_argument("Qwen3 normalization width exceeds the supported kernel range");
-        }
-        if (result.hidden_size % 8) {
-            throw std::invalid_argument("Qwen3 embedding width must be divisible by 8 for CUDA gather");
         }
         return result;
     }
@@ -272,6 +282,9 @@ class Qwen3Model {
                const Parameters& scales, const IntegerParameters& qzeros,
                const ModelConfig& source, bool quantized)
         : config_(parse_config(source, quantized)) {
+        if (config_.head_dim > 1024) {
+            throw std::invalid_argument("CUDA decoder attention supports head_dim at most 1024");
+        }
         size_t bytes = 0;
         add_storage_bytes(params, bytes);
         add_storage_bytes(qweights, bytes);
@@ -309,7 +322,8 @@ class Qwen3Model {
         }
     }
 
-    op::WeightTensor<T> prepared_linear(const std::string& name, size_t input, size_t output) const {
+    PreparedLinear<T> prepared_linear(const std::string& name, size_t input, size_t output,
+                                      const Tensor<T>* bias = nullptr) const {
         auto weight = get_weight(name);
         if (!weight.is_quantized()) {
             require_shape(*weight.tensor(), {input, output}, name);
@@ -329,43 +343,53 @@ class Qwen3Model {
             require_contiguous(*weight.scales(), name + ".scales");
             require_contiguous(*weight.qzeros(), name + ".qzeros");
         }
-        return weight;
+        TensorView<const T, 1> bias_view{};
+        if (bias) bias_view = borrow_tensor_view<1>(*bias);
+        PreparedLinear<T> result;
+        result.quantized = weight.is_quantized();
+        if (result.quantized) {
+            result.awq = op::cuda::prepare_awq<T>(borrow_tensor_view<2>(*weight.qweight()),
+                borrow_tensor_view<2>(*weight.scales()), borrow_tensor_view<2>(*weight.qzeros()),
+                config_.group_size, input, bias_view);
+        } else {
+            result.dense = op::cuda::prepare_dense<T>(borrow_tensor_view<2>(*weight.tensor()), bias_view);
+        }
+        return result;
     }
 
     void prepare_layers() {
         require_shape(embedding(), {config_.vocab_size, config_.hidden_size}, "token_embeddings.weight");
         require_contiguous(embedding(), "token_embeddings.weight");
         require_shape(output_norm(), {config_.hidden_size}, "rms_out_w");
-        output_weight_ = prepared_linear("lm_head", config_.hidden_size, config_.vocab_size);
+        require_contiguous(output_norm(), "rms_out_w");
+        embedding_view_ = borrow_tensor_view<2>(embedding());
+        output_norm_view_ = borrow_tensor_view<1>(output_norm());
+        output_weight_ = prepared_linear("lm_head", config_.hidden_size, config_.vocab_size,
+                                         optional_parameter("lm_head.bias", config_.vocab_size));
         layers_.reserve(config_.n_layers);
         const size_t q_width = config_.n_heads * config_.head_dim;
         const size_t kv_width = config_.n_kv_heads * config_.head_dim;
         for (size_t index = 0; index < config_.n_layers; ++index) {
             const auto suffix = std::to_string(index);
             const auto prefix = "layers." + suffix + ".";
-            auto norm = [&](const char* name, size_t width) -> const Tensor<T>* {
+            auto norm = [&](const char* name, size_t width) -> TensorView<const T, 1> {
                 const auto key = std::string(name) + suffix;
                 const auto& tensor = params_.at(key);
                 require_shape(tensor, {width}, key);
-                return &tensor;
+                require_contiguous(tensor, key);
+                return borrow_tensor_view<1>(tensor);
             };
             layers_.push_back({
-                prepared_linear("wq" + suffix, config_.hidden_size, q_width),
-                prepared_linear("wk" + suffix, config_.hidden_size, kv_width),
-                prepared_linear("wv" + suffix, config_.hidden_size, kv_width),
-                prepared_linear("wo" + suffix, q_width, config_.hidden_size),
-                prepared_linear("w_gate" + suffix, config_.hidden_size, config_.intermediate_size),
-                prepared_linear("w_up" + suffix, config_.hidden_size, config_.intermediate_size),
-                prepared_linear("w_down" + suffix, config_.intermediate_size, config_.hidden_size),
+                prepared_linear("wq" + suffix, config_.hidden_size, q_width, optional_parameter(prefix + "self_attn.q_proj.bias", q_width)),
+                prepared_linear("wk" + suffix, config_.hidden_size, kv_width, optional_parameter(prefix + "self_attn.k_proj.bias", kv_width)),
+                prepared_linear("wv" + suffix, config_.hidden_size, kv_width, optional_parameter(prefix + "self_attn.v_proj.bias", kv_width)),
+                prepared_linear("wo" + suffix, q_width, config_.hidden_size, optional_parameter(prefix + "self_attn.o_proj.bias", config_.hidden_size)),
+                prepared_linear("w_gate" + suffix, config_.hidden_size, config_.intermediate_size, optional_parameter(prefix + "mlp.gate_proj.bias", config_.intermediate_size)),
+                prepared_linear("w_up" + suffix, config_.hidden_size, config_.intermediate_size, optional_parameter(prefix + "mlp.up_proj.bias", config_.intermediate_size)),
+                prepared_linear("w_down" + suffix, config_.intermediate_size, config_.hidden_size, optional_parameter(prefix + "mlp.down_proj.bias", config_.hidden_size)),
                 norm("rms_att_w", config_.hidden_size), norm("rms_ffn_w", config_.hidden_size),
-                norm("q_norm", config_.head_dim), norm("k_norm", config_.head_dim),
-                optional_parameter(prefix + "self_attn.q_proj.bias", q_width),
-                optional_parameter(prefix + "self_attn.k_proj.bias", kv_width),
-                optional_parameter(prefix + "self_attn.v_proj.bias", kv_width),
-                optional_parameter(prefix + "self_attn.o_proj.bias", config_.hidden_size),
-                optional_parameter(prefix + "mlp.gate_proj.bias", config_.intermediate_size),
-                optional_parameter(prefix + "mlp.up_proj.bias", config_.intermediate_size),
-                optional_parameter(prefix + "mlp.down_proj.bias", config_.hidden_size)
+                config_.qk_norm ? norm("q_norm", config_.head_dim) : TensorView<const T,1>{},
+                config_.qk_norm ? norm("k_norm", config_.head_dim) : TensorView<const T,1>{}
             });
         }
     }
@@ -394,6 +418,7 @@ class Qwen3Model {
         if (status != cudaSuccess) throw std::runtime_error("Failed to prepare Qwen3 RoPE cache");
         rope_sin_cos_cache_ = Tensor<float>::from_external_buffer(output,
             {config_.max_position_embeddings, config_.head_dim}, Device::CUDA);
+        rope_view_ = borrow_tensor_view<2>(static_cast<const Tensor<float>&>(rope_sin_cos_cache_));
     }
 
     const Qwen3Config config_;
@@ -406,5 +431,8 @@ class Qwen3Model {
     IntegerParameters qzeros_params_;
     Tensor<float> rope_sin_cos_cache_;
     std::vector<Layer> layers_;
-    std::optional<op::WeightTensor<T>> output_weight_;
+    std::optional<PreparedLinear<T>> output_weight_;
+    TensorView<const T, 2> embedding_view_{};
+    TensorView<const T, 1> output_norm_view_{};
+    TensorView<const float, 2> rope_view_{};
 };

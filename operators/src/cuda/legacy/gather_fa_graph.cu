@@ -4,7 +4,10 @@
 #include <limits>
 #include <vector>
 
+#ifndef EDGE_INFER_COMPUTE_ONLY
 #include "cuda/legacy/legacy_cuda_api.cuh"
+#endif
+#include "operators/cuda/execution_kernels.cuh"
 
 #define MAX_BRANCHES 3
 
@@ -79,6 +82,8 @@ __global__ void gather_fa_kernel_graph_fixed(T **input_ptrs, T *output_ptr, int 
 }
 
 
+#ifndef EDGE_INFER_COMPUTE_ONLY
+
 template <typename T>
 void gather_fa_graph_fixed(T **d_input_ptrs, Tensor<T> &output, int *d_segment_info, cudaStream_t stream) {
     int dqkv = output.sizes()[1];
@@ -106,4 +111,21 @@ template void gather_fa_graph_fixed<float>(float **d_input_ptrs, Tensor<float> &
 template void gather_fa_graph_fixed<__nv_bfloat16>(__nv_bfloat16 **d_input_ptrs, Tensor<__nv_bfloat16> &output,
                                                    int *d_segment_info, cudaStream_t stream);
 
+
+#endif
 }  // namespace cuda_OP
+
+namespace op::cuda::detail {
+
+template <typename T>
+void launch_graph_gather(const ExecutionContext& context, T** branches,
+                          TensorView<T, 3> output, int* lengths) {
+  cuda_OP::gather_fa_kernel_graph_fixed<T><<<output.shape[1], output.shape[2], 0, context.stream>>>(
+      branches, output.data, lengths, output.shape[1], output.shape[2]);
+  const auto result = cudaGetLastError();
+  if (result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(result));
+}
+template void launch_graph_gather<float>(const ExecutionContext&, float**, TensorView<float, 3>, int*);
+template void launch_graph_gather<__nv_bfloat16>(const ExecutionContext&, __nv_bfloat16**, TensorView<__nv_bfloat16, 3>, int*);
+
+}  // namespace op::cuda::detail

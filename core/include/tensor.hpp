@@ -198,6 +198,9 @@ class Tensor {
             data_.reset();
             T* gpu_ptr = static_cast<T*>(GlobalCudaMemoryPool::instance().allocate(length_ * sizeof(T)));
             checkCudaError(cudaMemcpy(gpu_ptr, data.data(), length_ * sizeof(T), cudaMemcpyHostToDevice));
+            // Prepared sessions use nonblocking streams and must observe the
+            // complete upload, including pageable-host staging transfers.
+            checkCudaError(cudaStreamSynchronize(nullptr));
             gpu_data_ = make_gpu_owner(gpu_ptr);
         } else {
             throw std::runtime_error("Invalid device specified");
@@ -502,6 +505,7 @@ class Tensor {
         }
 
         checkCudaError(cudaMemcpy(gpu_ptr, data_ptr(), length_ * sizeof(T), cudaMemcpyHostToDevice));
+        checkCudaError(cudaStreamSynchronize(nullptr));
         data_.reset();
         gpu_data_ = make_gpu_owner(gpu_ptr);
         device_ = Device::CUDA;

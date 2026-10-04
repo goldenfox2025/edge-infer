@@ -4,7 +4,10 @@
 #include <limits> // For std::numeric_limits
 #include <vector>
 
+#ifndef EDGE_INFER_COMPUTE_ONLY
 #include "cuda/legacy/legacy_cuda_api.cuh"
+#endif
+#include "operators/cuda/execution_kernels.cuh"
 
 namespace cuda_OP
 {
@@ -116,6 +119,8 @@ __global__ void gather_fa_kernel_variable(const T *T1_ptr, const T *T2_ptr, cons
   output_ptr[base_out + tid] = static_cast<T>(final_out);
 }
 
+
+#ifndef EDGE_INFER_COMPUTE_ONLY
 
 template <typename T>
 void gather_fa_specialized_1branch(const std::vector<Tensor<T>>& inputs, Tensor<T>& output,
@@ -366,4 +371,23 @@ template void gather_fa_specialized_5branch<__nv_bfloat16>(
     Tensor<__nv_bfloat16>& output,
     cudaStream_t stream);
 
+
+#endif
 } // namespace cuda_OP
+
+namespace op::cuda::detail {
+
+template <typename T>
+void launch_attention_gather(const ExecutionContext& context, const T* first,
+    const T* second, const T* third, const T* fourth, const T* fifth,
+    int branches, TensorView<T, 3> output) {
+  cuda_OP::gather_fa_kernel_variable<T><<<output.shape[1], output.shape[2], 0, context.stream>>>(
+      first, second, third, fourth, fifth, output.data, branches, output.shape[1], output.shape[2]);
+  const auto result = cudaGetLastError();
+  if (result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(result));
+}
+
+template void launch_attention_gather<float>(const ExecutionContext&, const float*, const float*, const float*, const float*, const float*, int, TensorView<float, 3>);
+template void launch_attention_gather<__nv_bfloat16>(const ExecutionContext&, const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, int, TensorView<__nv_bfloat16, 3>);
+
+}  // namespace op::cuda::detail

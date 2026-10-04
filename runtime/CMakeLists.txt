@@ -14,9 +14,13 @@ endif()
 
 find_package(Threads REQUIRED)
 
-if(NOT TARGET unified_operators)
+if(NOT TARGET operators_cuda)
   add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../operators"
                    "${CMAKE_CURRENT_BINARY_DIR}/operators")
+endif()
+
+if(NOT TARGET core_cuda)
+  edge_infer_enable_core_cuda()
 endif()
 
 add_library(inference_runtime STATIC
@@ -24,8 +28,6 @@ add_library(inference_runtime STATIC
   src/thread_pool.cpp
   src/qwen.cpp
   src/qwen3.cpp
-  src/qwen3_forward.cpp
-  src/qwen3_prefill.cpp
   src/speculative_decoder.cpp
   src/speech/qwen_tts_conditioning.cpp
 )
@@ -35,17 +37,33 @@ target_include_directories(inference_runtime PUBLIC
 )
 target_compile_features(inference_runtime PUBLIC cxx_std_17)
 target_link_libraries(inference_runtime PUBLIC
-  unified_operators
+  operators_cuda
+  core_cuda
   Threads::Threads
 )
 set_target_properties(inference_runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if(BUILD_TESTING)
-  add_executable(qwen3_session_test tests/qwen3_session_test.cpp)
+  add_executable(qwen3_session_test tests/qwen3_session_test.cpp tests/allocation_probe.cpp tests/test_cuda_rng.cu)
+  set_target_properties(qwen3_session_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND UNIX)
+    target_compile_definitions(qwen3_session_test PRIVATE EDGE_INFER_TEST_CUDA_WRAPPING=1)
+    target_link_options(qwen3_session_test PRIVATE
+      LINKER:--wrap=cudaMalloc LINKER:--wrap=cudaMallocAsync
+      LINKER:--wrap=cudaFree LINKER:--wrap=cudaFreeAsync)
+  endif()
   target_link_libraries(qwen3_session_test PRIVATE EdgeInfer::runtime)
   add_test(NAME qwen3_session_test COMMAND qwen3_session_test)
   set_tests_properties(qwen3_session_test PROPERTIES
     LABELS "runtime;cuda;gpu;session" SKIP_RETURN_CODE 77 TIMEOUT 120)
+  add_executable(qwen2_float_test tests/qwen2_float_test.cpp)
+  target_link_libraries(qwen2_float_test PRIVATE EdgeInfer::runtime)
+  add_test(NAME qwen2_float_test COMMAND qwen2_float_test)
+  set_tests_properties(qwen2_float_test PROPERTIES LABELS "runtime;cuda;gpu;reference" SKIP_RETURN_CODE 77 TIMEOUT 120)
+  add_executable(inference_generation_test tests/inference_generation_test.cpp)
+  target_link_libraries(inference_generation_test PRIVATE EdgeInfer::runtime)
+  add_test(NAME inference_generation_test COMMAND inference_generation_test)
+  set_tests_properties(inference_generation_test PROPERTIES LABELS "runtime;cuda;gpu;generation" SKIP_RETURN_CODE 77 TIMEOUT 120)
 
   add_executable(qwen_tts_conditioning_parity tests/qwen_tts_conditioning_parity.cpp)
   target_link_libraries(qwen_tts_conditioning_parity PRIVATE EdgeInfer::runtime)

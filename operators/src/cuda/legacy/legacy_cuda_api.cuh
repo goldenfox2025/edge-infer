@@ -33,17 +33,7 @@
             throw std::runtime_error(cudaGetErrorString(err));                                          \
         }                                                                                               \
     } while (0)
-template <typename T, int N>
-union Vec {
-    float4 f4;
-    T t[N];
-};
-
-template <typename T, int N>
-union Vec_2 {
-    float2 f2;
-    T t[N];
-};
+#include "cuda/vector_pack.cuh"
 
 namespace cuda_OP {
 

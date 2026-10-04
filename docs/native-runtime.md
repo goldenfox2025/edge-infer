@@ -7,7 +7,7 @@ or WSL with a supported CUDA toolchain.
 
 ## CMake source integration
 
-Use the complete checkout, including its recorded CUTLASS submodule:
+The normal runtime build uses CUDA/cuBLAS and C++17. CUTLASS is only needed for the optional historical operator adapters:
 
 ```cmake
 cmake_minimum_required(VERSION 3.20)
@@ -90,6 +90,7 @@ auto second = first->new_session(1024);  // Shared weights, empty history.
 // Contiguous rank-one CUDA uint32_t tensors; next_input contains one token.
 auto prompt_logits = first->prefill(prompt);
 auto decode_logits = first->decode(next_input);
+// A CPU token value is also accepted: first->decode(uint32_t{token});
 const auto active_tokens = first->context_size();
 const auto capacity = first->context_capacity();
 first->reset();  // Empty history; retain KV and decode allocations.

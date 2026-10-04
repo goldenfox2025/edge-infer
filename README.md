@@ -72,7 +72,7 @@ The operator-based Qwen3 decoder and session isolation are covered in the
 The Docker recipe was not built.
 
 `scripts/test.sh` now runs these workspace unit tests instead of the historical matrix
-benchmark. That benchmark remains a separate target after an engine build:
+benchmark. That benchmark is available only with `-DEDGE_INFER_BUILD_LEGACY_OPERATORS=ON`:
 
 ```sh
 cmake --build build --target avx_matmul_bench --parallel 2
@@ -95,7 +95,6 @@ The engine contains Linux-specific host code; native Windows support is not
 established. The compiler is selected by CMake instead of a hard-coded path.
 
 ```sh
-git submodule update --init --recursive -- cutlass
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -r requirements-build.txt -r requirements-runtime.txt
@@ -115,17 +114,17 @@ device using `CMAKE_CUDA_ARCHITECTURES`; changing this number alone does not
 adapt the engine to Jetson. Jetson needs a matching JetPack/CUDA/compiler stack,
 ARM64 dependency wheels, model checks and measurements on the device.
 
-CUTLASS is pinned by the repository's gitlink. `scripts/build.sh` initializes that
-checkout when its headers are absent. An exported source tree can use an
-existing pinned checkout through `CUTLASS_DIR=/path/to/cutlass`. Build directories
-are reused; `--clean` invokes the build system's clean target.
+The default runtime links the direct `EdgeInfer::operators_cuda` compute library
+and does not require CUTLASS. The historical Tensor/factory adapters are optional:
+enable `EDGE_INFER_BUILD_LEGACY_OPERATORS=ON` to build them, then initialize the
+pinned CUTLASS submodule or provide its checkout through `CUTLASS_DIR`.
+Build directories are reused; `--clean` invokes the build system's clean target.
 
 ## Native C++ runtime
 
 Build the native runtime without Python, pybind11 or frontend dependencies:
 
 ```sh
-git submodule update --init --recursive -- cutlass
 cmake -S . -B build-native \
   -DEDGE_INFER_BUILD_RUNTIME=ON -DEDGE_INFER_BUILD_PYTHON=OFF \
   -DCMAKE_CUDA_ARCHITECTURES=89 -DCMAKE_BUILD_TYPE=Debug
@@ -165,22 +164,21 @@ sampling-distribution checks.
 
 ## Desktop container
 
-Initialize CUTLASS first so the Docker build uses the recorded revision:
+Build the desktop development image:
 
 ```sh
-git submodule update --init --recursive -- cutlass
 docker build --build-arg CUDA_ARCHITECTURES=89 -t edge-infer-dev .
 docker run --rm -it --gpus all -v /absolute/path/to/models:/models:ro edge-infer-dev
 ```
 
 The recipe copies `operators/` and its test sources, and does not clone a moving
-CUTLASS revision. It has not been built as part of the standalone test check.
+dependency revision. The current image recipe has not been built during native validation.
 It is a desktop development image, not a Jetson image.
 
 ## Code map and next work
 
 - `core/`: shared tensors, weight views, CUDA memory and portable workspace planning.
-- `runtime/include/execution/`: model execution programs and CUDA workspace integration.
+- `runtime/include/execution/`: the shared transformer backbone and planned CUDA workspaces.
 - `runtime/src/`: models, inference flow, KV-cache and CUDA Graph integration.
 - `runtime/include/speech/`: concrete Qwen TTS stage contracts, starting with conditioning.
 - `runtime/CMakeLists.txt`: the native `EdgeInfer::runtime` library.
@@ -239,16 +237,17 @@ cmake --build build-operators --parallel 2
 ctest --test-dir build-operators --output-on-failure
 ```
 
-This build uses the sibling `core/` directory. `operators_core` exposes
-non-owning views and inline reference functions. `unified_operators` contains
-CUDA kernels and the existing Tensor adapters. Direct CUDA calls are available
-for add, multiply, SiLU, RMSNorm, biased linear projection and multi-table
-embedding sums.
-Those eager facade calls avoid factory lookup and virtual dispatch. Qwen3 eager
-and prefill share one explicit typed operator sequence without execution IR or
-packed prepared-node arguments. Dense matmul retains a compatibility facade bound
-to the session's cuBLAS handle. The static API adds no required
-shared ownership or operand allocation; CUDA launch overhead still applies. See [architecture](docs/architecture.md) and [roadmap](docs/roadmap.md).
+This build uses the sibling `core/` directory. `EdgeInfer::operators_core`
+exposes borrowed views, workspace planning and inline CPU reference functions.
+With CUDA enabled, `EdgeInfer::operators_cuda` provides direct dense/AWQ linear,
+gather, RoPE, attention, KV stores, sampling and conditioning primitives. The
+compute target requires cudart and cuBLAS, and excludes Tensor ownership,
+operator factories and global memory-pool symbols. Callers own execution
+contexts and scratch; the runtime resolves fixed views and workspace offsets
+before execution. `EdgeInfer::unified_operators` is available only through
+`EDGE_INFER_BUILD_LEGACY_OPERATORS=ON` and requires the pinned CUTLASS checkout.
+CUDA library overhead remains; these boundaries establish no performance or
+complete TTS claim. See [architecture](docs/architecture.md) and [roadmap](docs/roadmap.md).
 
 Keep documentation, comments and diagnostics in English. Model input data may
 contain any language. Develop against `master`, and validate fused operations

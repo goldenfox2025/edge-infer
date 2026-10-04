@@ -4,7 +4,9 @@
 #include <limits>
 
 #include "operators/cuda/direct.hpp"
+#ifndef EDGE_INFER_COMPUTE_ONLY
 #include "operators/cuda/silu_cuda.cuh"
+#endif
 
 namespace op {
 
@@ -46,17 +48,23 @@ void cuda::silu(ArrayView<const T> input, ArrayView<T> output, cudaStream_t stre
   }
 }
 
+#ifndef EDGE_INFER_COMPUTE_ONLY
+
 template <typename T>
 void SiluCUDAOperator<T>::operator()(Tensor<T>* output, Tensor<T>* input,
                                     cudaStream_t stream) {
   cuda::silu<T>({input->data_ptr(), input->numel()},
                 {output->data_ptr(), output->numel()}, stream);
 }
+#endif
+
 
 template void cuda::silu<float>(ArrayView<const float>, ArrayView<float>, cudaStream_t);
 template void cuda::silu<__nv_bfloat16>(ArrayView<const __nv_bfloat16>, ArrayView<__nv_bfloat16>, cudaStream_t);
 
+#ifndef EDGE_INFER_COMPUTE_ONLY
 template class SiluCUDAOperator<float>;
 template class SiluCUDAOperator<__nv_bfloat16>;
+#endif
 
 }  // namespace op

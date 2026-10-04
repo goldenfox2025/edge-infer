@@ -4,7 +4,10 @@
 #include <stdexcept>
 #include <string>
 
+#ifndef EDGE_INFER_COMPUTE_ONLY
 #include "cuda/legacy/legacy_cuda_api.cuh"
+#endif
+#include "operators/cuda/execution_kernels.cuh"
 #include "ptx_common.h"
 
 __device__ __forceinline__ float warpReduceSum(float val) {
@@ -1106,6 +1109,8 @@ __global__ void flash_attn_prefill_kernel_v3(const T* __restrict__ q_global, con
         __syncthreads();
     }
 }
+#ifndef EDGE_INFER_COMPUTE_ONLY
+
 template <typename T>
 void flash_attention_prefill(const Tensor<T>& Q, const Tensor<T>& K, const Tensor<T>& V, Tensor<T>& output, int n_heads,
                              int n_kv_heads, int head_dim, int seq_len, int total_seq_len, int offset,
@@ -1179,4 +1184,39 @@ template void flash_attention_prefill<__nv_bfloat16>(const Tensor<__nv_bfloat16>
                                                      int n_heads, int n_kv_heads, int head_dim, int seq_len,
                                                      int total_seq_len, int offset, cudaStream_t stream);
 
+
+#endif
 }  // namespace cuda_OP
+
+namespace op::cuda::detail {
+
+const void* prepare_attention_padding() {
+  void* pointer = nullptr;
+  const auto result = cudaGetSymbolAddress(&pointer, cuda_OP::flash_prefill_zero_padding);
+  if (result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(result));
+  return pointer;
+}
+
+void launch_prefill_128(const ExecutionContext& context,
+    TensorView<const __nv_bfloat16, 3> q, TensorView<const __nv_bfloat16, 3> k,
+    TensorView<const __nv_bfloat16, 3> v, TensorView<__nv_bfloat16, 3> output,
+    std::size_t offset) {
+  constexpr int columns = 16, rows = 16, width = 128, warps = 8, stages = 2;
+  constexpr std::size_t shared_bytes =
+      rows * width * sizeof(__nv_bfloat16) +
+      2 * columns * width * sizeof(__nv_bfloat16) * stages +
+      rows * width * sizeof(float) + rows * 2 * sizeof(float) +
+      rows * columns * sizeof(float) + rows * columns * sizeof(__nv_bfloat16) +
+      rows * width * sizeof(float);
+  if (!context.attention_padding || shared_bytes > context.shared_memory_limit)
+    throw std::invalid_argument("Direct BF16 prefill requires prepared padding and sufficient shared memory");
+  cuda_OP::flash_attn_prefill_kernel_v3<__nv_bfloat16, columns, rows, rows, warps, width, stages>
+      <<<dim3((q.shape[0] + rows - 1) / rows, q.shape[1]), warps * 32, shared_bytes, context.stream>>>(
+          q.data, k.data, v.data, output.data, q.shape[1], k.shape[1], q.shape[1] / k.shape[1],
+          q.shape[0], k.shape[0], offset, q.stride[0],
+          const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(context.attention_padding)));
+  const auto result = cudaGetLastError();
+  if (result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(result));
+}
+
+}  // namespace op::cuda::detail

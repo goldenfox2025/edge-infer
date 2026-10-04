@@ -5,9 +5,8 @@ maintained branch. Native runtime extraction and the first Qwen3-TTS conditionin
 stage are implemented. The current speech milestone is an audible 0.6B path on
 NVIDIA desktop GPUs; its remaining work is:
 
-1. Extend the implemented Qwen3 model/session split and private fixed storage
-   to speech. Extract an embedding-to-hidden-state
-   transformer backbone with explicit head dimensions and positions. Validate
+1. Connect speech adapters to the shared embedding-to-hidden-state backbone
+   and private session storage, adding the talker's multi-axis positions. Validate
    the talker and code predictor separately against the pinned reference.
 2. Implement prompt alignment, language/speaker tokens, per-frame predictor
    cache reset, group-specific heads and stopping rules for the chosen variant.
@@ -25,9 +24,8 @@ language-model and platform work also remains:
    compiler, driver, CUDA toolkit and commands.
 2. Validate AWQ packing, scales, zeros and fused kernels across supported shapes.
    Establish correctness before comparing performance.
-3. Extend Qwen3's direct typed operator sequence to the remaining runtime paths.
-   Give probabilistic sampling caller-owned scratch before asynchronous sessions.
-   Measure call overhead, allocations and end-to-end latency.
+3. Measure the shared direct decoder and private sampling workspaces on real
+   checkpoints: call overhead, allocations, memory use and end-to-end latency.
 4. Review speculative rejection and residual resampling with distribution tests.
 5. Publish repeated NVIDIA desktop benchmarks, including warmup, memory use,
    prefill/decode latency and complete reference configurations.

@@ -1,8 +1,8 @@
 # Operator library
 
 The operator layer can be built separately from the model runtime and Python
-bindings. It provides a small direct CPU reference API and the existing
-CPU/CUDA compatibility adapters.
+bindings. It provides direct CPU reference operations and a standalone CUDA
+compute library. Historical Tensor/factory adapters are optional.
 
 ## Direct CPU reference API
 
@@ -47,18 +47,15 @@ CUDA, CUTLASS, Python, model weights, or the model runtime. Link the
 `EdgeInfer::operators_core` interface target from CMake. This target exports the
 `operators/include` and sibling `core/include` directories.
 
-## CUDA and compatibility adapters
+## Direct CUDA compute library
 
-The `EdgeInfer::unified_operators` static library includes the existing
-`Tensor`, factory, CPU and CUDA adapters, CUDA kernels, and legacy kernel bridge.
-It requires the CUDA toolkit, the sibling `core` directory, and the pinned
-CUTLASS submodule. It does not require Python or model weights.
-The static operator library resolves its CUDA device symbols when it is built,
-so a C++ application can link it through the native runtime without adding a
-CUDA source merely to trigger final device linking.
+`EdgeInfer::operators_cuda` is the default CUDA static library. It requires the
+CUDA toolkit with cudart/cuBLAS and the sibling core headers. It does not require
+CUTLASS, Python, model weights or the core memory runtime. It excludes the
+historical Tensor/factory adapters and resolves its CUDA device symbols during
+the library build, so C++ consumers need no extra CUDA source for device linking.
 
 ```sh
-git submodule update --init cutlass
 cmake -S operators -B build-operators-cuda \
   -DEDGE_INFER_OPERATORS_ENABLE_CUDA=ON \
   -DCMAKE_CUDA_ARCHITECTURES=89 -DCMAKE_BUILD_TYPE=Release
@@ -67,10 +64,12 @@ ctest --test-dir build-operators-cuda --output-on-failure
 ```
 
 Choose the CUDA architecture for the target GPU; `89` is the existing desktop
-default. `CUTLASS_DIR` can point to another compatible CUTLASS checkout. Building
-this library includes a CPU compatibility test that still links the CUDA
-toolkit because the existing `Tensor` API uses CUDA types and memory helpers.
-It performs no model inference.
+default. To build `EdgeInfer::unified_operators`, separately enable
+`EDGE_INFER_BUILD_LEGACY_OPERATORS=ON` and `EDGE_INFER_CORE_ENABLE_CUDA=ON`.
+That optional target requires the pinned CUTLASS submodule; initialize it with
+`git submodule update --init cutlass` or provide its checkout through
+`CUTLASS_DIR`. Its CPU compatibility tests still link CUDA because the legacy
+Tensor API uses CUDA types and memory helpers.
 
 `operators/cuda/direct.hpp` exports `op::cuda::add`, `multiply`, `silu`, and
 `rms_norm` for borrowed float/BF16 device views and a caller-supplied stream.
@@ -95,12 +94,12 @@ op::cuda::add<float>({device_a, count}, {device_b, count},
                      {device_output, count}, stream);
 ```
 
-`UnifiedOperators` uses these direct CUDA functions for the same four operations
+The optional historical `UnifiedOperators` facade uses these direct CUDA functions for the same four operations
 and statically calls their CPU adapters. Those methods bypass factory lookup,
 shared pointer copies and virtual dispatch. Factory metadata, the remaining
-compatibility operations, and Qwen3's prepared packed executor retain dynamic
-dispatch. Custom factory registrations affect those dynamic paths, while the
-four direct facade methods use the built-in implementations.
+compatibility operations retain dynamic dispatch. Custom factory registrations
+affect those historical paths. Prepared model execution calls the direct CUDA
+API with fixed views and resolved weight layouts.
 
 CUDA calls retain their launch and library overhead. CPU sampling
 uses AVX when enabled by the compiler and scalar temperature/max loops
@@ -118,7 +117,7 @@ GPU correctness on a target device.
 `operators/cuda/conditioning.hpp` adds borrowed float/BF16 `op::cuda::linear`
 and `sum_embeddings` primitives. These are tensor operations independent of
 model names, text tokenization, audio decoding, and Python. Link the same
-`EdgeInfer::unified_operators` target.
+`EdgeInfer::operators_cuda` target.
 
 `linear` accepts contiguous row-major input `[rows, in_features]`, physical
 weights `[out_features, in_features]`, an optional bias `[out_features]`, and
@@ -180,18 +179,44 @@ and rejected IDs/extents/overflow before output or scratch writes. It uses the
 These primitive tests use small deterministic inputs; checkpoint-based model
 conditioning parity is a separate runtime validation step.
 
+## Prepared CUDA execution
+
+`operators/cuda/execution.hpp` provides direct linear/AWQ, gather, RoPE, attention,
+KV stores and sampling on fixed `TensorView<T, Rank>` descriptors. Views contain
+only a borrowed pointer and fixed extents/strides. Preparation resolves matrix
+layout and device launch limits once. Bind the borrowed execution context at the
+start of a decoder submission, then keep all buffers and its handle alive through
+stream completion. No operator factory or model runtime is needed.
+
+Sampling preparation queries its CUB scratch requirement once; the caller owns
+that scratch, output tokens/probabilities and RNG state. Temperature/top-k/top-p
+are applied explicitly. A probability query writes to caller-owned storage.
+BF16 head width 128 reuses the optimized attention implementation. Other supported
+head widths and FP32 use a scalar correctness fallback. That fallback establishes
+functional coverage; no performance improvement is implied.
+
+`EdgeInfer::operators_cuda` links portable headers, cudart and cuBLAS only. The
+normal compute archive excludes Tensor adapters, shared ownership and global
+memory-pool symbols. Valid prepared submissions allocate no application operand
+or scratch storage. CUDA library-private allocations remain outside that claim.
+
 ## CMake integration
 
-- `EDGE_INFER_OPERATORS_ENABLE_CUDA`: build compatibility adapters and CUDA kernels
+- `EDGE_INFER_OPERATORS_ENABLE_CUDA`: build the direct CUDA compute library
   (default `ON`). Set it to `OFF` for the direct CPU reference path.
-- `EDGE_INFER_CORE_ENABLE_CUDA`: build the sibling core memory runtime. A standalone
-  operators build selects the same value as `EDGE_INFER_OPERATORS_ENABLE_CUDA`. A
-  parent project that adds `core` first must enable it for CUDA operators.
+- `EDGE_INFER_BUILD_LEGACY_OPERATORS`: build historical Tensor/factory adapters
+  (default `OFF`); requires the pinned CUTLASS checkout and core memory runtime.
+- `EDGE_INFER_CORE_ENABLE_CUDA`: build the sibling core memory runtime. Direct
+  CUDA compute does not need it; standalone operators enables it for the optional
+  legacy target. The native runtime also requires the core memory runtime.
 - `BUILD_TESTING`: include tests (default `ON` for standalone builds).
 - `EdgeInfer::operators_core`: header interface for the direct CPU operations
   and workspace utilities.
-- `EdgeInfer::unified_operators`: compatibility library, available with CUDA
-  enabled; links `EdgeInfer::core_cuda` and cuBLAS.
+- `EdgeInfer::operators_cuda`: direct CUDA compute library; links portable
+  headers, cudart and cuBLAS.
+- `EdgeInfer::unified_operators`: optional legacy compatibility library, available
+  with CUDA and `EDGE_INFER_BUILD_LEGACY_OPERATORS=ON`; links the core memory runtime
+  and cuBLAS.
 
 The sibling `core` directory is part of this library's dependency boundary.
 Model code, Python bindings, frontend code and engine include paths are outside

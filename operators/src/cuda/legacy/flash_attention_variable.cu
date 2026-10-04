@@ -12,7 +12,11 @@
 #include <stdexcept>
 #include <vector>
 
+#ifndef EDGE_INFER_COMPUTE_ONLY
 #include "cuda/legacy/legacy_cuda_api.cuh"
+#endif
+#include "operators/cuda/execution_kernels.cuh"
+#include "cuda/vector_pack.cuh"
 
 #define DQKV_VALUE 128
 #define B_C_VALUE 8
@@ -294,6 +298,8 @@ __global__ void flash_attention_kernel_variable(
   }
 }
 
+
+#ifndef EDGE_INFER_COMPUTE_ONLY
 
 template <typename T>
 void flash_attention_variable(Tensor<T>& Q,
@@ -901,4 +907,49 @@ template void dynamic_flash_attention_with_workspace<nvbf16>(
     Tensor<nvbf16>&, const Tensor<nvbf16>&, const Tensor<nvbf16>&, Tensor<nvbf16>&,
     int, Tensor<nvbf16>&, cudaStream_t);
 
+
+#endif
 }  // namespace cuda_OP
+
+namespace op::cuda::detail {
+
+template <typename T>
+void launch_decode_128(const ExecutionContext& context, TensorView<const T, 3> q,
+    TensorView<const T, 3> k, TensorView<const T, 3> v, TensorView<T, 3> output,
+    TensorView<T, 1> workspace) {
+  const int heads = q.shape[1], kv_heads = k.shape[1], width = q.shape[2];
+  const int length = k.shape[0];
+  const int branches = std::min((length + B_C_VALUE - 1) / B_C_VALUE, 5);
+  const int per_branch = (length + branches - 1) / branches;
+  const std::size_t output_elements = static_cast<std::size_t>(heads) * (width + 2);
+  const T* keys[5]{};
+  const T* values[5]{};
+  T* results[5]{};
+  int lengths[5]{};
+  int tiles[5]{};
+  for (int branch = 0; branch < branches; ++branch) {
+    const int start = branch * per_branch;
+    lengths[branch] = std::min(per_branch, length - start);
+    tiles[branch] = (lengths[branch] + B_C_VALUE - 1) / B_C_VALUE;
+    keys[branch] = k.data + static_cast<std::size_t>(start) * k.stride[0];
+    values[branch] = v.data + static_cast<std::size_t>(start) * v.stride[0];
+    results[branch] = workspace.data + branch * output_elements;
+  }
+  cuda_OP::flash_attention_kernel_variable<T>
+      <<<dim3(heads, branches), dim3(32, B_C_VALUE), 0, context.stream>>>(
+          const_cast<T*>(q.data), keys[0], keys[1], keys[2], keys[3], keys[4],
+          values[0], values[1], values[2], values[3], values[4],
+          results[0], results[1], results[2], results[3], results[4],
+          heads, kv_heads, width, B_C_VALUE, 1, heads / kv_heads, 1,
+          lengths[0], lengths[1], lengths[2], lengths[3], lengths[4],
+          tiles[0], tiles[1], tiles[2], tiles[3], tiles[4], branches,
+          static_cast<T>(1.0f / sqrtf(static_cast<float>(width))));
+  const auto result = cudaGetLastError();
+  if (result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(result));
+  launch_attention_gather(context, results[0], results[1], results[2], results[3], results[4], branches, output);
+}
+
+template void launch_decode_128<float>(const ExecutionContext&, TensorView<const float, 3>, TensorView<const float, 3>, TensorView<const float, 3>, TensorView<float, 3>, TensorView<float, 1>);
+template void launch_decode_128<__nv_bfloat16>(const ExecutionContext&, TensorView<const __nv_bfloat16, 3>, TensorView<const __nv_bfloat16, 3>, TensorView<const __nv_bfloat16, 3>, TensorView<__nv_bfloat16, 3>, TensorView<__nv_bfloat16, 1>);
+
+}  // namespace op::cuda::detail

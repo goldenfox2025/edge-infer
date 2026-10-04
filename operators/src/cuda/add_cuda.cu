@@ -5,7 +5,10 @@
 #include <type_traits>
 
 #include "operators/cuda/direct.hpp"
+#include "operators/cuda/execution.hpp"
+#ifndef EDGE_INFER_COMPUTE_ONLY
 #include "operators/cuda/add_cuda.cuh"
+#endif
 
 namespace op {
 
@@ -138,6 +141,8 @@ void cuda::add(ArrayView<const T> input_a, ArrayView<const T> input_b,
   }
 }
 
+#ifndef EDGE_INFER_COMPUTE_ONLY
+
 template <typename T>
 void AddCUDAOperator<T>::operator()(Tensor<T>* output, Tensor<T>* input_a,
                                       Tensor<T>* input_b, cudaStream_t stream) {
@@ -145,11 +150,56 @@ void AddCUDAOperator<T>::operator()(Tensor<T>* output, Tensor<T>* input_a,
                        {input_b->data_ptr(), input_b->numel()},
                        {output->data_ptr(), output->numel()}, stream);
 }
+#endif
 
+
+template <typename T>
+void cuda::add(const ExecutionContext& context, ArrayView<const T> input_a,
+                ArrayView<const T> input_b, ArrayView<T> output) {
+  const size_t count = input_a.size;
+  if (input_b.size != count || output.size != count ||
+      count > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+      (count && (!input_a.data || !input_b.data || !output.data))) {
+    throw std::invalid_argument("Direct add buffer extents or pointers are invalid");
+  }
+  if (!count) return;
+  constexpr int threads = 256;
+  const bool paired = count % 2 == 0 &&
+      reinterpret_cast<uintptr_t>(input_a.data) % (2 * sizeof(T)) == 0 &&
+      reinterpret_cast<uintptr_t>(input_b.data) % (2 * sizeof(T)) == 0 &&
+      reinterpret_cast<uintptr_t>(output.data) % (2 * sizeof(T)) == 0;
+  if (paired) {
+    const size_t pairs = count / 2;
+    const int blocks = std::min<int>((pairs + threads - 1) / threads,
+                                     context.multiprocessors * 32);
+    if constexpr (std::is_same_v<T, float>) {
+      add_kernel_float2<<<blocks, threads, 0, context.stream>>>(
+          reinterpret_cast<const float2*>(input_a.data),
+          reinterpret_cast<const float2*>(input_b.data),
+          reinterpret_cast<float2*>(output.data), pairs);
+    } else {
+      add_kernel_bf162<<<blocks, threads, 0, context.stream>>>(
+          reinterpret_cast<const __nv_bfloat162*>(input_a.data),
+          reinterpret_cast<const __nv_bfloat162*>(input_b.data),
+          reinterpret_cast<__nv_bfloat162*>(output.data), pairs);
+    }
+  } else {
+    const int blocks = std::min<int>((count + threads - 1) / threads,
+                                     context.multiprocessors * 32);
+    add_kernel<T><<<blocks, threads, 0, context.stream>>>(input_a.data, input_b.data, output.data, count);
+  }
+  const auto status = cudaGetLastError();
+  if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+}
+
+template void cuda::add<float>(const cuda::ExecutionContext&, ArrayView<const float>, ArrayView<const float>, ArrayView<float>);
+template void cuda::add<__nv_bfloat16>(const cuda::ExecutionContext&, ArrayView<const __nv_bfloat16>, ArrayView<const __nv_bfloat16>, ArrayView<__nv_bfloat16>);
 template void cuda::add<float>(ArrayView<const float>, ArrayView<const float>, ArrayView<float>, cudaStream_t);
 template void cuda::add<__nv_bfloat16>(ArrayView<const __nv_bfloat16>, ArrayView<const __nv_bfloat16>, ArrayView<__nv_bfloat16>, cudaStream_t);
 
+#ifndef EDGE_INFER_COMPUTE_ONLY
 template class AddCUDAOperator<float>;
 template class AddCUDAOperator<__nv_bfloat16>;
+#endif
 
 }  // namespace op

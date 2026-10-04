@@ -10,8 +10,11 @@
 #include <stdexcept>
 #include <vector>
 
+#ifndef EDGE_INFER_COMPUTE_ONLY
 #include "cuda/legacy/legacy_cuda_api.cuh"
+#endif
 #include "ptx_common.h"
+#include "operators/cuda/execution_kernels.cuh"
 
 
 namespace cuda_OP {
@@ -857,6 +860,8 @@ __global__ void matmul_awq_gemv_bf16_vectorized_kernel(
     }
 }
 
+#ifndef EDGE_INFER_COMPUTE_ONLY
+
 template <typename T, typename ScaleType>
 void matmul_quantized_gemv(const Tensor<T>& input,
                            const Tensor<int32_t>& qweight,
@@ -1001,4 +1006,102 @@ template void matmul_quantized_gemv<__half>(const Tensor<__half>&, const Tensor<
                                             const Tensor<int32_t>&, int, Tensor<__half>*, cudaStream_t,
                                             const Tensor<__half>*);
 
+
+#endif
 }  // namespace cuda_OP
+
+namespace op::cuda::detail {
+namespace {
+
+template <typename T>
+__global__ void awq_scalar_kernel(const T* input, const int32_t* packed,
+    const T* scales, const int32_t* zeros, const T* bias, T* output,
+    int rows, int width, int features, int group_size, int padded_groups) {
+  const std::size_t count = static_cast<std::size_t>(rows) * width;
+  const std::size_t begin = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::size_t step = static_cast<std::size_t>(blockDim.x) * gridDim.x;
+  const int weight_stride = (features + 7) / 8;
+  const int zero_stride = (features / group_size + 7) / 8;
+  for (std::size_t index = begin; index < count; index += step) {
+    const int row = index / width, column = index % width;
+    float result = bias ? static_cast<float>(bias[column]) : 0.0f;
+    for (int feature = 0; feature < features; ++feature) {
+      const int group = feature / group_size;
+      const uint32_t value = (static_cast<uint32_t>(packed[column * weight_stride + feature / 8]) >>
+                                ((feature % 8) * 4)) & 15;
+      const uint32_t zero = (static_cast<uint32_t>(zeros[column * zero_stride + group / 8]) >>
+                               ((group % 8) * 4)) & 15;
+      float weight = (static_cast<float>(value) - static_cast<float>(zero)) *
+                      static_cast<float>(scales[column * padded_groups + group]);
+      if (rows > 1) weight = static_cast<float>(static_cast<T>(weight));
+      result = fmaf(static_cast<float>(input[row * features + feature]), weight, result);
+    }
+    output[index] = static_cast<T>(result);
+  }
+}
+template <typename T>
+__global__ void awq_bias_kernel(T* output, const T* bias, std::size_t count, int width) {
+  const std::size_t begin = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::size_t step = static_cast<std::size_t>(blockDim.x) * gridDim.x;
+  for (std::size_t i = begin; i < count; i += step) output[i] = output[i] + bias[i % width];
+}
+
+}  // namespace
+
+template <typename T>
+void launch_awq(const ExecutionContext& context, TensorView<const T, 2> input,
+                 const AwqLinearWeight<T>& weight, TensorView<T, 2> output) {
+  const int rows = input.shape[0], features = weight.input_features, width = weight.output_features;
+  const int groups = features / weight.group_size;
+  const std::size_t scratch = static_cast<std::size_t>(features) * sizeof(T) +
+      8 * static_cast<std::size_t>(weight.padded_groups) * sizeof(T) +
+      8 * static_cast<std::size_t>((groups + 7) / 8) * sizeof(int32_t);
+  bool launched = false;
+  if (rows == 1 && features % 8 == 0 && width % 8 == 0 &&
+      reinterpret_cast<std::uintptr_t>(input.data) % 16 == 0 &&
+      (!std::is_same_v<T, __nv_bfloat16> || weight.group_size % 8 == 0) &&
+      scratch <= context.shared_memory_limit) {
+    if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+      cuda_OP::matmul_awq_gemv_bf16_vectorized_kernel<256, T>
+          <<<(width + 7) / 8, 256, scratch, context.stream>>>(input.data, weight.qweight,
+              weight.scales, weight.zeros, output.data, features, width, weight.group_size,
+              weight.padded_groups, weight.bias);
+    } else {
+      cuda_OP::matmul_awq_gemv_kernel_M_1<T, T, 256>
+          <<<(width + 7) / 8, 256, scratch, context.stream>>>(input.data, weight.qweight,
+              weight.scales, weight.zeros, output.data, features, width, weight.group_size,
+              weight.padded_groups, weight.bias);
+    }
+    launched = true;
+  }
+  if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+    if (!launched && rows > 1 && features >= 32 && features % 16 == 0 && groups % 8 == 0) {
+      constexpr int BM = 32, BN = 128, BK = 16, WMMA_M = 16, WMMA_N = 16, WMMA_K = 16;
+      constexpr int WARPS = BM / WMMA_M * BN / WMMA_N;
+      cuda_OP::awq_gemm_kernel_mma<T, T, BM, BN, BK, WMMA_M, WMMA_N, WMMA_K, WARPS, 2, 1, 1>
+          <<<dim3((rows + BM - 1) / BM, (width + BN - 1) / BN), WARPS * 32, 0, context.stream>>>(
+              input.data, weight.qweight, weight.scales, weight.zeros, output.data,
+              rows, width, features, weight.group_size, weight.padded_groups);
+      if (weight.bias) {
+        const auto blocks = std::min<std::size_t>((output.numel() + 255) / 256,
+                                                  context.multiprocessors * 32);
+        awq_bias_kernel<T><<<blocks, 256, 0, context.stream>>>(output.data, weight.bias, output.numel(), width);
+      }
+      launched = true;
+    }
+  }
+  if (!launched) {
+    const auto blocks = std::min<std::size_t>((output.numel() + 255) / 256,
+                                              context.multiprocessors * 32);
+    awq_scalar_kernel<T><<<blocks, 256, 0, context.stream>>>(input.data, weight.qweight,
+        weight.scales, weight.zeros, weight.bias, output.data, rows, width, features,
+        weight.group_size, weight.padded_groups);
+  }
+  const auto result = cudaGetLastError();
+  if (result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(result));
+}
+
+template void launch_awq<float>(const ExecutionContext&, TensorView<const float, 2>, const AwqLinearWeight<float>&, TensorView<float, 2>);
+template void launch_awq<__nv_bfloat16>(const ExecutionContext&, TensorView<const __nv_bfloat16, 2>, const AwqLinearWeight<__nv_bfloat16>&, TensorView<__nv_bfloat16, 2>);
+
+}  // namespace op::cuda::detail

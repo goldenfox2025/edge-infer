@@ -6,9 +6,12 @@ if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
 endif()
 
 option(EDGE_INFER_OPERATORS_ENABLE_CUDA "Build CUDA operators and compatibility adapters" ON)
+option(EDGE_INFER_BUILD_LEGACY_OPERATORS "Build the historical Tensor/factory operator adapters" OFF)
 
 if(NOT TARGET core_headers)
-  set(EDGE_INFER_CORE_ENABLE_CUDA "${EDGE_INFER_OPERATORS_ENABLE_CUDA}")
+  if(NOT DEFINED EDGE_INFER_CORE_ENABLE_CUDA)
+    set(EDGE_INFER_CORE_ENABLE_CUDA "${EDGE_INFER_BUILD_LEGACY_OPERATORS}")
+  endif()
   add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../core" "${CMAKE_CURRENT_BINARY_DIR}/core")
 endif()
 
@@ -21,17 +24,49 @@ target_link_libraries(operators_core INTERFACE core_headers)
 target_compile_features(operators_core INTERFACE cxx_std_17)
 
 if(EDGE_INFER_OPERATORS_ENABLE_CUDA)
-  if(NOT TARGET core_cuda)
-    message(FATAL_ERROR "CUDA operators require EDGE_INFER_CORE_ENABLE_CUDA=ON")
-  endif()
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "CUDA architectures to compile")
   endif()
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
+
+  # Independently usable compute archive: fixed borrowed views, explicit
+  # resources and scratch. Neither model/runtime nor Tensor ownership is linked.
+  add_library(operators_cuda STATIC
+      src/cuda/execution.cu
+      src/cuda/conditioning.cu
+      src/cuda/random.cu
+      src/cuda/add_cuda.cu
+      src/cuda/multiply_cuda.cu
+      src/cuda/rms_norm_cuda.cu
+      src/cuda/silu_cuda.cu
+      src/cuda/legacy/awq_gemv_gemm.cu
+      src/cuda/legacy/flash_attn_prefill.cu
+      src/cuda/legacy/flash_attention_variable.cu
+      src/cuda/legacy/flash_attention_graph.cu
+      src/cuda/legacy/gather_fa_variable.cu
+      src/cuda/legacy/gather_fa_graph.cu
+  )
+  add_library(EdgeInfer::operators_cuda ALIAS operators_cuda)
+  set_property(TARGET operators_cuda PROPERTY INTERFACE_EDGE_INFER_OPERATOR_ABI direct)
+  set_property(TARGET operators_cuda APPEND PROPERTY COMPATIBLE_INTERFACE_STRING EDGE_INFER_OPERATOR_ABI)
+  target_compile_definitions(operators_cuda PRIVATE EDGE_INFER_COMPUTE_ONLY=1)
+  target_include_directories(operators_cuda PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(operators_cuda PUBLIC operators_core CUDA::cublas CUDA::cudart)
+  set_target_properties(operators_cuda PROPERTIES
+      CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON POSITION_INDEPENDENT_CODE ON
+      CUDA_SEPARABLE_COMPILATION ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  target_compile_options(operators_cuda PRIVATE
+      $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:--use_fast_math>
+      $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--extended-lambda;--threads=0;--maxrregcount=64>)
+
+  if(EDGE_INFER_BUILD_LEGACY_OPERATORS)
+  if(NOT TARGET core_cuda)
+    message(FATAL_ERROR "Legacy Tensor adapters require EDGE_INFER_CORE_ENABLE_CUDA=ON")
+  endif()
   set(CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../cutlass" CACHE PATH "CUTLASS source directory")
   if(NOT EXISTS "${CUTLASS_DIR}/include/cutlass/cutlass.h")
-    message(FATAL_ERROR "CUTLASS headers are missing. Initialize the pinned cutlass submodule or set CUTLASS_DIR.")
+    message(FATAL_ERROR "Optional legacy operators require the pinned CUTLASS checkout.")
   endif()
 
   set(UNIFIED_CPU_OPERATOR_SOURCES
@@ -50,6 +85,7 @@ if(EDGE_INFER_OPERATORS_ENABLE_CUDA)
       src/cuda/attention_output_prefill_cuda.cu
       src/cuda/attention_scores_prefill_cuda.cu
       src/cuda/dynamic_flash_attention_cuda.cu
+      src/cuda/execution.cu
       src/cuda/flash_attention_prefill_cuda.cu
       src/cuda/gather_cuda.cu
       src/cuda/kv_cache_write_cuda.cu
@@ -111,6 +147,8 @@ if(EDGE_INFER_OPERATORS_ENABLE_CUDA)
   )
 
   add_library(EdgeInfer::unified_operators ALIAS unified_operators)
+  set_property(TARGET unified_operators PROPERTY INTERFACE_EDGE_INFER_OPERATOR_ABI legacy)
+  set_property(TARGET unified_operators APPEND PROPERTY COMPATIBLE_INTERFACE_STRING EDGE_INFER_OPERATOR_ABI)
   target_include_directories(unified_operators PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/src
   )
@@ -143,6 +181,7 @@ if(EDGE_INFER_OPERATORS_ENABLE_CUDA)
   )
 
   add_subdirectory(benchmarks)
+  endif()
 endif()
 
 if(BUILD_TESTING)

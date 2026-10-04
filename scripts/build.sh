@@ -30,20 +30,6 @@ if [[ "$ENGINE" == OFF ]]; then
 else
   BUILD_DIR="${BUILD_DIR:-$REPO_ROOT/build}"
   if [[ "$BUILD_DIR" != /* ]]; then BUILD_DIR="$REPO_ROOT/$BUILD_DIR"; fi
-  CUTLASS_DIR="${CUTLASS_DIR:-$REPO_ROOT/cutlass}"
-  if [[ ! -f "$CUTLASS_DIR/include/cute/tensor.hpp" ]]; then
-    if [[ "$CUTLASS_DIR" != "$REPO_ROOT/cutlass" ]]; then
-      echo "CUTLASS_DIR does not contain include/cute/tensor.hpp: $CUTLASS_DIR" >&2
-      exit 1
-    fi
-    # Use the gitlink recorded by this checkout, never an unpinned latest clone.
-    git -C "$REPO_ROOT" submodule update --init --recursive -- cutlass
-  fi
-  if [[ ! -f "$CUTLASS_DIR/include/cute/tensor.hpp" ]]; then
-    echo "CUTLASS headers are missing. Initialize the submodule before building." >&2
-    exit 1
-  fi
-  CMAKE_ARGS=(-DCUTLASS_DIR="$CUTLASS_DIR" "${CMAKE_ARGS[@]}")
   if [[ "$PYTHON_BINDINGS" == ON ]]; then
     PYBIND11_DIR="$("$PYTHON_BIN" -m pybind11 --cmakedir)"
     CMAKE_ARGS=(-Dpybind11_DIR="$PYBIND11_DIR" -DPython_EXECUTABLE="$(command -v "$PYTHON_BIN")" "${CMAKE_ARGS[@]}")

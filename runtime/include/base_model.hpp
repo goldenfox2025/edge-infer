@@ -26,6 +26,9 @@ class BaseModel {
  public:
   BaseModel() = default;
   virtual ~BaseModel() = default;
+  // Compatibility frontends request independent mutable execution state while
+  // retaining shared prepared weights. Custom executors may return null.
+  virtual std::shared_ptr<BaseModel> fork_executor() const { return {}; }
 
   // Core inference methods that must be implemented by derived classes
   virtual uint32_t* forward(const Tensor<uint32_t>* input,
@@ -62,7 +65,7 @@ class BaseModel {
     return 0;
   }
 
-  // Compatibility engines need the global arena only for legacy executors.
+  // Whether the executor prepares and owns its intermediate storage.
   virtual bool owns_execution_workspaces() const { return false; }
 
   // Print the model device.

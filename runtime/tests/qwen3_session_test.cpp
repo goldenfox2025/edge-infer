@@ -1,4 +1,8 @@
 #include "qwen3.hpp"
+#include "allocation_probe.hpp"
+#include "test_cuda_rng.hpp"
+#include "tensor_view_adapter.hpp"
+#include "operators/cuda/execution.hpp"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -10,8 +14,10 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -23,6 +29,7 @@ using Weights = std::unordered_map<std::string, Tensor<BFloat16>>;
 using Session = Qwen3Session<BFloat16>;
 using Model = Qwen3Model<BFloat16>;
 using Cache = KVCache<BFloat16>;
+using Logits = TensorView<BFloat16, 2>;
 
 constexpr std::size_t kHidden = 128;
 constexpr std::size_t kIntermediate = 256;
@@ -144,6 +151,18 @@ std::vector<BFloat16> download(const Tensor<BFloat16>& tensor) {
   return result;
 }
 
+template <typename T, std::size_t Rank>
+std::vector<std::remove_const_t<T>> download(TensorView<T, Rank> view) {
+  require(view.is_contiguous(), "Downloaded GPU view must be contiguous");
+  std::vector<std::remove_const_t<T>> result(view.numel());
+  if (!result.empty()) {
+    cuda_check(cudaMemcpy(result.data(), view.data_ptr(),
+                          result.size() * sizeof(std::remove_const_t<T>),
+                          cudaMemcpyDeviceToHost));
+  }
+  return result;
+}
+
 struct Snapshot {
   std::vector<BFloat16> logits;
   std::vector<BFloat16> keys;
@@ -151,7 +170,7 @@ struct Snapshot {
 };
 
 Snapshot snapshot(Session& session, Cache& cache,
-                  const Tensor<BFloat16>* logits = nullptr) {
+                  const Logits* logits = nullptr) {
   session.synchronize();
   Snapshot result;
   if (logits) result.logits = download(*logits);
@@ -191,7 +210,7 @@ void equal_snapshot(const Snapshot& expected, const Snapshot& actual,
   equal_values(expected.values, actual.values, label + " V cache");
 }
 
-Tensor<BFloat16> decode(Session& session,
+Logits decode(Session& session,
                         const Tensor<std::uint32_t>& token, Cache& cache,
                         bool graph) {
   cache.resize(cache.size() + 1);
@@ -210,8 +229,8 @@ const History kB{{17, 23, 29, 31}, {37, 41, 5}};
 std::vector<Snapshot> isolated(const Weights& source, const History& history,
                                bool graph) {
   auto model = std::make_shared<Model>(source, config());
-  Session session(model, graph);
   Cache cache(1, kCapacity, kHidden, Device::CUDA);
+  Session session(model, graph);
   initialize_cache(cache);
   auto prompt = input(history.prompt);
   cache.resize(history.prompt.size());
@@ -314,8 +333,8 @@ void cross_mode_test(const Weights& source) {
 
 void reset_test(const std::shared_ptr<const Model>& model,
                 const std::vector<Snapshot>& expected, bool graph) {
-  Session session(model, graph);
   Cache cache(1, kCapacity, kHidden, Device::CUDA);
+  Session session(model, graph);
   initialize_cache(cache);
   auto prompt = input(kA.prompt);
   for (int replay = 0; replay < 2; ++replay) {
@@ -343,8 +362,8 @@ void reset_test(const std::shared_ptr<const Model>& model,
 
 void destruction_test(const std::shared_ptr<const Model>& model,
                       const std::vector<Snapshot>& expected, bool graph) {
-  Session a(model, graph);
   Cache cache_a(1, kCapacity, kHidden, Device::CUDA);
+  Session a(model, graph);
   initialize_cache(cache_a);
   auto prompt_a = input(kA.prompt);
   cache_a.resize(kA.prompt.size());
@@ -380,7 +399,7 @@ void destruction_test(const std::shared_ptr<const Model>& model,
 void expect_managed_rejected(Session& session,
                              const std::function<void()>& operation,
                              const std::string& label,
-                             const Tensor<BFloat16>* held_logits = nullptr) {
+                             const Logits* held_logits = nullptr) {
   session.synchronize();
   const auto before_size = session.context_size();
   const auto before_capacity = session.context_capacity();
@@ -404,6 +423,97 @@ void expect_managed_rejected(Session& session,
     equal_values(before_logits, download(*held_logits),
                   label + " modified held managed logits");
   }
+}
+
+void allocation_probe_self_test() {
+  {
+    test_alloc::Scope probe;
+    void* pointer = ::operator new(64);
+    ::operator delete(pointer);
+    const auto count = probe.finish();
+    require(count.host_allocations == 1 && count.host_frees == 1,
+            "Scoped allocation probe missed C++ allocation/free");
+  }
+#ifdef EDGE_INFER_TEST_CUDA_WRAPPING
+  void* pointer = nullptr;
+  test_alloc::Scope probe;
+  const auto allocation_status = cudaMalloc(&pointer, 256);
+  const auto release_status = cudaFree(pointer);
+  const auto count = probe.finish();
+  cuda_check(allocation_status);
+  cuda_check(release_status);
+  require(count.device_allocations == 1 && count.device_frees == 1,
+          "Scoped CUDA wrapper missed native allocation/free");
+#endif
+}
+
+void allocation_test(const std::shared_ptr<const Model>& model,
+                     const std::vector<Snapshot>& expected_a,
+                     const std::vector<Snapshot>& expected_b, bool graph) {
+  auto a = Session::create(model, kCapacity, graph);
+  auto b = Session::create(model, kCapacity, graph);
+  auto prompt_a = input(kA.prompt);
+  auto prompt_b = input(kB.prompt);
+  a->prefill(borrow_tensor_view<1>(prompt_a).as_const());
+  b->prefill(borrow_tensor_view<1>(prompt_b).as_const());
+  std::array<Tensor<std::uint32_t>, 3> tokens_a;
+  std::array<Tensor<std::uint32_t>, 3> tokens_b;
+  std::array<TensorView<const std::uint32_t, 1>, 3> views_a;
+  std::array<TensorView<const std::uint32_t, 1>, 3> views_b;
+  for (std::size_t step = 0; step < 3; ++step) {
+    tokens_a[step] = input({kA.continuation[step]});
+    tokens_b[step] = input({kB.continuation[step]});
+    views_a[step] = borrow_tensor_view<1>(tokens_a[step]).as_const();
+    views_b[step] = borrow_tensor_view<1>(tokens_b[step]).as_const();
+  }
+  // Warm library launch paths and, for graph mode, capture outside the scope.
+  auto logits_a = a->decode(views_a[0]);
+  auto logits_b = b->decode(views_b[0]);
+  equal_values(expected_a[1].logits, download(logits_a), "Allocation warmup A logits");
+  equal_values(expected_b[1].logits, download(logits_b), "Allocation warmup B logits");
+  const auto* output_a = logits_a.data_ptr();
+  const auto* output_b = logits_b.data_ptr();
+  const auto capacity_a = a->decode_workspace_bytes();
+  const auto capacity_b = b->decode_workspace_bytes();
+  test_alloc::Counts total;
+  for (std::size_t step = 1; step < 3; ++step) {
+    test_alloc::Scope probe_a;
+    logits_a = a->decode(views_a[step]);
+    const auto count_a = probe_a.finish();
+    test_alloc::Scope probe_b;
+    logits_b = step == 2 ? b->decode(kB.continuation[step])
+                         : b->decode(views_b[step]);
+    const auto count_b = probe_b.finish();
+    for (const auto& count : {count_a, count_b}) {
+      total.host_allocations += count.host_allocations;
+      total.host_frees += count.host_frees;
+      total.device_allocations += count.device_allocations;
+      total.device_frees += count.device_frees;
+    }
+    require(logits_a.data_ptr() == output_a && logits_b.data_ptr() == output_b &&
+                output_a != output_b &&
+                a->decode_workspace_bytes() == capacity_a &&
+                b->decode_workspace_bytes() == capacity_b,
+            "Steady decode changed private output/workspace storage");
+    equal_values(expected_a[step + 1].logits, download(logits_a),
+                  "Allocation-measured A logits");
+    equal_values(expected_b[step + 1].logits, download(logits_b),
+                  "Allocation-measured B logits");
+  }
+  std::cout << (graph ? "Graph" : "Eager")
+            << " steady decode: C++ allocations=" << total.host_allocations
+            << ", C++ frees=" << total.host_frees;
+#ifdef EDGE_INFER_TEST_CUDA_WRAPPING
+  std::cout << ", native CUDA allocations=" << total.device_allocations
+            << ", native CUDA frees=" << total.device_frees;
+  require(total.device_allocations == 0 && total.device_frees == 0,
+          "Steady decode allocated/freed native device storage");
+#else
+  std::cout << ", CUDA allocation tracing unavailable in this build";
+#endif
+  std::cout << '\n';
+  require(total.host_allocations == 0 && total.host_frees == 0,
+          "Steady decode allocated/freed C++ heap storage");
 }
 
 void managed_test(const std::shared_ptr<const Model>& model,
@@ -551,22 +661,21 @@ void managed_test(const std::shared_ptr<const Model>& model,
 void sampling_test(const std::shared_ptr<const Model>& model,
                    const std::vector<Snapshot>& expected_a,
                    const std::vector<Snapshot>& expected_b, bool graph) {
+  Cache cache_a(1, kCapacity, kHidden, Device::CUDA);
+  Cache cache_b(1, kCapacity, kHidden, Device::CUDA);
   Session a(model, graph);
   Session b(model, graph);
   ThreadPool thread_pool(1);
-  Cache cache_a(1, kCapacity, kHidden, Device::CUDA);
-  Cache cache_b(1, kCapacity, kHidden, Device::CUDA);
   initialize_cache(cache_a);
   initialize_cache(cache_b);
 
-  // The legacy sampler consumes a valid RNG state even with top_k=1.
+  // Own RNG storage explicitly; the test never uses the compatibility facade.
   CudaWorkspaceArena random_storage;
   random_storage.reserve(2 * sizeof(curandState));
   auto* random_a = random_storage.ptr_at<curandState>(0);
   auto* random_b = random_a + 1;
-  op::UnifiedOperators<BFloat16> random_operators(Device::CUDA);
-  random_operators.init_curand(random_a, 123, 0);
-  random_operators.init_curand(random_b, 456, 0);
+  test_cuda::initialize_random_state(random_a, 123, a.stream());
+  test_cuda::initialize_random_state(random_b, 456, b.stream());
   cuda_check(cudaDeviceSynchronize());
 
   auto prompt_a = input(kA.prompt);
@@ -637,6 +746,8 @@ void isolation_test(const Weights& source, bool graph) {
 
   // The model must own uploaded weights after the loader's temporary map dies.
   auto model = std::make_shared<Model>(weights(), config());
+  Cache cache_a(1, kCapacity, kHidden, Device::CUDA);
+  Cache cache_b(1, kCapacity, kHidden, Device::CUDA);
   Session a(model, graph);
   Session b(model, graph);
   require(a.model().get() == model.get() && b.model().get() == model.get(),
@@ -648,9 +759,21 @@ void isolation_test(const Weights& source, bool graph) {
   const auto b_workspace = b.decode_workspace_bytes();
   require(a_workspace > 0 && b_workspace > 0,
           "Decode workspaces must be allocated during session construction");
+  const auto& plan = a.decode_workspace_plan();
+  require(a.decode_reused_bytes() > 0 &&
+              a.decode_workspace_bytes() < a.decode_unaliased_bytes() &&
+              a.decode_workspace_bytes() == plan.total_bytes(),
+          "Automatic decoder memory must reclaim dead activation storage");
+  for (std::size_t left_index = 0; left_index < plan.allocations().size(); ++left_index) {
+    const auto& left = plan.allocations()[left_index];
+    for (std::size_t right_index = left_index + 1; right_index < plan.allocations().size(); ++right_index) {
+      const auto& right = plan.allocations()[right_index];
+      const bool live_overlap = left.first_use <= right.last_use && right.first_use <= left.last_use;
+      const bool byte_overlap = left.offset < right.offset + right.bytes && right.offset < left.offset + left.bytes;
+      require(!(live_overlap && byte_overlap), "Live decoder activations share planned bytes");
+    }
+  }
 
-  Cache cache_a(1, kCapacity, kHidden, Device::CUDA);
-  Cache cache_b(1, kCapacity, kHidden, Device::CUDA);
   initialize_cache(cache_a);
   initialize_cache(cache_b);
   auto prompt_a = input(kA.prompt);
@@ -707,12 +830,13 @@ void isolation_test(const Weights& source, bool graph) {
   reset_test(model, expected_a, graph);
   destruction_test(model, expected_a, graph);
   managed_test(model, expected_a, expected_b, graph);
+  allocation_test(model, expected_a, expected_b, graph);
 }
 
 void expect_rejected(Session& session, Cache& cache,
                      const std::function<void()>& operation,
                      const std::string& label,
-                     const Tensor<BFloat16>* held_logits = nullptr,
+                     const Logits* held_logits = nullptr,
                      Cache* extra_cache = nullptr) {
   const auto before = snapshot(session, cache, held_logits);
   Snapshot extra_before;
@@ -790,11 +914,11 @@ void model_preparation_test() {
   expect_preparation_rejected(
       [&] { Model invalid(strided_embeddings, config()); },
       "contiguous: token_embeddings.weight", "Noncontiguous embeddings");
-  auto unsupported_width = config();
-  unsupported_width.at("hidden_size") = 130;
+  auto mismatched_width = config();
+  mismatched_width.at("hidden_size") = 130;
   expect_preparation_rejected(
-      [&] { Model invalid(weights(), unsupported_width); },
-      "embedding width must be divisible by 8", "Unsupported embedding width");
+      [&] { Model invalid(weights(), mismatched_width); },
+      "shape mismatch: token_embeddings.weight", "Configured embedding width mismatch");
   std::cout << "Model preparation preserves owned transposed weights and validates shapes\n";
 }
 
@@ -1057,19 +1181,24 @@ void sampling_validation_test() {
   CudaWorkspaceArena output_storage;
   output_storage.reserve(sizeof(std::uint32_t));
   auto* output = output_storage.ptr_at<std::uint32_t>(0);
-  op::UnifiedOperators<BFloat16> operators(Device::CUDA);
+  const auto context = op::cuda::prepare_execution_context(nullptr, nullptr);
+  const auto plan = op::cuda::prepare_sampling(context, vocabulary);
+  CudaWorkspaceArena scratch;
+  scratch.reserve(plan.total_bytes);
+  const auto workspace = TensorView<unsigned char,1>::contiguous(
+      scratch.ptr_at<unsigned char>(0), {plan.total_bytes});
+  const auto tokens = TensorView<std::uint32_t,1>::contiguous(output, {1});
   cuda_check(cudaGetLastError());
   for (std::size_t top_k : {std::size_t{0}, std::size_t{1025}}) {
     cuda_check(cudaMemcpy(output, &sentinel, sizeof(sentinel), cudaMemcpyHostToDevice));
     bool rejected = false;
     try {
       // The null RNG would be invalid for an actual sampling launch. Invalid
-      // top_k must fail in the facade before touching device state or output.
-      operators.sample_to_fixed(Tensor<BFloat16>(logits), output,
-                                 1.0f, 1.0f, top_k, nullptr);
-    } catch (const std::runtime_error& error) {
-      require(std::string(error.what()).find("top_k") != std::string::npos,
-              "Invalid sampling diagnostic must identify top_k");
+      // top_k must fail validation before touching device state or output.
+      op::cuda::sample(context, borrow_tensor_view<2>(static_cast<const Tensor<BFloat16>&>(logits)),
+                        tokens, {}, workspace, plan, 1.0f, 1.0f, top_k, nullptr);
+    } catch (const std::invalid_argument& error) {
+      require(std::strlen(error.what()) > 0, "Invalid sampling diagnostic is empty");
       rejected = true;
     }
     require(rejected, "Invalid fixed-output sampling top_k was accepted");
@@ -1085,8 +1214,8 @@ void sampling_validation_test() {
 
 void validation_test(const Weights& source) {
   auto model = std::make_shared<Model>(source, config());
-  Session session(model, false);
   Cache cache(1, kCapacity, kHidden, Device::CUDA);
+  Session session(model, false);
   initialize_cache(cache);
   cache.resize(1);
   auto token = input({3});
@@ -1215,6 +1344,7 @@ int main() {
     GlobalCudaMemoryPool::set_prefill_phase(false);
     const auto source = weights();
     model_preparation_test();
+    allocation_probe_self_test();
     awq_preparation_test();
     cache_lifetime_test();
     sampling_validation_test();

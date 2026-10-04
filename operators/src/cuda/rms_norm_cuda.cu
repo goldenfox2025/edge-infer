@@ -4,7 +4,9 @@
 #include <limits>
 
 #include "operators/cuda/direct.hpp"
+#ifndef EDGE_INFER_COMPUTE_ONLY
 #include "operators/cuda/rms_norm_cuda.cuh"
+#endif
 
 namespace op {
 
@@ -131,6 +133,8 @@ void cuda::rms_norm(ArrayView<const T> input, ArrayView<const T> weight,
     }
 }
 
+#ifndef EDGE_INFER_COMPUTE_ONLY
+
 template <typename T>
 void RmsNormCUDAOperator<T>::operator()(Tensor<T>* output, Tensor<T>* input,
                                        Tensor<T>* weight, float eps, cudaStream_t stream) {
@@ -148,11 +152,15 @@ void RmsNormCUDAOperator<T>::operator()(Tensor<T>* output, Tensor<T>* input,
                       {output->data_ptr(), output->numel()},
                       batch_size, feature_dim, eps, stream);
 }
+#endif
+
 
 template void cuda::rms_norm<float>(ArrayView<const float>, ArrayView<const float>, ArrayView<float>, std::size_t, std::size_t, float, cudaStream_t);
 template void cuda::rms_norm<__nv_bfloat16>(ArrayView<const __nv_bfloat16>, ArrayView<const __nv_bfloat16>, ArrayView<__nv_bfloat16>, std::size_t, std::size_t, float, cudaStream_t);
 
+#ifndef EDGE_INFER_COMPUTE_ONLY
 template class RmsNormCUDAOperator<float>;
 template class RmsNormCUDAOperator<__nv_bfloat16>;
+#endif
 
 }  // namespace op

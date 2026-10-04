@@ -24,14 +24,6 @@ if(EDGE_INFER_BUILD_RUNTIME)
     set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "CUDA architectures to compile")
   endif()
 
-  set(CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/cutlass" CACHE PATH "CUTLASS source directory")
-  if(NOT EXISTS "${CUTLASS_DIR}/include/cute/tensor.hpp")
-    message(FATAL_ERROR
-      "CUTLASS headers are missing. Run git submodule update --init --recursive -- cutlass, "
-      "or set CUTLASS_DIR to the recorded CUTLASS checkout. "
-      "Use -DEDGE_INFER_BUILD_RUNTIME=OFF -DEDGE_INFER_BUILD_PYTHON=OFF for portable tests.")
-  endif()
-
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
   find_package(Threads REQUIRED)

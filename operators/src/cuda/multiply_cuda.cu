@@ -4,7 +4,9 @@
 #include <limits>
 
 #include "operators/cuda/direct.hpp"
+#ifndef EDGE_INFER_COMPUTE_ONLY
 #include "operators/cuda/multiply_cuda.cuh"
+#endif
 
 namespace op {
 
@@ -80,6 +82,8 @@ void cuda::multiply(ArrayView<const T> input_a, ArrayView<const T> input_b,
   }
 }
 
+#ifndef EDGE_INFER_COMPUTE_ONLY
+
 template <typename T>
 void MultiplyCUDAOperator<T>::operator()(Tensor<T>* output, Tensor<T>* input_a,
                                       Tensor<T>* input_b, cudaStream_t stream) {
@@ -87,11 +91,15 @@ void MultiplyCUDAOperator<T>::operator()(Tensor<T>* output, Tensor<T>* input_a,
                        {input_b->data_ptr(), input_b->numel()},
                        {output->data_ptr(), output->numel()}, stream);
 }
+#endif
+
 
 template void cuda::multiply<float>(ArrayView<const float>, ArrayView<const float>, ArrayView<float>, cudaStream_t);
 template void cuda::multiply<__nv_bfloat16>(ArrayView<const __nv_bfloat16>, ArrayView<const __nv_bfloat16>, ArrayView<__nv_bfloat16>, cudaStream_t);
 
+#ifndef EDGE_INFER_COMPUTE_ONLY
 template class MultiplyCUDAOperator<float>;
 template class MultiplyCUDAOperator<__nv_bfloat16>;
+#endif
 
 }  // namespace op

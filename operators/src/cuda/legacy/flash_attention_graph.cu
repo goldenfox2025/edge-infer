@@ -1,4 +1,6 @@
 // Attention entry points used during CUDA Graph execution. Sequence offsets are read from device state.
+#include "operators/cuda/execution_kernels.cuh"
+#include "cuda/vector_pack.cuh"
 // #define MULTIST
 
 #ifdef MULTIST
@@ -16,7 +18,9 @@
 #include <stdexcept>
 #include <vector>
 
+#ifndef EDGE_INFER_COMPUTE_ONLY
 #include "cuda/legacy/legacy_cuda_api.cuh"
+#endif
 #include "ptx_common.h"
 #define DQKV_VALUE 128
 #define B_C_VALUE 16
@@ -312,6 +316,8 @@ __global__ void flash_attention_kernel_decode(T *q, const T *total_k, const T *t
     }
 }
 
+#ifndef EDGE_INFER_COMPUTE_ONLY
+
 template <typename T>
 void flash_attention_graph_fixed(Tensor<T> &Q, const Tensor<T> &total_K, const Tensor<T> &total_V, T **d_output_ptrs,
                                  int *d_segment_info, int n_kv_heads, cudaStream_t stream, int *pingpong_index) {
@@ -359,6 +365,8 @@ template void flash_attention_graph_fixed<__nv_bfloat16>(Tensor<__nv_bfloat16> &
                                                          __nv_bfloat16 **d_output_ptrs, int *d_segment_info,
                                                          int n_kv_heads, cudaStream_t stream, int *pingpong_index);
 
+
+#endif
 }  // namespace cuda_OP
 
 #endif
@@ -376,7 +384,9 @@ template void flash_attention_graph_fixed<__nv_bfloat16>(Tensor<__nv_bfloat16> &
 #include <stdexcept>
 #include <vector>
 
+#ifndef EDGE_INFER_COMPUTE_ONLY
 #include "cuda/legacy/legacy_cuda_api.cuh"
+#endif
 
 #define DQKV_VALUE 128
 #define B_C_VALUE 16
@@ -624,6 +634,8 @@ __global__ void flash_attention_kernel_decode(T *q,
 }
 
 
+#ifndef EDGE_INFER_COMPUTE_ONLY
+
 template <typename T>
 void flash_attention_graph_fixed(Tensor<T> &Q, const Tensor<T> &total_K, const Tensor<T> &total_V, T **d_output_ptrs,
                                  int *d_segment_info, int n_kv_heads, cudaStream_t stream, int *pingpong_index) {
@@ -667,5 +679,41 @@ template void flash_attention_graph_fixed<__nv_bfloat16>(Tensor<__nv_bfloat16> &
                                                          __nv_bfloat16 **d_output_ptrs, int *d_segment_info,
                                                          int n_kv_heads, cudaStream_t stream, int *pingpong_index);
 
+
+#endif
 }  // namespace cuda_OP
 #endif
+
+namespace op::cuda::detail {
+
+template <typename T>
+void launch_graph_128(const ExecutionContext& context, TensorView<const T, 3> q,
+    TensorView<const T, 3> k, TensorView<const T, 3> v, TensorView<T, 3> output,
+    T** branches, int* lengths, int* pingpong) {
+  const int heads = q.shape[1], kv_heads = k.shape[1], width = q.shape[2];
+  const float scale = 1.0f / sqrtf(static_cast<float>(width));
+#ifdef MULTIST
+  constexpr int stages = 2;
+  const std::size_t shared_bytes = DQKV_VALUE * sizeof(float) +
+      2 * stages * B_C_VALUE * DQKV_VALUE * sizeof(T) +
+      2 * B_C_VALUE * sizeof(float) + 2 * sizeof(float) + DQKV_VALUE * sizeof(float);
+  cuda_OP::flash_attention_kernel_decode<T, stages>
+      <<<dim3(heads, 3), dim3(32, B_C_VALUE), shared_bytes, context.stream>>>(
+          const_cast<T*>(q.data), k.data, v.data, branches, lengths,
+          heads, kv_heads, width, B_C_VALUE, 1, heads / kv_heads, 1,
+          static_cast<T>(scale), pingpong);
+#else
+  cuda_OP::flash_attention_kernel_decode<T>
+      <<<dim3(heads, 3), dim3(32, B_C_VALUE), 0, context.stream>>>(
+          const_cast<T*>(q.data), k.data, v.data, branches, lengths,
+          heads, kv_heads, width, B_C_VALUE, 1, heads / kv_heads, 1, scale, pingpong);
+#endif
+  const auto result = cudaGetLastError();
+  if (result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(result));
+  launch_graph_gather(context, branches, output, lengths);
+}
+
+template void launch_graph_128<float>(const ExecutionContext&, TensorView<const float, 3>, TensorView<const float, 3>, TensorView<const float, 3>, TensorView<float, 3>, float**, int*, int*);
+template void launch_graph_128<__nv_bfloat16>(const ExecutionContext&, TensorView<const __nv_bfloat16, 3>, TensorView<const __nv_bfloat16, 3>, TensorView<const __nv_bfloat16, 3>, TensorView<__nv_bfloat16, 3>, __nv_bfloat16**, int*, int*);
+
+}  // namespace op::cuda::detail
