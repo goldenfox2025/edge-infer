@@ -37,27 +37,30 @@ compiler:
 
 ```sh
 cmake -S operators -B build-operators-cpu \
-  -DLLM_OPERATORS_ENABLE_CUDA=OFF -DCMAKE_BUILD_TYPE=Release
+  -DEDGE_INFER_OPERATORS_ENABLE_CUDA=OFF -DCMAKE_BUILD_TYPE=Release
 cmake --build build-operators-cpu -j
 ctest --test-dir build-operators-cpu --output-on-failure
 ```
 
 This builds the workspace planner, liveness, and direct operator tests without
 CUDA, CUTLASS, Python, model weights, or the model runtime. Link the
-`LLMInfer::operators_core` interface target from CMake. This target exports the
+`EdgeInfer::operators_core` interface target from CMake. This target exports the
 `operators/include` and sibling `core/include` directories.
 
 ## CUDA and compatibility adapters
 
-The `LLMInfer::unified_operators` static library includes the existing
+The `EdgeInfer::unified_operators` static library includes the existing
 `Tensor`, factory, CPU and CUDA adapters, CUDA kernels, and legacy kernel bridge.
 It requires the CUDA toolkit, the sibling `core` directory, and the pinned
 CUTLASS submodule. It does not require Python or model weights.
+The static operator library resolves its CUDA device symbols when it is built,
+so a C++ application can link it through the native runtime without adding a
+CUDA source merely to trigger final device linking.
 
 ```sh
 git submodule update --init cutlass
 cmake -S operators -B build-operators-cuda \
-  -DLLM_OPERATORS_ENABLE_CUDA=ON \
+  -DEDGE_INFER_OPERATORS_ENABLE_CUDA=ON \
   -DCMAKE_CUDA_ARCHITECTURES=89 -DCMAKE_BUILD_TYPE=Release
 cmake --build build-operators-cuda -j
 ctest --test-dir build-operators-cuda --output-on-failure
@@ -112,16 +115,16 @@ GPU correctness on a target device.
 
 ## CMake integration
 
-- `LLM_OPERATORS_ENABLE_CUDA`: build compatibility adapters and CUDA kernels
+- `EDGE_INFER_OPERATORS_ENABLE_CUDA`: build compatibility adapters and CUDA kernels
   (default `ON`). Set it to `OFF` for the direct CPU reference path.
-- `LLM_CORE_ENABLE_CUDA`: build the sibling core memory runtime. A standalone
-  operators build selects the same value as `LLM_OPERATORS_ENABLE_CUDA`. A
+- `EDGE_INFER_CORE_ENABLE_CUDA`: build the sibling core memory runtime. A standalone
+  operators build selects the same value as `EDGE_INFER_OPERATORS_ENABLE_CUDA`. A
   parent project that adds `core` first must enable it for CUDA operators.
 - `BUILD_TESTING`: include tests (default `ON` for standalone builds).
-- `LLMInfer::operators_core`: header interface for the direct CPU operations
+- `EdgeInfer::operators_core`: header interface for the direct CPU operations
   and workspace utilities.
-- `LLMInfer::unified_operators`: compatibility library, available with CUDA
-  enabled; links `LLMInfer::core_cuda` and cuBLAS.
+- `EdgeInfer::unified_operators`: compatibility library, available with CUDA
+  enabled; links `EdgeInfer::core_cuda` and cuBLAS.
 
 The sibling `core` directory is part of this library's dependency boundary.
 Model code, Python bindings, frontend code and engine include paths are outside

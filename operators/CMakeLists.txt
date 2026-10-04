@@ -1,28 +1,28 @@
 cmake_minimum_required(VERSION 3.20)
 
 if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
-  project(llm_infer_operators LANGUAGES CXX)
+  project(edge_infer_operators LANGUAGES CXX)
   include(CTest)
 endif()
 
-option(LLM_OPERATORS_ENABLE_CUDA "Build CUDA operators and compatibility adapters" ON)
+option(EDGE_INFER_OPERATORS_ENABLE_CUDA "Build CUDA operators and compatibility adapters" ON)
 
 if(NOT TARGET core_headers)
-  set(LLM_CORE_ENABLE_CUDA "${LLM_OPERATORS_ENABLE_CUDA}")
+  set(EDGE_INFER_CORE_ENABLE_CUDA "${EDGE_INFER_OPERATORS_ENABLE_CUDA}")
   add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../core" "${CMAKE_CURRENT_BINARY_DIR}/core")
 endif()
 
 add_library(operators_core INTERFACE)
-add_library(LLMInfer::operators_core ALIAS operators_core)
+add_library(EdgeInfer::operators_core ALIAS operators_core)
 target_include_directories(operators_core INTERFACE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
 target_link_libraries(operators_core INTERFACE core_headers)
 target_compile_features(operators_core INTERFACE cxx_std_17)
 
-if(LLM_OPERATORS_ENABLE_CUDA)
+if(EDGE_INFER_OPERATORS_ENABLE_CUDA)
   if(NOT TARGET core_cuda)
-    message(FATAL_ERROR "CUDA operators require LLM_CORE_ENABLE_CUDA=ON")
+    message(FATAL_ERROR "CUDA operators require EDGE_INFER_CORE_ENABLE_CUDA=ON")
   endif()
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "CUDA architectures to compile")
@@ -109,7 +109,7 @@ if(LLM_OPERATORS_ENABLE_CUDA)
       ${UNIFIED_CUDA_LEGACY_KERNEL_SOURCES}
   )
 
-  add_library(LLMInfer::unified_operators ALIAS unified_operators)
+  add_library(EdgeInfer::unified_operators ALIAS unified_operators)
   target_include_directories(unified_operators PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/src
   )
@@ -132,6 +132,7 @@ if(LLM_OPERATORS_ENABLE_CUDA)
       CUDA_STANDARD_REQUIRED ON
       POSITION_INDEPENDENT_CODE ON
       CUDA_SEPARABLE_COMPILATION ON
+      CUDA_RESOLVE_DEVICE_SYMBOLS ON
   )
 
   target_compile_options(unified_operators PRIVATE

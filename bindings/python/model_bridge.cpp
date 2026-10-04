@@ -13,6 +13,7 @@
 #include "base_model.hpp"
 #include "device_manager.hpp"
 #include "include/weight_processor.hpp"
+#include "include/python_callback.hpp"
 #include "inference.hpp"
 #include "model_factory.hpp"
 #include "model_initializer.hpp"
@@ -22,6 +23,8 @@ namespace py = pybind11;
 class infer_base;
 
 namespace {
+
+bool g_runtime_busy = false;  // Accessed only while holding the Python GIL.
 
 using InitModelFn = bool (*)(py::dict, py::dict, std::shared_ptr<BaseModel>&,
                              std::unique_ptr<infer_base>&);
@@ -85,19 +88,21 @@ infer_base* resolve_generation_engine(bool prefer_speculative) {
 void dispatch_generation(infer_base* engine, const std::vector<uint32_t>& input_ids,
                          py::function callback, size_t max_length, float temperature,
                          float top_p, size_t top_k) {
+  edge_infer::python::RuntimeOperation operation(g_runtime_busy);
   if (!engine) {
     throw std::runtime_error("Generation engine not initialized");
   }
 
-  engine->generate_with_callback(input_ids, max_length, temperature, top_p,
-                                 top_k, [callback](uint32_t token) {
-                                   py::gil_scoped_acquire acquire;
-                                   callback(token);
-                                 });
+  edge_infer::python::dispatch_callback(
+      callback, [&](std::function<void(uint32_t)> native_callback) {
+        engine->generate_with_callback(input_ids, max_length, temperature,
+                                       top_p, top_k, std::move(native_callback));
+      });
 }
 
 bool init_model(py::dict config, py::dict weights,
                 const std::string& model_type) {
+  edge_infer::python::RuntimeOperation operation(g_runtime_busy);
   try {
 
     ModelInitializer::print_config_and_weights_info(config, weights);
@@ -134,6 +139,7 @@ void generate_text_stream(const std::vector<uint32_t>& input_ids,
 }
 
 bool set_default_device(const std::string& device_str) {
+  edge_infer::python::RuntimeOperation operation(g_runtime_busy);
   try {
     Device device;
     if (device_str == "cuda" || device_str == "CUDA") {
@@ -170,6 +176,7 @@ std::string get_default_device() {
 bool init_speculative_decoder(py::dict config, py::dict weights,
                               const std::string& draft_model_type,
                               size_t spec_length = 4) {
+  edge_infer::python::RuntimeOperation operation(g_runtime_busy);
   try {
 
     if (!g_model) {

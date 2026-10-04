@@ -16,14 +16,21 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build portable project tests
         run: |
-          cmake -S . -B build-cpu-tests -DLLM_INFER_BUILD_ENGINE=OFF -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Debug
+          cmake -S . -B build-cpu-tests -DEDGE_INFER_BUILD_RUNTIME=OFF -DEDGE_INFER_BUILD_PYTHON=OFF -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Debug
           cmake --build build-cpu-tests --parallel 2
           ctest --test-dir build-cpu-tests --output-on-failure
       - name: Build standalone operator tests
         run: |
-          cmake -S operators -B build-operators -DLLM_OPERATORS_ENABLE_CUDA=OFF -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Debug
+          cmake -S operators -B build-operators -DEDGE_INFER_OPERATORS_ENABLE_CUDA=OFF -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Debug
           cmake --build build-operators --parallel 2
           ctest --test-dir build-operators --output-on-failure
+      - name: Check Python callback boundary
+        run: |
+          python3 -m venv .venv-tests
+          .venv-tests/bin/python -m pip install -r requirements-build.txt
+          cmake -S bindings/python/tests -B build-bindings-tests -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Debug -DPython_EXECUTABLE="$PWD/.venv-tests/bin/python" -Dpybind11_DIR="$(.venv-tests/bin/python -m pybind11 --cmakedir)"
+          cmake --build build-bindings-tests --parallel 2
+          ctest --test-dir build-bindings-tests --output-on-failure
       - name: Check Python and shell syntax
         run: |
           python3 - <<'PY'

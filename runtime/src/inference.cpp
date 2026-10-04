@@ -1,11 +1,9 @@
 #include "inference.hpp"
 
-#include <pybind11/numpy.h>
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
-
 #include <chrono>
 #include <iomanip>
+#include <numeric>
+#include <vector>
 
 #include "base_model.hpp"
 #include "common.hpp"
@@ -14,7 +12,6 @@
 
 enum class Signal { EndOfStream };
 using GenerationResult = std::variant<uint32_t, Signal, std::exception_ptr>;
-namespace py = pybind11;
 
 namespace {
 
@@ -326,10 +323,6 @@ uint32_t* InferenceEngine<T>::generate_next_token(ThreadPool& thread_pool, uint3
     return next_token;
 }
 
-namespace py = pybind11;
-#include <numeric>
-#include <vector>
-
 template <typename T>
 void InferenceEngine<T>::warmup(size_t warmup_tokens, bool force_warmup, float temperature, float top_p, size_t top_k) {
 
@@ -570,24 +563,7 @@ void InferenceEngine<T>::generate_with_callback(const std::vector<uint32_t>& inp
                 [&](auto&& arg) {
                     using Type = std::decay_t<decltype(arg)>;
                     if constexpr (std::is_same_v<Type, uint32_t>) {
-                        uint32_t token;
-
-                        token = arg;
-
-                        try {
-                            py::gil_scoped_release release;
-                            callback(token);
-                        } catch (const py::error_already_set& e) {
-                            std::cerr << "Python error in callback: " << e.what() << std::endl;
-                            // Wrap Python callback failures so the caller receives a C++ exception.
-                            throw std::runtime_error("Python callback failed: " + std::string(e.what()));
-                        } catch (const std::exception& e) {
-                            std::cerr << "C++ error in callback: " << e.what() << std::endl;
-                            throw;
-                        } catch (...) {
-                            std::cerr << "Unknown error during callback execution." << std::endl;
-                            throw;
-                        }
+                        callback(arg);
                     } else if constexpr (std::is_same_v<Type, Signal>) {
                         if (arg == Signal::EndOfStream) {
                             should_break = true;
@@ -608,7 +584,6 @@ void InferenceEngine<T>::generate_with_callback(const std::vector<uint32_t>& inp
             }
         }
     } catch (...) {
-        std::cerr << "No!" << std::endl;
         if (generation_thread.joinable()) {
             generation_thread.join();
         }
@@ -623,7 +598,9 @@ void InferenceEngine<T>::generate_with_callback(const std::vector<uint32_t>& inp
 
     // Reset the prefill workspace cursor and retain its storage for reuse.
 
-    GlobalCudaMemoryPool::reset_prefill_buffer();
+    if (device_ == Device::CUDA) {
+        GlobalCudaMemoryPool::reset_prefill_buffer();
+    }
 }
 template <typename T>
 void InferenceEngine<T>::reset() {

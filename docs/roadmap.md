@@ -1,6 +1,7 @@
 # Development roadmap
 
-`master` is the maintained branch. This list describes future work.
+`edge-infer` targets on-device language and speech inference. `master` is the
+maintained branch. This list describes future work, in dependency order.
 
 1. Validate BF16 greedy inference against a pinned reference: logits, generated
    tokens, KV-cache growth and graph replay. Record model/tokenizer revisions,
@@ -12,11 +13,15 @@
 4. Review speculative rejection and residual resampling with distribution tests.
 5. Publish repeated NVIDIA desktop benchmarks, including warmup, memory use,
    prefill/decode latency and complete reference configurations.
-6. Validate a specific Jetson board/JetPack release, including ARM64 dependencies,
-   unified memory, thermal limits and supported CUDA kernels.
-7. Select a Qwen TTS checkpoint, map transformer/audio-codec components, establish
-   an audio baseline, then implement streaming and measure time to first audio
-   and real-time factor.
+6. Pin a separate Torch Qwen TTS reference checkpoint and export staged
+   inputs/outputs. Integrate talker/code prediction using shared operators where
+   semantics match, then implement the audio codec and streaming output. See
+   [speech integration](speech-integration.md). Measure time to first audio,
+   real-time factor and peak memory alongside the Torch reference.
+7. Validate language and speech on a specific Jetson board/JetPack release,
+   including ARM64 dependencies, memory budgets, thermal limits and supported
+   CUDA kernels. Select board-specific precision and fusion settings based on
+   correctness and measurements.
 
 Keep operators independently consumable. Introduce shared abstractions when
 existing implementations require them.

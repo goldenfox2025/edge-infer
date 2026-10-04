@@ -3,6 +3,7 @@ build/
 build-*/
 target/
 .venv/
+.venv-*/
 *.so
 *.o
 *.a

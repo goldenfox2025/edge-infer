@@ -121,7 +121,7 @@ def load_qwen3_model(model_path: str, keep_bf16=True, is_awq=False):
     """Load Qwen3 weights and configuration, preserving BF16 or AWQ when requested."""
     model_path = Path(model_path)
     weights = {}
-    verbose_weights = os.environ.get("LLM_INFER_VERBOSE_WEIGHTS") == "1"
+    verbose_weights = os.environ.get("EDGE_INFER_VERBOSE_WEIGHTS") == "1"
 
     index_path = model_path / "model.safetensors.index.json"
     if index_path.exists():

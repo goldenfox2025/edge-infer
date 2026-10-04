@@ -1,11 +1,11 @@
 # Architecture
 
 The responsibilities are organized as `core -> operators -> runtime -> bindings`.
-Core and operators have independent build targets. Runtime sources currently
-build into the Python module, and callback handling in `runtime/src/inference.cpp`
-still depends on pybind11. Moving GIL handling fully into the bindings is future
-work. The Python frontend calls the bindings; development tools do not belong
-in operator or model execution code.
+Core, operators and the native runtime have independent build targets. The
+`EdgeInfer::runtime` static library depends on CUDA, operators and native threads;
+it has no Python or pybind11 dependency. The optional Python module links that
+library and owns Python callback/GIL handling. The Python frontend calls the
+bindings; development tools do not belong in operator or model execution code.
 
 ## Shared core
 
@@ -44,6 +44,20 @@ and decoding. Model code may select an operation but must not become a dependenc
 of that operation's implementation. `bindings/python/` owns weight preprocessing,
 initialization and Python exposure.
 
+The native `model_factory.hpp` belongs to `runtime/include/` and consumes Tensor
+weight maps rather than Python dictionaries. The current frontend and bindings
+still load/convert checkpoint weights. The native library exposes the existing
+LLM model classes and C++ token callback interface; it does not yet have a native
+checkpoint loader or a speech-model interface.
+
+The current Python module owns one process-global model/decoder session. It
+releases the GIL during native generation and reacquires it for Python callbacks.
+Overlapping generation, initialization and device mutation are rejected before
+changing that session. Native callbacks are joined before return, and callback
+exceptions retain their Python type and traceback at the binding boundary.
+Applications must serialize operations on a native engine instance; independent
+concurrent sessions and stream-safe global CUDA pool use remain future work.
+
 ## Future speech models
 
 [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) includes an audio tokenizer/codec
@@ -51,4 +65,6 @@ and streaming speech generation. Transformer primitives can be shared, while
 speech-specific execution and audio decoding need separate runtime components.
 An output API will need audio chunks, sample-rate metadata and cancellation or
 backpressure. Add these contracts when a concrete integration requires them;
-this cleanup does not implement TTS or add an unused modality hierarchy.
+The [speech integration plan](speech-integration.md) defines the migration
+sequence from a Torch reference. TTS execution and waveform output are future
+work; the shared foundation is already used by the language-model runtime.

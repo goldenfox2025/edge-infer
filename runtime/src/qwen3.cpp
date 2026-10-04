@@ -20,12 +20,12 @@
 namespace {
 
 bool verbose_weight_debug() {
-  const char *value = std::getenv("LLM_INFER_VERBOSE_WEIGHTS");
+  const char *value = std::getenv("EDGE_INFER_VERBOSE_WEIGHTS");
   return value != nullptr && std::string(value) == "1";
 }
 
 bool qwen3_graph_enabled_by_default() {
-  const char* value = std::getenv("LLM_INFER_ENABLE_QWEN3_GRAPH");
+  const char* value = std::getenv("EDGE_INFER_ENABLE_QWEN3_GRAPH");
   return value != nullptr && std::string(value) == "1";
 }
 

@@ -123,7 +123,7 @@ bool init_awq_cuda_only_model(py::dict config, py::dict weights, ModelType type,
 }  // namespace
 
 void ModelInitializer::print_config_and_weights_info(py::dict config, py::dict weights) {
-    const char* verbose = std::getenv("LLM_INFER_VERBOSE_WEIGHTS");
+    const char* verbose = std::getenv("EDGE_INFER_VERBOSE_WEIGHTS");
     if (!(verbose != nullptr && std::string(verbose) == "1")) {
         return;
     }

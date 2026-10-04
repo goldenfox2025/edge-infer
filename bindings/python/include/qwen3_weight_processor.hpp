@@ -10,7 +10,7 @@
 namespace qwen3_weight_processor {
 
 inline bool verbose_awq_debug() {
-    const char* value = std::getenv("LLM_INFER_VERBOSE_WEIGHTS");
+    const char* value = std::getenv("EDGE_INFER_VERBOSE_WEIGHTS");
     return value != nullptr && std::string(value) == "1";
 }
 

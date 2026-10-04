@@ -1,7 +1,9 @@
 # Validation record: 2026-10-04
 
-This record covers the initial repository restructuring committed alongside this
-document. The source before restructuring is preserved at
+This record covers the initial LLM_infer restructuring at commit
+`bbe9b42fb5812ccc2027872d887e13b009f4bd14`, before the edge-infer rename and native
+runtime extraction. The reproduction commands below target that commit; current
+build options are documented in the README. The source before restructuring is preserved at
 `legacy-before-restructure` (`e8ed78ca5a3d94e366c7fa52bfc06f1ad6747a1f`).
 
 ## Environment
