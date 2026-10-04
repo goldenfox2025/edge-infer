@@ -41,3 +41,5 @@ jobs:
                   ast.parse(source.read_text(encoding='utf-8'), filename=str(source))
           PY
           for script in scripts/*.sh; do bash -n "$script"; done
+      - name: Check offline Qwen TTS checkpoint contracts
+        run: python3 -m unittest discover -s tools/validation/tests -p test_qwen_tts_checkpoint.py -v

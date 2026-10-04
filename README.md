@@ -1,12 +1,15 @@
 # edge-infer
 
 A C++17/CUDA inference project for on-device language and speech generation.
-The current implementation contains Qwen/Qwen3 language-model paths for NVIDIA GPUs;
-Qwen TTS is a planned extension. NVIDIA desktops are the first validation target,
+The current implementation contains Qwen/Qwen3 language-model paths and a first
+native Qwen3-TTS conditioning stage for NVIDIA GPUs. NVIDIA desktops are the first validation target,
 followed by a specific Jetson/JetPack configuration.
 
 Shared memory utilities, independent operators and a native C++ runtime form the
 inference foundation. Python bindings and the frontend are optional consumers.
+Models compose operators; the extension target is a model implementation plus
+configuration and weight mapping. Dedicated sessions with shared read-only
+weights and private preallocated decode/KV storage are the next runtime boundary.
 The project explores BF16 and AWQ kernels, KV-cache management, CUDA Graphs and
 workspace planning. It is experimental and has not established full model parity.
 
@@ -25,12 +28,13 @@ Git history and the `legacy-before-restructure` tag.
 | --- | --- |
 | Workspace planning and lifetime analysis | Standalone C++17 tests; no CUDA or Python dependency |
 | Native C++ runtime | Separate `EdgeInfer::runtime` target; Python bindings are optional |
+| Dedicated decoding sessions | Planned state separation; the current Python API has one guarded session |
 | CUDA operators and `model_bridge` | CUDA build and direct operator tests validated; full model correctness remains pending |
 | Qwen/Qwen3 BF16 and AWQ paths | Implemented; not an established compatibility matrix |
 | Speculative decoding | Experimental; probability rejection/resampling needs a correctness review |
 | Desktop NVIDIA GPU | Current development target; historical measurements used RTX 4070 Laptop |
 | Jetson ARM64 / JetPack | Planned validation target; not verified or supported by this README |
-| Qwen TTS | Planned; shared transformer operators are available, speech execution and audio codec remain to be implemented |
+| Qwen3-TTS 0.6B Base / CustomVoice | Native text projection and audio-code embedding composition; talker, code predictor and waveform generation remain pending |
 
 Passing the workspace tests does not establish model correctness, GPU performance,
 or Jetson support. The existing Tensor-based operator test still requires the CUDA build
@@ -59,6 +63,8 @@ After the edge-infer rename and runtime extraction, the native configuration
 passed 6/6 tests and the Python-enabled configuration passed 7/7. The isolated
 callback suite passed eight cases without CUDA. See the
 [native runtime validation](docs/validation-native-runtime-2026-10-04.md).
+The first speech migration has its own
+[conditioning validation record](docs/validation-qwen-tts-2026-10-04.md).
 The Docker recipe was not built.
 
 `scripts/test.sh` now runs these workspace unit tests instead of the historical matrix
@@ -132,7 +138,7 @@ runtime and core headers and its CUDA/operator dependencies.
 `infer_base` streams token IDs through a C++ callback. Checkpoint loading and
 tokenization still belong to the current Python frontend. Python GIL handling
 is confined to the bindings. This creates a usable C++ integration boundary;
-it does not provide a native checkpoint loader or TTS model implementation.
+it does not provide a native checkpoint loader or complete TTS model implementation.
 See [native runtime integration](docs/native-runtime.md) for CMake usage,
 prepared-weight contracts and callback lifetimes.
 
@@ -172,6 +178,7 @@ It is a desktop development image, not a Jetson image.
 - `core/`: shared tensors, weight views, CUDA memory and portable workspace planning.
 - `runtime/include/execution/`: model execution programs and CUDA workspace integration.
 - `runtime/src/`: models, inference flow, KV-cache and CUDA Graph integration.
+- `runtime/include/speech/`: concrete Qwen TTS stage contracts, starting with conditioning.
 - `runtime/CMakeLists.txt`: the native `EdgeInfer::runtime` library.
 - `operators/`: operator interfaces, CPU utilities, CUDA implementations and legacy kernels.
 - `bindings/python/`: model initialization, weight conversion and Python bindings.
@@ -183,23 +190,28 @@ It is a desktop development image, not a Jetson image.
 
 Keep execution planning separate from model logic and CUDA kernel implementation.
 The next release gates are repeatable CUDA CI, broader GPU operator coverage,
-model-level greedy parity, a review of speculative resampling, and reproducible
+model/session separation, model-level greedy parity, a review of speculative resampling, and reproducible
 benchmarks. Platform-specific changes should follow measurements on the chosen
 NVIDIA device instead of speculative abstraction work.
 
 ## Extending to speech
 
-Use a separate Torch Qwen TTS implementation as the reference for a future native
-implementation; it is not bundled here. Reuse the shared operator, memory and execution
-layers where tensor layouts and semantics match. Speech-specific model
-sequencing, code prediction, codec operators and waveform output need their own
-implementation; a text-model name change cannot provide them.
+`QwenTtsConditioner<float>` and `QwenTtsConditioner<__nv_bfloat16>` implement the
+shared text projection (biased Linear, SiLU, biased Linear) and composition of
+all audio-codebook embeddings with aligned text. They borrow device weights,
+buffers, FP32 workspace, a cuBLAS handle and a stream; they have no Torch or
+Python dependency. Selected real 0.6B Base checkpoint rows and full projection
+weights are compared with a pinned official Torch reference.
 
-Start with staged comparisons against a pinned Torch checkpoint, then move the
-talker and audio-codec stages into the native runtime. Measure time to first
-audio, real-time factor, memory use and streaming continuity. See the
+The local checkpoint inspection tool maps the conditioning weights of 0.6B
+Base and CustomVoice without converting payloads. The full speech decoder is
+the next stage: an embedding-to-hidden-state transformer backbone, a talker,
+a per-frame code predictor, then an audio codec. Speech execution has its own
+contracts alongside the existing text model. See the
 [speech integration plan](docs/speech-integration.md) for component boundaries
-and validation gates.
+and validation gates, and [developer tools](tools/README.md) to reproduce the
+reference checks. Voice cloning, preset voices and waveform streaming are
+not yet exposed by edge-infer.
 
 ## Measurements and license
 
@@ -225,7 +237,9 @@ ctest --test-dir build-operators --output-on-failure
 
 This build uses the sibling `core/` directory. `operators_core` exposes
 non-owning views and inline reference functions. `unified_operators` contains
-CUDA kernels and the existing Tensor adapters. Direct CUDA calls are available for add, multiply, SiLU and RMSNorm.
+CUDA kernels and the existing Tensor adapters. Direct CUDA calls are available
+for add, multiply, SiLU, RMSNorm, biased linear projection and multi-table
+embedding sums.
 Those eager facade calls avoid factory lookup and virtual dispatch. Matmul and
 prepared-node execution retain dynamic dispatch. The static API adds no required
 shared ownership or operand allocation; CUDA launch overhead still applies. See [architecture](docs/architecture.md) and [roadmap](docs/roadmap.md).

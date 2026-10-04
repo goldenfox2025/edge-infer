@@ -113,6 +113,73 @@ its size guard. It uses the `gpu`/`cuda` labels and skips with code 77 when no
 CUDA device is available. Build success or a skipped test does not establish
 GPU correctness on a target device.
 
+## Direct CUDA conditioning primitives
+
+`operators/cuda/conditioning.hpp` adds borrowed float/BF16 `op::cuda::linear`
+and `sum_embeddings` primitives. These are tensor operations independent of
+model names, text tokenization, audio decoding, and Python. Link the same
+`EdgeInfer::unified_operators` target.
+
+`linear` accepts contiguous row-major input `[rows, in_features]`, physical
+weights `[out_features, in_features]`, an optional bias `[out_features]`, and
+output `[rows, out_features]`. Pass an empty bias view to omit it. The caller
+provides at least `rows * out_features` floats of device scratch and a cuBLAS
+handle in host pointer mode with `CUBLAS_DEFAULT_MATH`. The call explicitly sets
+that handle's stream to the supplied stream; do not use the handle concurrently.
+GEMM uses FP32 computation and writes FP32 scratch, then adds bias before casting
+to the output dtype. This preserves the biased linear layer's BF16 rounding
+boundary instead of rounding the GEMM result before adding bias. Nonempty
+dimensions must be positive and fit cuBLAS's signed-int interface.
+
+```cpp
+#include "operators/cuda/conditioning.hpp"
+
+// The caller owns the device buffers, FP32 scratch, handle, and stream.
+op::cuda::linear<float>(
+    {device_input, rows * in_features},
+    {device_weight, out_features * in_features},
+    {device_bias, out_features}, {device_output, rows * out_features},
+    {device_scratch, rows * out_features},
+    rows, in_features, out_features, handle, stream);
+```
+
+`sum_embeddings` takes a host array of `EmbeddingTable<T>` descriptors, each
+containing a borrowed device table `[vocab_size, features]`, and host code IDs
+in `[frames, codebooks]` order. Codebooks may have different vocabulary sizes.
+It writes `[frames, features]` output using at least `frames * features` floats
+of caller-owned device scratch. Every ID and table extent is validated before
+the first launch. All codebooks accumulate in FP32 and the result is cast once;
+repeated BF16 additions would introduce extra rounding. IDs travel in bounded
+64-frame launch arguments, with no device metadata allocation. The primitive
+consumes the host descriptors and IDs during the call, so these host arrays may
+be released on return. Their referenced device tables must remain alive until
+the supplied stream completes.
+
+Both primitives require valid storage on the current CUDA device. Matrix,
+table, ID, and output views have exact extents; scratch may be larger than the
+required count. Extent products and byte counts are checked for overflow.
+Operands and scratch must not overlap. Output may exactly alias scratch for
+`float`; other output overlap is unsupported. These are primitive-level alias
+rules: a composed operation may need stricter rules when one stage's output
+becomes a later stage's input. Empty operations launch no work. Keep all device
+buffers and the borrowed handle alive through stream completion, and establish
+stream/event dependencies before consuming results elsewhere.
+
+These functions perform no operand or workspace allocation, factory lookup,
+shared ownership copies, or virtual dispatch. CUDA launch and cuBLAS overhead,
+including any cuBLAS-managed workspace, remain. They do not establish a speedup
+or complete speech inference support.
+
+`operators_cuda_conditioning_test` checks float/BF16 biased and unbiased linear
+layers, odd feature widths, different codebook vocabularies, multiple blocks
+and the 64-frame chunk boundary. Cancellation fixtures verify the BF16 bias and
+codebook sum rounding boundaries. It also checks nonblocking stream use, host
+metadata lifetime, permitted float scratch aliasing, empty calls, handle modes,
+and rejected IDs/extents/overflow before output or scratch writes. It uses the
+`operators`/`cuda`/`gpu` labels and skips with code 77 when no GPU is available.
+These primitive tests use small deterministic inputs; checkpoint-based model
+conditioning parity is a separate runtime validation step.
+
 ## CMake integration
 
 - `EDGE_INFER_OPERATORS_ENABLE_CUDA`: build compatibility adapters and CUDA kernels

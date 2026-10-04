@@ -1,7 +1,24 @@
 # Development roadmap
 
 `edge-infer` targets on-device language and speech inference. `master` is the
-maintained branch. This list describes future work, in dependency order.
+maintained branch. Native runtime extraction and the first Qwen3-TTS conditioning
+stage are implemented. The current speech milestone is an audible 0.6B path on
+NVIDIA desktop GPUs; its remaining work is:
+
+1. Separate shared model weights from dedicated sessions with preallocated KV
+   capacity and fixed decode workspace. Extract an embedding-to-hidden-state
+   transformer backbone with explicit head dimensions and positions. Validate
+   the talker and code predictor separately against the pinned reference.
+2. Implement prompt alignment, language/speaker tokens, per-frame predictor
+   cache reset, group-specific heads and stopping rules for the chosen variant.
+3. Connect the reference Torch codec for initial audible comparisons, record
+   transfer costs, then migrate the codec and waveform output to native code.
+4. Validate streaming boundaries, cancellation, long inputs and repeated
+   requests; measure first-audio latency, real-time factor and memory use.
+
+See [speech integration](speech-integration.md) and the
+[first-stage validation record](validation-qwen-tts-2026-10-04.md). The following
+language-model and platform work also remains:
 
 1. Validate BF16 greedy inference against a pinned reference: logits, generated
    tokens, KV-cache growth and graph replay. Record model/tokenizer revisions,
@@ -13,12 +30,7 @@ maintained branch. This list describes future work, in dependency order.
 4. Review speculative rejection and residual resampling with distribution tests.
 5. Publish repeated NVIDIA desktop benchmarks, including warmup, memory use,
    prefill/decode latency and complete reference configurations.
-6. Pin a separate Torch Qwen TTS reference checkpoint and export staged
-   inputs/outputs. Integrate talker/code prediction using shared operators where
-   semantics match, then implement the audio codec and streaming output. See
-   [speech integration](speech-integration.md). Measure time to first audio,
-   real-time factor and peak memory alongside the Torch reference.
-7. Validate language and speech on a specific Jetson board/JetPack release,
+6. Validate language and speech on a specific Jetson board/JetPack release,
    including ARM64 dependencies, memory budgets, thermal limits and supported
    CUDA kernels. Select board-specific precision and fusion settings based on
    correctness and measurements.

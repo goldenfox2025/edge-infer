@@ -1,0 +1,370 @@
+{
+  "model_id": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+  "model_revision": "5d83992436eae1d760afd27aff78a71d676296fc",
+  "text_ids": [
+    0,
+    77091,
+    151671,
+    151672
+  ],
+  "codec_ids": [
+    0,
+    17,
+    2047,
+    127
+  ],
+  "dtype": "BF16",
+  "roles": {
+    "fc1_weight": {
+      "name": "talker.text_projection.linear_fc1.weight",
+      "shape": [
+        2048,
+        2048
+      ]
+    },
+    "fc1_bias": {
+      "name": "talker.text_projection.linear_fc1.bias",
+      "shape": [
+        2048
+      ]
+    },
+    "fc2_weight": {
+      "name": "talker.text_projection.linear_fc2.weight",
+      "shape": [
+        1024,
+        2048
+      ]
+    },
+    "fc2_bias": {
+      "name": "talker.text_projection.linear_fc2.bias",
+      "shape": [
+        1024
+      ]
+    },
+    "text_input": {
+      "name": "talker.model.text_embedding.weight",
+      "shape": [
+        4,
+        2048
+      ],
+      "original_shape": [
+        151936,
+        2048
+      ],
+      "source_ids": [
+        0,
+        77091,
+        151671,
+        151672
+      ]
+    },
+    "codec_0": {
+      "name": "talker.model.codec_embedding.weight",
+      "shape": [
+        4,
+        1024
+      ],
+      "original_shape": [
+        3072,
+        1024
+      ],
+      "source_ids": [
+        0,
+        17,
+        2047,
+        127
+      ]
+    },
+    "codec_1": {
+      "name": "talker.code_predictor.model.codec_embedding.0.weight",
+      "shape": [
+        4,
+        1024
+      ],
+      "original_shape": [
+        2048,
+        1024
+      ],
+      "source_ids": [
+        0,
+        17,
+        2047,
+        127
+      ]
+    },
+    "codec_2": {
+      "name": "talker.code_predictor.model.codec_embedding.1.weight",
+      "shape": [
+        4,
+        1024
+      ],
+      "original_shape": [
+        2048,
+        1024
+      ],
+      "source_ids": [
+        0,
+        17,
+        2047,
+        127
+      ]
+    },
+    "codec_3": {
+      "name": "talker.code_predictor.model.codec_embedding.2.weight",
+      "shape": [
+        4,
+        1024
+      ],
+      "original_shape": [
+        2048,
+        1024
+      ],
+      "source_ids": [
+        0,
+        17,
+        2047,
+        127
+      ]
+    },
+    "codec_4": {
+      "name": "talker.code_predictor.model.codec_embedding.3.weight",
+      "shape": [
+        4,
+        1024
+      ],
+      "original_shape": [
+        2048,
+        1024
+      ],
+      "source_ids": [
+        0,
+        17,
+        2047,
+        127
+      ]
+    },
+    "codec_5": {
+      "name": "talker.code_predictor.model.codec_embedding.4.weight",
+      "shape": [
+        4,
+        1024
+      ],
+      "original_shape": [
+        2048,
+        1024
+      ],
+      "source_ids": [
+        0,
+        17,
+        2047,
+        127
+      ]
+    },
+    "codec_6": {
+      "name": "talker.code_predictor.model.codec_embedding.5.weight",
+      "shape": [
+        4,
+        1024
+      ],
+      "original_shape": [
+        2048,
+        1024
+      ],
+      "source_ids": [
+        0,
+        17,
+        2047,
+        127
+      ]
+    },
+    "codec_7": {
+      "name": "talker.code_predictor.model.codec_embedding.6.weight",
+      "shape": [
+        4,
+        1024
+      ],
+      "original_shape": [
+        2048,
+        1024
+      ],
+      "source_ids": [
+        0,
+        17,
+        2047,
+        127
+      ]
+    },
+    "codec_8": {
+      "name": "talker.code_predictor.model.codec_embedding.7.weight",
+      "shape": [
+        4,
+        1024
+      ],
+      "original_shape": [
+        2048,
+        1024
+      ],
+      "source_ids": [
+        0,
+        17,
+        2047,
+        127
+      ]
+    },
+    "codec_9": {
+      "name": "talker.code_predictor.model.codec_embedding.8.weight",
+      "shape": [
+        4,
+        1024
+      ],
+      "original_shape": [
+        2048,
+        1024
+      ],
+      "source_ids": [
+        0,
+        17,
+        2047,
+        127
+      ]
+    },
+    "codec_10": {
+      "name": "talker.code_predictor.model.codec_embedding.9.weight",
+      "shape": [
+        4,
+        1024
+      ],
+      "original_shape": [
+        2048,
+        1024
+      ],
+      "source_ids": [
+        0,
+        17,
+        2047,
+        127
+      ]
+    },
+    "codec_11": {
+      "name": "talker.code_predictor.model.codec_embedding.10.weight",
+      "shape": [
+        4,
+        1024
+      ],
+      "original_shape": [
+        2048,
+        1024
+      ],
+      "source_ids": [
+        0,
+        17,
+        2047,
+        127
+      ]
+    },
+    "codec_12": {
+      "name": "talker.code_predictor.model.codec_embedding.11.weight",
+      "shape": [
+        4,
+        1024
+      ],
+      "original_shape": [
+        2048,
+        1024
+      ],
+      "source_ids": [
+        0,
+        17,
+        2047,
+        127
+      ]
+    },
+    "codec_13": {
+      "name": "talker.code_predictor.model.codec_embedding.12.weight",
+      "shape": [
+        4,
+        1024
+      ],
+      "original_shape": [
+        2048,
+        1024
+      ],
+      "source_ids": [
+        0,
+        17,
+        2047,
+        127
+      ]
+    },
+    "codec_14": {
+      "name": "talker.code_predictor.model.codec_embedding.13.weight",
+      "shape": [
+        4,
+        1024
+      ],
+      "original_shape": [
+        2048,
+        1024
+      ],
+      "source_ids": [
+        0,
+        17,
+        2047,
+        127
+      ]
+    },
+    "codec_15": {
+      "name": "talker.code_predictor.model.codec_embedding.14.weight",
+      "shape": [
+        4,
+        1024
+      ],
+      "original_shape": [
+        2048,
+        1024
+      ],
+      "source_ids": [
+        0,
+        17,
+        2047,
+        127
+      ]
+    }
+  },
+  "reference_revision": "022e286b98fbec7e1e916cb940cdf532cd9f488e",
+  "reference_class": "Qwen3TTSTalkerResizeMLP",
+  "reference_source_sha256": "25c42656bcf810f06ef6bc1839bd7083f3c8cfedac3a147c4060b4262b1c96a0",
+  "torch_version": "2.6.0+cu124",
+  "device": "cuda",
+  "gpu": "NVIDIA GeForce RTX 4070 Laptop GPU",
+  "scope": "selected real embedding rows and complete text projection; no transformer/codec inference",
+  "fixture_sha256": {
+    "codec_0.f32": "e5eb5483cd614ce4db95e3fb60e561451efc69043b2b582a51c0ce34de901a75",
+    "codec_1.f32": "dc523a89e37fba703b93f4b04fae24ecab14461f6efe731d277786e197b02043",
+    "codec_10.f32": "9258315e503086301c7af0b4b23ce3ebf7d21cb3e9b9a7f9f581a3724fd3ab74",
+    "codec_11.f32": "e6d65c27892e4da2dbf2b6e3936ee28a03e6fd09ba8462d7f2da6a2217376da1",
+    "codec_12.f32": "d3ce3a80dd8796d977f6895f3272d84a4ce70dc6ab239893f65f968386b78676",
+    "codec_13.f32": "9f28ed9732ba4edc5fcf3590cdc4810b977b595174ccf345129400e830dc710a",
+    "codec_14.f32": "8edfa3e9cac50ddc8614412692594f94080c00b65b4c0a19a4b4c7990a8dafd2",
+    "codec_15.f32": "e78d0f9b1bedd67d2d8eed25c56891c13d5bacff45023d1af27b2dac30c57fb5",
+    "codec_2.f32": "02f44abfbb8cf99f64c0480e567a2e6db2495d6bd5fb6ea782cfcaf3ae79fcae",
+    "codec_3.f32": "1d8ce24f8ba8021a7b2a5b191672075e0ef1d3ed08db03e151df49bfdd2d4e01",
+    "codec_4.f32": "c04ae729ce4abb64603866c336c60c9c20e9b1a8f19edf8427be8a40e160e9a2",
+    "codec_5.f32": "4827421bbbb01660aaaaab33c5951bef851072d29517a0a550e392ed24cb9515",
+    "codec_6.f32": "2766b95397b09ff5804c858dfe72ca3051ca16972dae200ce598bee4e09f0665",
+    "codec_7.f32": "90d4f879b2f7810fd40ff20ab7ba53aec97bc775087c736d1d5eb24724a333c6",
+    "codec_8.f32": "260432c42f559e5c3519f792cda62818eb91234c1608f63bb95ed2b8bebac0e3",
+    "codec_9.f32": "6aa09c0437591ebd7b20533c30b00796e456f6669ae64f1ed73463ab6b272a79",
+    "codec_ids.u32": "969529e9ecb1ebd9cadb933346a5a2d4ccde644163891e0bfaac3f730e0da537",
+    "dimensions.txt": "22c1fc0fb00d193ff4750378360ee1cdc330f63a3e971ad61a9b0134e1f60a48",
+    "fc1_bias.f32": "c572675cd442f7917438346d7844dc4914616ca1378e3be864eacc8df4794be9",
+    "fc1_weight.f32": "2d76e2a596dab80433c5d1ff28f33bd7707cdeac2b4546f5c79bfe3eeb2e5b3b",
+    "fc2_bias.f32": "3bf2c0a2c698d3248a1d7aaa0f8a9114b64654a02ce8db5ca7e0cefa1aa7f8f2",
+    "fc2_weight.f32": "bc93b18c2c58a96b62c42865f8599526200b4a6f11be1c7a4d6f0ccb324f495e",
+    "frame_expected_bfloat16.f32": "25c7daa8aaa5e741b15b5f79638dd8a9a1a6678825033bcde32190199eb601b3",
+    "frame_expected_float32.f32": "1555e21351c9299e613fd91f2e85a56ba9d281a8e41ea24e5220e5bb013390eb",
+    "text_expected_bfloat16.f32": "9d53559696dee3e75c355be28c7aeafbfd7c0f091a465ac5da2e31309a737918",
+    "text_expected_float32.f32": "5b6bfefb6baf014d3b89025022695795c8cc01ba476fbfc151ca115a19297267",
+    "text_input.f32": "f03ead2d1dd59e74e620bd012f951c2b792303b6104a32a2fdaabe375a6b2857"
+  }
+}

@@ -46,6 +46,7 @@ if(EDGE_INFER_OPERATORS_ENABLE_CUDA)
 
   set(UNIFIED_CUDA_OPERATOR_SOURCES
       src/cuda/add_cuda.cu
+      src/cuda/conditioning.cu
       src/cuda/attention_output_prefill_cuda.cu
       src/cuda/attention_scores_prefill_cuda.cu
       src/cuda/dynamic_flash_attention_cuda.cu
