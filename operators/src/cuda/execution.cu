@@ -58,11 +58,11 @@ void require_attention(TensorView<const T, 3> q, TensorView<const T, 3> k,
 }
 
 template <typename T>
-__global__ void bias_kernel(T* output, const T* bias, int rows, int width) {
+__global__ void broadcast_bias_kernel(T* output, const T* bias, int rows, int width) {
   const std::size_t count = static_cast<std::size_t>(rows) * width;
   const std::size_t start = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const std::size_t step = static_cast<std::size_t>(gridDim.x) * blockDim.x;
-  for (std::size_t i = start; i < count; i += step) output[i] = output[i] + bias[i % width];
+  for (std::size_t i = start; i < count; i += step) output[i] = bias[i % width];
 }
 template <typename T>
 __global__ void gather_rows_kernel(const uint32_t* ids, const T* table, T* output,
@@ -90,15 +90,35 @@ __global__ void rotate_kernel(T* data, std::size_t row_stride, std::size_t head_
     sine = cache[position * cache_stride + pair * 2];
     cosine = cache[position * cache_stride + pair * 2 + 1];
   } else {
-    const float frequency = 1.0f / powf(theta, (2.0f * pair) / static_cast<float>(head_dim));
-    const float angle = static_cast<float>(position) * frequency;
-    sine = sinf(angle); cosine = cosf(angle);
+    const float exponent = (2.0f * pair) / static_cast<float>(head_dim);
+    const float power = static_cast<float>(pow(static_cast<double>(theta),
+                                              static_cast<double>(exponent)));
+    const float frequency = __fdiv_rn(1.0f, power);
+    const float angle = __fmul_rn(static_cast<float>(position), frequency);
+    // Fast single-precision sine has an absolute error that loses significant
+    // bits for small RoPE angles. Double transcendental calls retain precision
+    // under --use_fast_math. Prepared models use their shared table instead.
+    sine = static_cast<float>(sin(static_cast<double>(angle)));
+    cosine = static_cast<float>(cos(static_cast<double>(angle)));
   }
   T* head = data + static_cast<std::size_t>(blockIdx.x) * row_stride + blockIdx.y * head_dim;
   const float x = static_cast<float>(head[pair]);
   const float y = static_cast<float>(head[pair + half]);
-  head[pair] = static_cast<T>(x * cosine - y * sine);
-  head[pair + half] = static_cast<T>(x * sine + y * cosine);
+  if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+    // BF16 RoPE casts its trigonometric tensors to the activation dtype,
+    // rounds each product, then rounds the sum of those BF16 products.
+    sine = __bfloat162float(__float2bfloat16_rn(sine));
+    cosine = __bfloat162float(__float2bfloat16_rn(cosine));
+    const float x_cosine = __bfloat162float(__float2bfloat16_rn(x * cosine));
+    const float y_sine = __bfloat162float(__float2bfloat16_rn(y * sine));
+    const float x_sine = __bfloat162float(__float2bfloat16_rn(x * sine));
+    const float y_cosine = __bfloat162float(__float2bfloat16_rn(y * cosine));
+    head[pair] = __float2bfloat16_rn(x_cosine - y_sine);
+    head[pair + half] = __float2bfloat16_rn(x_sine + y_cosine);
+  } else {
+    head[pair] = static_cast<T>(x * cosine - y * sine);
+    head[pair + half] = static_cast<T>(x * sine + y * cosine);
+  }
 }
 
 template <typename T>
@@ -173,12 +193,12 @@ void launch_scalar_attention(const ExecutionContext& context,
 template <typename T>
 __global__ void scaled_indices_kernel(const T* logits, float* scaled, int* indices,
                                        int vocabulary, float temperature) {
-  const int start = blockIdx.x * blockDim.x + threadIdx.x;
-  const int step = gridDim.x * blockDim.x;
-  for (int i = start; i < vocabulary; i += step) {
+  const std::size_t start = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::size_t step = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  for (std::size_t i = start; i < static_cast<std::size_t>(vocabulary); i += step) {
     const float value = static_cast<float>(logits[i]);
     scaled[i] = isnan(value) ? -INFINITY : value / temperature;
-    indices[i] = i;
+    indices[i] = static_cast<int>(i);
   }
 }
 __global__ void sample_sorted_kernel(const float* sorted, const int* indices,
@@ -284,19 +304,23 @@ void linear(const ExecutionContext& context, TensorView<const T, 2> input,
   if (!context.handle || !weight.data || input.shape[1] != static_cast<std::size_t>(weight.input_features) ||
       output.shape[0] != input.shape[0] || output.shape[1] != static_cast<std::size_t>(weight.output_features))
     throw std::invalid_argument("Direct dense linear input/output dimensions or handle are invalid");
-  const float alpha = 1.0f, beta = 0.0f;
+  const float alpha = 1.0f, beta = weight.bias ? 1.0f : 0.0f;
   constexpr auto dtype = std::is_same_v<T, float> ? CUDA_R_32F : CUDA_R_16BF;
+  if (weight.bias) {
+    // GEMM accumulates alpha*A*B + beta*C in FP32 before its final dtype cast.
+    // Initialize C with the exact bias, preserving cancellation that would be
+    // lost by rounding the matrix product to BF16 before adding the bias.
+    const auto blocks = std::min<std::size_t>((output.numel() + 255) / 256,
+                                             context.multiprocessors * 32);
+    broadcast_bias_kernel<T><<<blocks, 256, 0, context.stream>>>(
+        output.data, weight.bias, rows, weight.output_features);
+    check_cuda(cudaGetLastError());
+  }
   check_blas(cublasGemmEx(context.handle, weight.operation, CUBLAS_OP_N,
       weight.output_features, rows, weight.input_features, &alpha,
       weight.data, dtype, weight.leading_dimension, input.data, dtype,
       weight.input_features, &beta, output.data, dtype, weight.output_features,
       CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
-  if (weight.bias) {
-    const auto blocks = std::min<std::size_t>((output.numel() + 255) / 256,
-                                             context.multiprocessors * 32);
-    bias_kernel<T><<<blocks, 256, 0, context.stream>>>(output.data, weight.bias, rows, weight.output_features);
-    check_cuda(cudaGetLastError());
-  }
 }
 template <typename T>
 void awq_linear(const ExecutionContext& context, TensorView<const T, 2> input,
@@ -335,13 +359,16 @@ void rope(const ExecutionContext& context, TensorView<T, 3> input,
 }
 template <typename T>
 void rope_precomputed(const ExecutionContext& context, TensorView<T, 3> input,
-    TensorView<const float, 2> cache, const std::size_t* offsets, const int* pingpong) {
+    TensorView<const float, 2> cache, std::size_t offset,
+    const std::size_t* offsets, const int* pingpong) {
   require_head_view(input); require_dense_view(cache);
-  if (!offsets || cache.shape[1] != input.shape[2] || input.shape[2] % 2 ||
+  if (cache.shape[1] != input.shape[2] || input.shape[2] % 2 ||
       input.shape[2] / 2 > static_cast<std::size_t>(context.max_threads_per_block))
     throw std::invalid_argument("Direct cached RoPE has incompatible cache or offsets");
+  if (!offsets && (offset > cache.shape[0] || input.shape[0] > cache.shape[0] - offset))
+    throw std::out_of_range("Direct cached RoPE positions exceed table capacity");
   rotate_kernel<T><<<dim3(input.shape[0], input.shape[1]), input.shape[2] / 2, 0, context.stream>>>(
-      input.data, input.stride[0], input.shape[2], 0, 0.0f, cache.data, cache.stride[0], offsets, pingpong);
+      input.data, input.stride[0], input.shape[2], offset, 0.0f, cache.data, cache.stride[0], offsets, pingpong);
   check_cuda(cudaGetLastError());
 }
 template <typename T>
@@ -360,7 +387,7 @@ void store_kv(const ExecutionContext& context, TensorView<const T, 2> source,
 template <typename T>
 void attention_decode(const ExecutionContext& context, TensorView<const T, 3> q,
     TensorView<const T, 3> k, TensorView<const T, 3> v, TensorView<T, 3> output,
-    TensorView<T, 1> workspace) {
+    TensorView<float, 1> workspace) {
   require_attention(q, k, v, output);
   if (q.shape[0] != 1) throw std::invalid_argument("Direct decode attention requires one query row");
   if (std::is_same_v<T, __nv_bfloat16> && q.shape[2] == 128 &&
@@ -391,7 +418,7 @@ void attention_prefill(const ExecutionContext& context, TensorView<const T, 3> q
 template <typename T>
 void attention_graph(const ExecutionContext& context, TensorView<const T, 3> q,
     TensorView<const T, 3> k, TensorView<const T, 3> v, TensorView<T, 3> output,
-    T** branch_outputs, int* lengths, int* pingpong) {
+    float** branch_outputs, int* lengths, int* pingpong) {
   require_attention(q, k, v, output);
   if (q.shape[0] != 1 || !lengths || !pingpong)
     throw std::invalid_argument("Direct graph attention requires one query and device extent state");
@@ -454,7 +481,8 @@ void sample(const ExecutionContext& context, TensorView<const T, 2> logits,
   int* indices = reinterpret_cast<int*>(workspace.data + plan.indices_offset);
   int* sorted_indices = reinterpret_cast<int*>(workspace.data + plan.sorted_indices_offset);
   const int vocabulary = checked_int(plan.vocabulary);
-  const int blocks = std::min((vocabulary + 255) / 256, context.multiprocessors * 32);
+  const auto blocks = std::min<std::size_t>((plan.vocabulary + 255) / 256,
+      static_cast<std::size_t>(context.multiprocessors) * 32);
   for (std::size_t row = 0; row < logits.shape[0]; ++row) {
     scaled_indices_kernel<T><<<blocks, 256, 0, context.stream>>>(
         logits.data + row * logits.stride[0], scaled, indices, vocabulary,
@@ -486,11 +514,11 @@ void token_probability(const ExecutionContext& context, TensorView<const T, 2> l
   template void awq_linear<T>(const ExecutionContext&, TensorView<const T, 2>, const AwqLinearWeight<T>&, TensorView<T, 2>); \
   template void gather<T>(const ExecutionContext&, TensorView<const uint32_t, 1>, TensorView<const T, 2>, TensorView<T, 2>); \
   template void rope<T>(const ExecutionContext&, TensorView<T, 3>, std::size_t, float); \
-  template void rope_precomputed<T>(const ExecutionContext&, TensorView<T, 3>, TensorView<const float, 2>, const std::size_t*, const int*); \
+  template void rope_precomputed<T>(const ExecutionContext&, TensorView<T, 3>, TensorView<const float, 2>, std::size_t, const std::size_t*, const int*); \
   template void store_kv<T>(const ExecutionContext&, TensorView<const T, 2>, TensorView<T, 2>, std::size_t, const std::size_t*); \
-  template void attention_decode<T>(const ExecutionContext&, TensorView<const T, 3>, TensorView<const T, 3>, TensorView<const T, 3>, TensorView<T, 3>, TensorView<T, 1>); \
+  template void attention_decode<T>(const ExecutionContext&, TensorView<const T, 3>, TensorView<const T, 3>, TensorView<const T, 3>, TensorView<T, 3>, TensorView<float, 1>); \
   template void attention_prefill<T>(const ExecutionContext&, TensorView<const T, 3>, TensorView<const T, 3>, TensorView<const T, 3>, TensorView<T, 3>, std::size_t); \
-  template void attention_graph<T>(const ExecutionContext&, TensorView<const T, 3>, TensorView<const T, 3>, TensorView<const T, 3>, TensorView<T, 3>, T**, int*, int*); \
+  template void attention_graph<T>(const ExecutionContext&, TensorView<const T, 3>, TensorView<const T, 3>, TensorView<const T, 3>, TensorView<T, 3>, float**, int*, int*); \
   template void sample<T>(const ExecutionContext&, TensorView<const T, 2>, TensorView<uint32_t, 1>, TensorView<float, 1>, TensorView<unsigned char, 1>, const SamplingPlan&, float, float, std::size_t, curandState*); \
   template void token_probability<T>(const ExecutionContext&, TensorView<const T, 2>, std::size_t, uint32_t, float*);
 

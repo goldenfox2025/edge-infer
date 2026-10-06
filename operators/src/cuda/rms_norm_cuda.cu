@@ -2,11 +2,9 @@
 #include <iostream>
 #include <stdexcept>
 #include <limits>
+#include <type_traits>
 
 #include "operators/cuda/direct.hpp"
-#ifndef EDGE_INFER_COMPUTE_ONLY
-#include "operators/cuda/rms_norm_cuda.cuh"
-#endif
 
 namespace op {
 
@@ -90,7 +88,14 @@ __global__ void rms_norm_kernel(const T* input, T* output, const T* __restrict__
             float x = val[flag++];
             float w = static_cast<float>(weight[i]);
 
-            out_row[i] = static_cast<T>((x * inv_rms) * w);
+            if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+                // Qwen RMSNorm casts the normalized activation back to BF16
+                // before applying its BF16 weight. Preserve both roundings.
+                const float normalized = __bfloat162float(__float2bfloat16_rn(x * inv_rms));
+                out_row[i] = __float2bfloat16_rn(normalized * w);
+            } else {
+                out_row[i] = static_cast<T>((x * inv_rms) * w);
+            }
         }
     }
 }
@@ -133,34 +138,10 @@ void cuda::rms_norm(ArrayView<const T> input, ArrayView<const T> weight,
     }
 }
 
-#ifndef EDGE_INFER_COMPUTE_ONLY
-
-template <typename T>
-void RmsNormCUDAOperator<T>::operator()(Tensor<T>* output, Tensor<T>* input,
-                                       Tensor<T>* weight, float eps, cudaStream_t stream) {
-    const auto& sizes = input->sizes();
-    if (sizes.empty()) {
-        throw std::runtime_error("RMSNorm CUDA input requires a feature dimension");
-    }
-    const size_t feature_dim = sizes.back();
-    size_t batch_size = 1;
-    for (size_t i = 0; i + 1 < sizes.size(); ++i) {
-        batch_size *= sizes[i];
-    }
-    cuda::rms_norm<T>({input->data_ptr(), input->numel()},
-                      {weight->data_ptr(), weight->numel()},
-                      {output->data_ptr(), output->numel()},
-                      batch_size, feature_dim, eps, stream);
-}
-#endif
 
 
 template void cuda::rms_norm<float>(ArrayView<const float>, ArrayView<const float>, ArrayView<float>, std::size_t, std::size_t, float, cudaStream_t);
 template void cuda::rms_norm<__nv_bfloat16>(ArrayView<const __nv_bfloat16>, ArrayView<const __nv_bfloat16>, ArrayView<__nv_bfloat16>, std::size_t, std::size_t, float, cudaStream_t);
 
-#ifndef EDGE_INFER_COMPUTE_ONLY
-template class RmsNormCUDAOperator<float>;
-template class RmsNormCUDAOperator<__nv_bfloat16>;
-#endif
 
 }  // namespace op

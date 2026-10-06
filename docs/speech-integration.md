@@ -99,9 +99,16 @@ must not be assumed to represent multi-codebook audio frames or waveform chunks.
 Introduce speech-specific stage/output contracts with their actual consumers;
 avoid a generic modality framework before those requirements are established.
 
-The next reusable transformer backbone accepts embeddings and returns normalized
-hidden states with explicit caller-owned KV state. Lookup and task-specific
-output heads stay outside it. A talker step produces a hidden state and primary
+The implemented `Qwen3Session::prefill_embeddings()` and `decode_embeddings()`
+boundary accepts contiguous CUDA embeddings and returns borrowed normalized
+hidden states through the shared eager decoder. Each managed session owns its
+bounded KV cache; callers supply logical position offsets independently of
+physical cache slots. Lookup, output heads and sampling stay outside these
+calls. This is a reusable execution boundary, not a completed speech model:
+prepared weights and positions still follow the text backbone's contract, and
+the talker requires MRoPE and stage-specific weights/heads.
+
+A talker step produces a hidden state and primary
 code; the predictor starts with `[talker hidden, primary-code embedding]` and
 predicts residual groups with their own heads. Its cache resets each frame,
 while the talker's cache continues across frames. Later variants with different
@@ -116,7 +123,9 @@ before using it as an optimization; preserve the recorded MRoPE configuration.
 1. Conditioning is implemented. Extend deterministic references to actual
    prompt/preprocessing outputs and both supported variants before exposing
    user-facing generation.
-2. Integrate the talker and code-prediction stages incrementally. Compare
+2. Connect talker and code-prediction adapters to the implemented
+   embedding-to-hidden boundary, adding MRoPE and stage-specific prepared weights
+   and heads. Compare
    deterministic logits/codes with references and verify cache reset, growth,
    sequence boundaries and stopping rules.
 3. Keep the Torch codec temporarily as a bridge to audible outputs while the

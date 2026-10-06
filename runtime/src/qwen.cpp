@@ -116,6 +116,12 @@ ModelConfig decoder_configuration(ModelConfig config) {
     config["qk_norm"] = 0;
     return config;
 }
+
+void validate_cpu_sampling_policy(float temperature, float top_p, size_t top_k) {
+    if (!std::isfinite(temperature) || !std::isfinite(top_p) ||
+        top_p <= 0.0f || top_p > 1.0f || !top_k)
+        throw std::invalid_argument("Invalid Qwen CPU sampling policy");
+}
 }
 
 template <typename T>
@@ -487,6 +493,7 @@ uint32_t* QwenModel<T>::cpu_sample_result(TensorView<const T, 2> logits, float t
     if (device_ == Device::CPU) return new uint32_t(token); // BaseModel caller owns this compatibility result.
     auto* result = cpu_sample_storage_.template ptr_at<uint32_t>(0);
     CUDA_CHECK(cudaMemcpy(result, &token, sizeof(token), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
     return result;
 }
 
@@ -495,6 +502,7 @@ uint32_t* QwenModel<T>::forward(const Tensor<uint32_t>* input, ThreadPool& pool,
                               size_t top_k, float temperature, float top_p, curandState* states) {
     if (device_ == Device::CUDA && sample_mode_ != SampleMode::CPU)
         return cuda_session_->forward(input, pool, base, top_k, temperature, top_p, states);
+    validate_cpu_sampling_policy(temperature, top_p, top_k);
     auto* cache = dynamic_cast<KVCache<T>*>(base);
     auto logits = device_ == Device::CUDA && cuda_session_->graph_enabled()
         ? forward_for_graph_logits_only(input, cache) : forward_logits_only(input, cache);
@@ -505,6 +513,7 @@ uint32_t* QwenModel<T>::prefill(const Tensor<uint32_t>* input, ThreadPool& pool,
                               size_t top_k, float temperature, float top_p, curandState* states) {
     if (device_ == Device::CUDA && sample_mode_ != SampleMode::CPU)
         return cuda_session_->prefill(input, pool, base, top_k, temperature, top_p, states);
+    validate_cpu_sampling_policy(temperature, top_p, top_k);
     auto* cache = dynamic_cast<KVCache<T>*>(base);
     auto logits = device_ == Device::CUDA ? prefill_cuda(input, cache) : prefill_generic(input, cache);
     return cpu_sample_result(logits.as_const(), temperature, top_p, top_k);
@@ -513,6 +522,12 @@ uint32_t* QwenModel<T>::prefill(const Tensor<uint32_t>* input, ThreadPool& pool,
 template <typename T> QwenModel<T>& QwenModel<T>::cuda() {
     if (device_ != Device::CUDA) prepare_cuda();
     return *this;
+}
+template <typename T> void QwenModel<T>::synchronize() const {
+    if (device_ == Device::CUDA) {
+        if (!cuda_session_) throw std::logic_error("Qwen CUDA session is not prepared");
+        cuda_session_->synchronize();
+    }
 }
 template <typename T> QwenModel<T>& QwenModel<T>::cpu() {
     if (device_ == Device::CPU) return *this;
@@ -558,10 +573,5 @@ template <typename T> op::WeightTensor<T> QwenModel<T>::get_weight(const std::st
     if (dense != params_.end()) return op::WeightTensor<T>(&dense->second);
     throw std::runtime_error("Qwen weight not found: " + name);
 }
-template <typename T>
-std::vector<uint32_t> QwenModel<T>::generate(const std::vector<uint32_t>&, size_t, float, float, size_t) {
-    throw std::runtime_error("Use InferenceEngine for token generation");
-}
-
 template class QwenModel<float>;
 template class QwenModel<__nv_bfloat16>;

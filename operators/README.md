@@ -2,15 +2,14 @@
 
 The operator layer can be built separately from the model runtime and Python
 bindings. It provides direct CPU reference operations and a standalone CUDA
-compute library. Historical Tensor/factory adapters are optional.
+compute library. Historical Tensor/factory adapters are preserved in Git history.
 
 ## Direct CPU reference API
 
 `operators/core/cpu_reference.hpp` defines inline `op::cpu::add`, `multiply`,
 `silu`, and `rms_norm` functions. They take borrowed `op::ArrayView<T>` values:
 each view contains a pointer and an element count, with no ownership,
-allocation, factory lookup, or virtual dispatch. The CPU adapter classes reuse
-these functions for their float implementations.
+allocation, factory lookup, or virtual dispatch.
 
 The CPU templates accept native C++ arithmetic types and are tested with
 `float`. Vendor device types such as CUDA BF16 must be converted to float for
@@ -29,7 +28,7 @@ Callers provide matching extents, valid storage and lifetimes. Exact aliasing
 between an input and output is supported; partial overlap is unsupported.
 RMSNorm additionally requires a positive feature dimension and weights that do
 not overlap the output. These are CPU reference functions, with float
-accumulation for SiLU/RMSNorm as in the existing adapters. No GPU performance
+accumulation for SiLU/RMSNorm. No GPU performance
 claim follows from this API.
 
 From the repository root, a standalone build needs only CMake and a C++17
@@ -64,22 +63,26 @@ ctest --test-dir build-operators-cuda --output-on-failure
 ```
 
 Choose the CUDA architecture for the target GPU; `89` is the existing desktop
-default. To build `EdgeInfer::unified_operators`, separately enable
-`EDGE_INFER_BUILD_LEGACY_OPERATORS=ON` and `EDGE_INFER_CORE_ENABLE_CUDA=ON`.
-That optional target requires the pinned CUTLASS submodule; initialize it with
-`git submodule update --init cutlass` or provide its checkout through
-`CUTLASS_DIR`. Its CPU compatibility tests still link CUDA because the legacy
-Tensor API uses CUDA types and memory helpers.
+default. The maintained compute library has no CUTLASS, Tensor/factory adapter
+or process-global allocator dependency.
 
-`operators/cuda/direct.hpp` exports `op::cuda::add`, `multiply`, `silu`, and
-`rms_norm` for borrowed float/BF16 device views and a caller-supplied stream.
-They share the existing CUDA kernels with the compatibility adapters and do not
+`operators/cuda/direct.hpp` exports `op::cuda::add`, `multiply`, `silu`,
+`silu_multiply`, and `rms_norm` for borrowed float/BF16 device views and a
+caller-supplied stream.
+They launch concrete CUDA kernels and do not
 allocate operand/workspace storage, register operators or use virtual dispatch.
 Matching extents are checked. Elementwise counts must fit a signed integer;
 the current RMSNorm kernel supports feature dimensions from 1 to 10240 and
 rejects larger nonempty rows before launch. Empty views perform no launch.
-RMSNorm weights must not overlap the output; exact input/output aliasing is
-supported for all four functions.
+RMSNorm weights must not overlap the output. Exact input/output aliasing is
+supported; partial overlap is unsupported.
+
+`silu_multiply(gate, up, output, stream)` performs the gated activation in one
+kernel, with no intermediate device buffer. It preserves the two-stage dtype
+contract: first round `SiLU(gate)` to the operand dtype, then multiply by `up`
+and round the product. BF16 therefore keeps the same intermediate activation
+rounding as separate SiLU and multiplication calls. FP32 retains FP32 arithmetic.
+The decoder uses this operation with `output` exactly aliasing `gate`.
 
 Launches are asynchronous. Keep device buffers alive until the supplied stream
 completes. Enqueue uploads on that stream or establish a CUDA event dependency,
@@ -94,23 +97,22 @@ op::cuda::add<float>({device_a, count}, {device_b, count},
                      {device_output, count}, stream);
 ```
 
-The optional historical `UnifiedOperators` facade uses these direct CUDA functions for the same four operations
-and statically calls their CPU adapters. Those methods bypass factory lookup,
-shared pointer copies and virtual dispatch. Factory metadata, the remaining
-compatibility operations retain dynamic dispatch. Custom factory registrations
-affect those historical paths. Prepared model execution calls the direct CUDA
-API with fixed views and resolved weight layouts.
+Prepared model execution calls the direct CUDA API with fixed views and resolved
+weight layouts. CUDA calls retain their launch and library overhead. Jetson
+builds and end-to-end inference remain unverified.
 
-CUDA calls retain their launch and library overhead. CPU sampling
-uses AVX when enabled by the compiler and scalar temperature/max loops
-otherwise. This fallback removes an x86-only header dependency; Jetson builds
-and end-to-end inference remain unverified.
-
-The GPU test compares float/BF16 outputs against CPU references, including
+The direct GPU test compares float/BF16 outputs against CPU references, including
 in-place operations, vector tails, empty inputs, the RMSNorm cache boundary and
 its size guard. It uses the `gpu`/`cuda` labels and skips with code 77 when no
 CUDA device is available. Build success or a skipped test does not establish
 GPU correctness on a target device.
+
+`operators_cuda_bf16_contract_test` checks the fused activation against an
+independent scalar reference, comparing BF16 bits exactly and FP32 values within
+tolerance. Its mixed-sign inputs, cancelling output pairs, offset pointers and
+513-element extent cover intermediate rounding, in-place execution, scalar tails,
+nonblocking streams and output guards. Invalid extents and empty calls are also
+checked. The same test covers BF16 RMSNorm, RoPE and biased dense-linear rounding.
 
 ## Direct CUDA conditioning primitives
 
@@ -195,6 +197,18 @@ BF16 head width 128 reuses the optimized attention implementation. Other support
 head widths and FP32 use a scalar correctness fallback. That fallback establishes
 functional coverage; no performance improvement is implied.
 
+Prepared models own one shared FP32 sine/cosine table. The common decoder calls
+`rope_precomputed` with that table in prefill, eager decode and CUDA Graph mode;
+the modes differ in how they supply the logical position offset. BF16 rotation
+rounds trigonometric values, each product and the final sum to BF16. The uncached
+`rope` primitive remains available for callers that provide a theta instead.
+This table implements ordinary RoPE. Qwen TTS MRoPE still requires multimodal
+position support in its model adapter.
+
+Maintained optimized kernel bodies live in `operators/src/cuda/kernels` under
+concrete entry points. Unused prefill variants and historical adapters are kept
+in Git history rather than compiled into the compute archive.
+
 `EdgeInfer::operators_cuda` links portable headers, cudart and cuBLAS only. The
 normal compute archive excludes Tensor adapters, shared ownership and global
 memory-pool symbols. Valid prepared submissions allocate no application operand
@@ -204,19 +218,14 @@ or scratch storage. CUDA library-private allocations remain outside that claim.
 
 - `EDGE_INFER_OPERATORS_ENABLE_CUDA`: build the direct CUDA compute library
   (default `ON`). Set it to `OFF` for the direct CPU reference path.
-- `EDGE_INFER_BUILD_LEGACY_OPERATORS`: build historical Tensor/factory adapters
-  (default `OFF`); requires the pinned CUTLASS checkout and core memory runtime.
-- `EDGE_INFER_CORE_ENABLE_CUDA`: build the sibling core memory runtime. Direct
-  CUDA compute does not need it; standalone operators enables it for the optional
-  legacy target. The native runtime also requires the core memory runtime.
+- `EDGE_INFER_CORE_ENABLE_CUDA`: expose the sibling core CUDA header interface
+  with cudart linkage for owning Tensor consumers. The direct compute archive
+  needs the portable core headers only.
 - `BUILD_TESTING`: include tests (default `ON` for standalone builds).
 - `EdgeInfer::operators_core`: header interface for the direct CPU operations
   and workspace utilities.
 - `EdgeInfer::operators_cuda`: direct CUDA compute library; links portable
   headers, cudart and cuBLAS.
-- `EdgeInfer::unified_operators`: optional legacy compatibility library, available
-  with CUDA and `EDGE_INFER_BUILD_LEGACY_OPERATORS=ON`; links the core memory runtime
-  and cuBLAS.
 
 The sibling `core` directory is part of this library's dependency boundary.
 Model code, Python bindings, frontend code and engine include paths are outside

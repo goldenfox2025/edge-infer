@@ -10,9 +10,9 @@
 
 namespace edge_infer::python {
 
-// Enter and leave while holding the GIL. The current binding has one mutable
-// runtime: reject overlapping operations instead of waiting under the GIL or
-// allowing initialization to destroy an engine still in use by generation.
+// Enter and leave while holding the GIL. Each mutable session has its own guard;
+// the procedural compatibility wrapper has another guard for atomic replacement.
+// Reject overlapping operations instead of waiting while holding the GIL.
 class RuntimeOperation {
  public:
   explicit RuntimeOperation(bool& busy) : busy_(busy) {

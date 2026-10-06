@@ -49,6 +49,17 @@ class BaseModel {
   virtual BaseModel& cpu() = 0;
   virtual Device device() const = 0;
 
+  // Complete this executor's submitted work before resetting or reusing state.
+  // Callers select its CUDA device first. Custom CUDA executors retain a
+  // conservative device-wide default; private-stream executors override it.
+  virtual void synchronize() const {
+    if (device() == Device::CUDA) {
+      const auto status = cudaDeviceSynchronize();
+      if (status != cudaSuccess)
+        throw std::runtime_error(cudaGetErrorString(status));
+    }
+  }
+
   // Getters for model properties
   virtual size_t get_n_layers() const = 0;
   virtual size_t get_max_seq_len() const = 0;

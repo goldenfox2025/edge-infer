@@ -1,596 +1,294 @@
 #pragma once
+
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <initializer_list>
-#include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-#include "CudaMemoryPool.hpp"  // CUDA allocation and shared pool access
-
 enum class Device { CPU, CUDA };
 
-// Forward declaration for template friend declarations.
-template <typename T>
-class Tensor;
-
-// Conversion helper for Tensor<__nv_bfloat16> to Tensor<float>.
-template <typename FromType, typename ToType>
-Tensor<ToType> tensor_convert(const Tensor<FromType>& src);
-
+// Owning checkpoint/boundary storage. Copies and slices share ownership;
+// fixed TensorView descriptors are used for execution. There is no global pool.
 template <typename T>
 class Tensor {
-   private:
-    // Static CUDA error checking is also usable from const members.
-    static inline void checkCudaError(cudaError_t error) {
-        if (error != cudaSuccess) {
-            throw std::runtime_error("CUDA error: " + std::string(cudaGetErrorString(error)));
-        }
+  template <typename>
+  friend class Tensor;
+  static void check(cudaError_t status) {
+    if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+  }
+  static size_t count(const std::vector<size_t>& shape) {
+    size_t value = 1;
+    for (auto n : shape) {
+      if (n && value > std::numeric_limits<size_t>::max() / n)
+        throw std::overflow_error("Tensor element count overflow");
+      value *= n;
     }
-
-    static size_t compute_numel(const std::vector<size_t>& shape) {
-        size_t numel = 1;
-        for (size_t dim : shape) {
-            numel *= dim;
-        }
-        return numel;
+    if (value > std::numeric_limits<size_t>::max() / sizeof(T))
+      throw std::overflow_error("Tensor byte extent overflow");
+    return value;
+  }
+  static std::vector<size_t> dense_strides(const std::vector<size_t>& shape) {
+    std::vector<size_t> strides(shape.size());
+    size_t value = 1;
+    for (size_t i = shape.size(); i-- > 0;) {
+      strides[i] = value;
+      if (shape[i] && value > std::numeric_limits<size_t>::max() / shape[i])
+        throw std::overflow_error("Tensor stride overflow");
+      value *= shape[i];
     }
-
-    static std::shared_ptr<T> make_gpu_owner(T* gpu_ptr) {
-        return std::shared_ptr<T>(gpu_ptr, [](T* ptr) { GlobalCudaMemoryPool::instance().free(ptr); });
+    return strides;
+  }
+  static std::shared_ptr<T> own(T* pointer, int device) {
+    return std::shared_ptr<T>(pointer, [device](T* p) noexcept {
+      int previous = device;
+      cudaGetDevice(&previous);
+      if (previous != device) cudaSetDevice(device);
+      cudaFree(p);
+      if (previous != device) cudaSetDevice(previous);
+    });
+  }
+  static std::shared_ptr<T> adopt(T* pointer) {
+    if (!pointer) return {};
+    cudaPointerAttributes attributes{};
+    check(cudaPointerGetAttributes(&attributes, pointer));
+    if (attributes.type != cudaMemoryTypeDevice)
+      throw std::invalid_argument("Tensor ownership requires CUDA device storage");
+    return own(pointer, attributes.device);
+  }
+  static std::shared_ptr<T> allocate(size_t elements) {
+    if (!elements) return {};
+    int device = 0;
+    check(cudaGetDevice(&device));
+    T* pointer = nullptr;
+    check(cudaMalloc(reinterpret_cast<void**>(&pointer), elements * sizeof(T)));
+    // shared_ptr invokes its deleter if control-block allocation throws.
+    return own(pointer, device);
+  }
+  std::vector<T> host_values() const {
+    std::vector<T> result(length_);
+    if (!length_) return result;
+    if (is_contiguous()) {
+      if (device_ == Device::CPU)
+        std::copy_n(data_ptr(), length_, result.data());
+      else
+        check(cudaMemcpy(result.data(), data_ptr(), nbytes(), cudaMemcpyDeviceToHost));
+      return result;
     }
-
-   public:
-    // Allow Tensor<U> specializations to access Tensor<T> internals.
-    template <typename U>
-    friend class Tensor;
-
-    // Grant the conversion helper access to tensor internals.
-    template <typename FromType, typename ToType>
-    friend Tensor<ToType> tensor_convert(const Tensor<FromType>& src);
-
-    // Copy individual GPU values into one tensor.
-    // Parameters:
-    // - gpu_ptrs: GPU pointer array
-    // - device: Device type (CUDA by default)
-    // Return a tensor containing all pointed-to values, with shape [gpu_ptrs.size()].
-    template <typename PtrType>
-    static Tensor<T> combine_gpu_ptrs(const std::vector<PtrType*>& gpu_ptrs, Device device = Device::CUDA) {
-        if (gpu_ptrs.empty()) {
-            throw std::runtime_error("Cannot combine empty GPU pointers array");
-        }
-
-        // Create the result with shape [gpu_ptrs.size()].
-        size_t seq_len = gpu_ptrs.size();
-        Tensor<T> result({seq_len}, device);
-
-        if (device != Device::CUDA) {
-            throw std::runtime_error("combine_gpu_ptrs only supports CUDA device");
-        }
-
-        // Copy the value from each input pointer.
-        for (size_t i = 0; i < seq_len; ++i) {
-            // Copy each GPU value into its corresponding result element.
-            checkCudaError(cudaMemcpy(result.data_ptr() + i,    // Destination element
-                                      gpu_ptrs[i],              // Source GPU pointer
-                                      sizeof(T),                // Element size
-                                      cudaMemcpyDeviceToDevice  // Device-to-device copy
-                                      ));
-        }
-
-        return result;
+    // Migration materializes a strided view in logical row-major order.
+    size_t span = 1;
+    for (size_t i = 0; i < shape_.size(); ++i) span += (shape_[i] - 1) * strides_[i];
+    std::vector<T> physical;
+    const T* source = data_ptr();
+    if (device_ == Device::CUDA) {
+      physical.resize(span);
+      check(cudaMemcpy(physical.data(), source, span * sizeof(T), cudaMemcpyDeviceToHost));
+      source = physical.data();
     }
-
-    static Tensor<T> from_external_buffer(T* ptr, const std::vector<size_t>& shape, Device device) {
-        if (ptr == nullptr) {
-            throw std::runtime_error("from_external_buffer requires a non-null pointer");
-        }
-        if (device != Device::CUDA) {
-            throw std::runtime_error("from_external_buffer currently only supports CUDA buffers");
-        }
-
-        Tensor<T> result;
-        result.shape_ = shape;
-        result.strides_ = compute_strides(shape);
-        result.offset_ = 0;
-        result.length_ = compute_numel(shape);
-        result.device_ = device;
-        result.data_.reset();
-        result.gpu_data_ = std::shared_ptr<T>(ptr, [](T* /*unused*/) {});
-        result.tag_.clear();
-        return result;
-    }
-
-    // Construct an empty CPU tensor.
-    Tensor()
-        : data_(std::make_shared<std::vector<T>>()),
-          offset_(0),
-          length_(0),
-          device_(Device::CPU),
-          gpu_data_(nullptr, [](T* ptr) { /* no-op */ }) {
-    }
-
-    // Construct a CPU tensor from data covering every element of the shape.
-    Tensor(std::shared_ptr<std::vector<T>> data, const std::vector<size_t>& shape)
-        : data_(data),
-          shape_(shape),
-          offset_(0),
-          length_(compute_numel(shape)),
-          device_(Device::CPU),
-          gpu_data_(nullptr, [](T* ptr) { /* no-op */ }) {
-        if (length_ > data_->size()) {
-            throw std::runtime_error("Data size does not match tensor shape");
-        }
-        strides_ = compute_strides(shape_);
-    }
-
-    // Allocate storage for the supplied shape and device.
-    // is_prefill: Whether this is a prefill allocation
-    // tag: Tag for persistent allocations
-    Tensor(std::initializer_list<size_t> shape, Device device = Device::CPU, bool is_prefill = false,
-           const std::string& tag = "")
-        : shape_(shape),
-          offset_(0),
-          length_(compute_numel(shape_)),
-          device_(device),
-          gpu_data_(nullptr, [](T* ptr) { /* no-op */ }),
-          tag_(tag) {
-        strides_ = compute_strides(shape_);
-        if (device_ == Device::CPU) {
-            data_ = std::make_shared<std::vector<T>>(length_);
-            gpu_data_.reset();
-        } else if (device_ == Device::CUDA) {
-            data_.reset();
-            // Allocate GPU storage through the memory pool.
-            T* gpu_ptr = nullptr;
-            if (!tag_.empty()) {
-                // Use a tagged persistent allocation.
-                gpu_ptr = static_cast<T*>(GlobalCudaMemoryPool::allocate_tagged(tag_, length_ * sizeof(T), is_prefill));
-            } else {
-                // Ordinary allocation
-                gpu_ptr = static_cast<T*>(GlobalCudaMemoryPool::instance().allocate(length_ * sizeof(T), is_prefill));
-            }
-            gpu_data_ = make_gpu_owner(gpu_ptr);
-        } else {
-            throw std::runtime_error("Invalid device specified");
-        }
-    }
-
-    // Wrap an already allocated GPU pointer returned by sampling.
-    Tensor(T* gpu_ptr, const std::vector<size_t>& shape, Device device)
-        : shape_(shape),
-          offset_(0),
-          length_(compute_numel(shape_)),
-          device_(Device::CUDA),
-          data_(nullptr),
-          gpu_data_(make_gpu_owner(gpu_ptr)) {
-        if (device == Device::CPU) {
-            throw std::runtime_error("Invalid device specified in Tensor constructor");
-        }
-        strides_ = compute_strides(shape_);
-    }
-    // Move vector data into a CPU tensor.
-    Tensor(std::vector<T>&& data, const std::vector<size_t>& shape)
-        : data_(std::make_shared<std::vector<T>>(std::move(data))),
-          shape_(shape),
-          offset_(0),
-          length_(compute_numel(shape_)),
-          device_(Device::CPU),
-          gpu_data_(nullptr, [](T* ptr) { /* no-op */ }) {
-        if (length_ > data_->size()) {
-            throw std::runtime_error("Data size does not match tensor shape");
-        }
-        strides_ = compute_strides(shape_);
-    }
-
-    // Construct from moved vector data, shape, and device.
-    Tensor(std::vector<T>&& data, const std::vector<size_t>& shape, Device device)
-        : shape_(shape), offset_(0), length_(compute_numel(shape_)), device_(device), gpu_data_(nullptr, [](T* ptr) { /* no-op */ }) {
-        strides_ = compute_strides(shape_);
-        if (device_ == Device::CPU) {
-            // Keep the vector data directly on the CPU.
-            data_ = std::make_shared<std::vector<T>>(std::move(data));
-        } else if (device_ == Device::CUDA) {
-            // Allocate GPU storage through the pool and copy synchronously.
-            // Do not use cudaMemcpyAsync: the source vector is destroyed when the constructor returns.
-            data_.reset();
-            T* gpu_ptr = static_cast<T*>(GlobalCudaMemoryPool::instance().allocate(length_ * sizeof(T)));
-            checkCudaError(cudaMemcpy(gpu_ptr, data.data(), length_ * sizeof(T), cudaMemcpyHostToDevice));
-            // Prepared sessions use nonblocking streams and must observe the
-            // complete upload, including pageable-host staging transfers.
-            checkCudaError(cudaStreamSynchronize(nullptr));
-            gpu_data_ = make_gpu_owner(gpu_ptr);
-        } else {
-            throw std::runtime_error("Invalid device specified");
-        }
-    }
-
-    // Allocate a tensor for the shape (CPU by default).
-    Tensor(const std::vector<size_t>& shape)
-        : shape_(shape), offset_(0), length_(compute_numel(shape_)), device_(Device::CPU), gpu_data_(nullptr, [](T* ptr) { /* no-op */ }) {
-        data_ = std::make_shared<std::vector<T>>(length_);
-        strides_ = compute_strides(shape_);
-    }
-
-    // Allocate a tensor for the shape and device.
-    // is_prefill: Whether this is a prefill allocation
-    // tag: Tag for persistent allocations
-    Tensor(const std::vector<size_t>& shape, Device device, bool is_prefill = false, const std::string& tag = "")
-        : shape_(shape),
-          offset_(0),
-          length_(compute_numel(shape_)),
-          device_(device),
-          gpu_data_(nullptr, [](T* ptr) { /* no-op */ }),
-          tag_(tag) {
-        strides_ = compute_strides(shape_);
-        if (device_ == Device::CPU) {
-            data_ = std::make_shared<std::vector<T>>(length_);
-            gpu_data_.reset();
-        } else if (device_ == Device::CUDA) {
-            data_.reset();
-            // Allocate GPU storage through the memory pool.
-            T* gpu_ptr = nullptr;
-            if (!tag_.empty()) {
-                // Use a tagged persistent allocation.
-                gpu_ptr = static_cast<T*>(GlobalCudaMemoryPool::allocate_tagged(tag_, length_ * sizeof(T), is_prefill));
-            } else {
-                // Ordinary allocation
-                gpu_ptr = static_cast<T*>(GlobalCudaMemoryPool::instance().allocate(length_ * sizeof(T), is_prefill));
-            }
-            gpu_data_ = make_gpu_owner(gpu_ptr);
-        } else {
-            throw std::runtime_error("Invalid device specified");
-        }
-    }
-
-    // CUDA copies share gpu_data_ rather than copying device storage.
-    Tensor(const Tensor& other)
-        : data_(other.data_),
-          shape_(other.shape_),
-          strides_(other.strides_),
-          offset_(other.offset_),
-          length_(other.length_),
-          device_(other.device_),
-          tag_(other.tag_) {
-        if (device_ == Device::CUDA) {
-            gpu_data_ = other.gpu_data_;
-        } else {
-            gpu_data_.reset();
-        }
-    }
-
-    // Assignment shares CUDA storage.
-    Tensor& operator=(const Tensor& other) {
-        if (this != &other) {
-            shape_ = other.shape_;
-            strides_ = other.strides_;
-            offset_ = other.offset_;
-            length_ = other.length_;
-            device_ = other.device_;
-            tag_ = other.tag_;
-            if (device_ == Device::CUDA) {
-                gpu_data_ = other.gpu_data_;
-                data_.reset();
-            } else {
-                data_ = other.data_;
-                gpu_data_.reset();
-            }
-        }
-        return *this;
-    }
-
-    int nbytes() const {
-        return sizeof(T) * length_;
-    }
-    // Return a const data pointer.
-    const T* data_ptr() const {
-        if (device_ == Device::CPU) {
-            return data_->data() + offset_;
-        } else {
-            return gpu_data_.get() + offset_;
-        }
-    }
-    // Return a mutable data pointer.
-    T* data_ptr() {
-        if (device_ == Device::CPU) {
-            return data_->data() + offset_;
-        } else {
-            return gpu_data_.get() + offset_;
-        }
-    }
-
-    // Return the tensor shape.
-    const std::vector<size_t>& sizes() const {
-        return shape_;
-    }
-
-    // Return the element count.
-    size_t numel() const {
-        return length_;
-    }
-
-    // Return the strides.
-    const std::vector<size_t>& strides() const {
-        return strides_;
-    }  // Tensor member
-
-    // Check whether the tensor is contiguous.
-    bool is_contiguous() const {
-        if (strides_.empty() || shape_.empty())
-            return true;
-        size_t expected_stride = 1;
-        for (int i = shape_.size() - 1; i >= 0; --i) {
-            // Singleton dimensions do not constrain contiguity because their strides are arbitrary.
-            if (shape_[i] != 1) {
-                if (strides_[i] != expected_stride) {
-                    return false;
-                }
-            }
-            expected_stride *= shape_[i];
-        }
-        return true;
-    }
-
-    // Reshape a tensor view in place.
-    Tensor<T>& view(const std::vector<size_t>& new_shape) & {
-        // 1. Require the same total element count.
-        size_t new_numel = 1;
-        for (size_t dim : new_shape) {
-            new_numel *= dim;
-        }
-        if (new_numel != length_) {
-            throw std::runtime_error("view: New shape's number of elements must match original");
-        }
-
-        // 2. Fast path for a fully contiguous tensor.
-        if (this->is_contiguous()) {
-            shape_ = new_shape;
-            strides_ = compute_strides(new_shape);
-            return *this;
-        }
-
-        // Check whether only a contiguous suffix is being reshaped.
-        // The innermost stride must be one.
-        if (strides_.empty() || strides_.back() != 1) {
-            throw std::runtime_error(
-                "view failed: a view can only be created for tensors that are contiguous "
-                "or have a stride of 1 for the last dimension.");
-        }
-
-        // Find the first dimension d where the shapes differ.
-        int d = 0;
-        while (d < shape_.size() && d < new_shape.size() && shape_[d] == new_shape[d]) {
-            d++;
-        }
-
-        // Require matching element counts in the old and new suffixes starting at d.
-        size_t old_tail_numel = 1;
-        for (size_t i = d; i < shape_.size(); ++i)
-            old_tail_numel *= shape_[i];
-
-        size_t new_tail_numel = 1;
-        for (size_t i = d; i < new_shape.size(); ++i)
-            new_tail_numel *= new_shape[i];
-
-        if (old_tail_numel == new_tail_numel) {
-            // The suffix can be reshaped without copying.
-            std::vector<size_t> final_strides(new_shape.size());
-
-            // Preserve strides in the common prefix.
-            for (int i = 0; i < d; ++i) {
-                final_strides[i] = strides_[i];
-            }
-
-            // Compute strides for the reshaped suffix.
-            // strides_.back() == 1 establishes a C-contiguous suffix here.
-            // Compute suffix strides backwards, starting from one.
-            size_t current_stride = 1;
-            for (int i = new_shape.size() - 1; i >= d; --i) {
-                final_strides[i] = current_stride;
-                if (new_shape[i] > 0) {  // Avoid multiplication by zero
-                    current_stride *= new_shape[i];
-                }
-            }
-
-            shape_ = new_shape;
-            strides_ = final_strides;
-            return *this;
-        }
-
-        // 4. Reject layouts that cannot be reshaped safely without copying.
-        throw std::runtime_error(
-            "view failed: cannot view this non-contiguous tensor in this way without copying data.");
-    }
-
-    // Const lvalue overload
-    Tensor<T> view(const std::vector<size_t>& new_shape) const& {
-        Tensor result = *this;   // Copy view metadata
-        result.view(new_shape);  // Reshape through the mutable lvalue overload
-        return result;
-    }
-
-    // Rvalue overload
-    Tensor<T> view(const std::vector<size_t>& new_shape) && {
-        this->view(new_shape);  // Reshape the temporary in place
-        return std::move(*this);
-    }
-    // transpose: swap two dimensions
-    Tensor<T> transpose(int dim0, int dim1) const {
-        if (dim0 < 0)
-            dim0 += shape_.size();
-        if (dim1 < 0)
-            dim1 += shape_.size();
-        if (dim0 >= shape_.size() || dim1 >= shape_.size()) {
-            throw std::runtime_error("transpose: dimension index out of range");
-        }
-        Tensor<T> result(*this);
-        std::swap(result.shape_[dim0], result.shape_[dim1]);
-        std::swap(result.strides_[dim0], result.strides_[dim1]);
-        return result;
-    }
-
-    // slice: create a view sharing the underlying storage
-    Tensor<T> slice(const std::vector<size_t>& start, const std::vector<size_t>& end) const {
-        if (start.size() != shape_.size() || end.size() != shape_.size()) {
-            throw std::runtime_error("slice: start and end must have same dimensions as tensor");
-        }
-        std::vector<size_t> new_shape(shape_.size());
-        for (size_t i = 0; i < shape_.size(); i++) {
-            if (start[i] > shape_[i] || end[i] > shape_[i] || start[i] > end[i]) {
-                throw std::runtime_error("slice: invalid start or end indices");
-            }
-            new_shape[i] = end[i] - start[i];
-        }
-        size_t new_offset = offset_;
-        for (size_t i = 0; i < shape_.size(); i++) {
-            new_offset += start[i] * strides_[i];
-        }
-        size_t new_length = 1;
-        for (size_t dim : new_shape) {
-            new_length *= dim;
-        }
-        Tensor<T> result;
-        result.shape_ = new_shape;
-        result.strides_ = strides_;
-        result.offset_ = new_offset;
-        result.length_ = new_length;
-        result.device_ = device_;
-        if (device_ == Device::CPU) {
-            result.data_ = data_;
-            result.gpu_data_.reset();
-        } else {
-            result.data_.reset();
-            result.gpu_data_ = gpu_data_;
-        }
-        return result;
-    }
-
-    Tensor<T> squeeze(size_t dim) {
-        if (dim >= shape_.size()) {
-            std::cerr << "Dimension " << dim << " is out of range." << std::endl;
-            return *this;
-        }
-        if (shape_[dim] != 1) {
-            std::cout << "Cannot squeeze dimension " << dim << " because its size is " << shape_[dim] << " (not 1)."
-                      << std::endl;
-            return *this;
-        }
-        shape_.erase(shape_.begin() + dim);
-        strides_.erase(strides_.begin() + dim);
-        return *this;
-    }
-
-    // Copy CPU data into GPU storage allocated through the pool.
-    // is_prefill: Whether this is a prefill allocation
-    // tag: Tag for persistent allocations
-    Tensor<T>& cuda(bool is_prefill = false, const std::string& tag = "") {
-        if (device_ == Device::CUDA)
-            return *this;
-
-        // Use the new allocation tag when supplied.
-        if (!tag.empty()) {
-            tag_ = tag;
-        }
-
-        // Allocate GPU storage through the memory pool.
-        T* gpu_ptr = nullptr;
-        if (!tag_.empty()) {
-            // Use a tagged persistent allocation.
-            gpu_ptr = static_cast<T*>(GlobalCudaMemoryPool::allocate_tagged(tag_, length_ * sizeof(T), is_prefill));
-        } else {
-            // Ordinary allocation
-            gpu_ptr = static_cast<T*>(GlobalCudaMemoryPool::instance().allocate(length_ * sizeof(T), is_prefill));
-        }
-
-        checkCudaError(cudaMemcpy(gpu_ptr, data_ptr(), length_ * sizeof(T), cudaMemcpyHostToDevice));
-        checkCudaError(cudaStreamSynchronize(nullptr));
-        data_.reset();
-        gpu_data_ = make_gpu_owner(gpu_ptr);
-        device_ = Device::CUDA;
-        return *this;
-    }
-
-    // Copy GPU data to CPU storage.
-    Tensor<T>& cpu() {
-        if (device_ == Device::CPU)
-            return *this;
-        data_ = std::make_shared<std::vector<T>>(length_);
-        checkCudaError(cudaMemcpy(data_->data(), gpu_data_.get(), length_ * sizeof(T), cudaMemcpyDeviceToHost));
-        gpu_data_.reset();
-        device_ = Device::CPU;
-        return *this;
-    }
-
-    // Return the current device.
-    Device device() const {
-        return device_;
-    }
-    size_t offset() const {
-        return offset_;
-    }
-
-    // Return the allocation tag.
-    const std::string& tag() const {
-        return tag_;
-    }
-
-   private:
-    // Compute the strides.
-    static std::vector<size_t> compute_strides(const std::vector<size_t>& shape) {
-        std::vector<size_t> strides(shape.size());
-        size_t stride = 1;
-        for (int i = static_cast<int>(shape.size()) - 1; i >= 0; --i) {
-            strides[i] = stride;
-            stride *= shape[i];
-        }
-        return strides;
-    }
-
-    std::shared_ptr<std::vector<T>> data_;  // CPU storage
-    std::shared_ptr<T> gpu_data_;           // GPU storage owned by shared_ptr with a custom deleter
-    std::vector<size_t> shape_;
-    std::vector<size_t> strides_;
-    size_t offset_;
-    size_t length_;
-    Device device_;
-    std::string tag_;  // Tag for persistent allocations
-};
-
-// Tensor conversion helper
-template <typename FromType, typename ToType>
-Tensor<ToType> tensor_convert(const Tensor<FromType>& src) {
-    // Only reinterpret contiguous layouts without copying; reject non-contiguous views to preserve offsets and strides.
-    if (!src.is_contiguous()) {
-        throw std::runtime_error("tensor_convert currently requires a contiguous tensor");
-    }
-
-    Tensor<ToType> result(src.shape_, src.device_);
-    result.offset_ = 0;
-    result.length_ = src.length_;
-    result.strides_ = result.compute_strides(src.shape_);
-    result.tag_.clear();
-
-    if (src.device_ == Device::CPU) {
-        auto new_data = std::make_shared<std::vector<ToType>>(src.length_);
-        const FromType* src_ptr = src.data_ptr();
-        for (size_t i = 0; i < src.length_; ++i) {
-            (*new_data)[i] = static_cast<ToType>(src_ptr[i]);
-        }
-        result.data_ = new_data;
-        result.gpu_data_.reset();
-    } else {
-        std::vector<FromType> host_data(src.length_);
-        const FromType* src_ptr = src.data_ptr();
-        cudaError_t err = cudaMemcpy(host_data.data(), src_ptr, src.length_ * sizeof(FromType), cudaMemcpyDeviceToHost);
-        result.checkCudaError(err);
-        std::vector<ToType> converted(src.length_);
-        for (size_t i = 0; i < src.length_; ++i) {
-            converted[i] = static_cast<ToType>(host_data[i]);
-        }
-        err = cudaMemcpy(result.data_ptr(), converted.data(), src.length_ * sizeof(ToType), cudaMemcpyHostToDevice);
-        result.checkCudaError(err);
+    for (size_t flat = 0; flat < length_; ++flat) {
+      size_t rest = flat, offset = 0;
+      for (size_t i = shape_.size(); i-- > 0;) {
+        offset += (rest % shape_[i]) * strides_[i];
+        rest /= shape_[i];
+      }
+      result[flat] = source[offset];
     }
     return result;
+  }
+
+ public:
+  Tensor() = default;
+  explicit Tensor(const std::vector<size_t>& shape, Device device = Device::CPU)
+      : shape_(shape), strides_(dense_strides(shape)), length_(count(shape)), device_(device) {
+    if (device == Device::CPU)
+      data_ = std::make_shared<std::vector<T>>(length_);
+    else if (device == Device::CUDA)
+      gpu_data_ = allocate(length_);
+    else
+      throw std::invalid_argument("Invalid Tensor device");
+  }
+  Tensor(std::initializer_list<size_t> shape, Device device = Device::CPU)
+      : Tensor(std::vector<size_t>(shape), device) {}
+  Tensor(std::shared_ptr<std::vector<T>> data, const std::vector<size_t>& shape)
+      : data_(std::move(data)),
+        shape_(shape),
+        strides_(dense_strides(shape)),
+        length_(count(shape)) {
+    if (!data_ || data_->size() < length_)
+      throw std::invalid_argument("Tensor data is shorter than shape");
+  }
+  Tensor(std::vector<T>&& data, const std::vector<size_t>& shape, Device device = Device::CPU)
+      : Tensor(std::make_shared<std::vector<T>>(std::move(data)), shape) {
+    if (device == Device::CUDA)
+      cuda();
+    else if (device != Device::CPU)
+      throw std::invalid_argument("Invalid Tensor device");
+  }
+  // Transfer ownership of storage allocated by cudaMalloc. Borrowing is explicit.
+  Tensor(T* pointer, const std::vector<size_t>& shape, Device device)
+      : shape_(shape), strides_(dense_strides(shape)), length_(count(shape)), device_(device) {
+    if (device != Device::CUDA || (!pointer && length_))
+      throw std::invalid_argument("Tensor adoption requires CUDA storage");
+    gpu_data_ = adopt(pointer);
+  }
+  static Tensor from_external_buffer(T* pointer, const std::vector<size_t>& shape, Device device) {
+    Tensor result;
+    result.shape_ = shape;
+    result.strides_ = dense_strides(shape);
+    result.length_ = count(shape);
+    result.device_ = device;
+    if (device != Device::CUDA || (!pointer && result.length_))
+      throw std::invalid_argument("Tensor borrowing requires CUDA storage");
+    result.gpu_data_ = std::shared_ptr<T>(pointer, [](T*) {});
+    return result;
+  }
+  template <typename U>
+  static Tensor combine_gpu_ptrs(const std::vector<U*>& pointers, Device device = Device::CUDA) {
+    static_assert(sizeof(U) == sizeof(T), "Token pointer element size mismatch");
+    if (pointers.empty() || device != Device::CUDA)
+      throw std::invalid_argument("Combining pointers requires nonempty CUDA input");
+    Tensor result({pointers.size()}, device);
+    for (size_t i = 0; i < pointers.size(); ++i) {
+      if (!pointers[i]) throw std::invalid_argument("Null combined CUDA pointer");
+      check(cudaMemcpy(result.data_ptr() + i, pointers[i], sizeof(T), cudaMemcpyDeviceToDevice));
+    }
+    check(cudaStreamSynchronize(nullptr));
+    return result;
+  }
+  Tensor(const Tensor&) = default;
+  Tensor& operator=(const Tensor&) = default;
+  Tensor(Tensor&&) noexcept = default;
+  Tensor& operator=(Tensor&&) noexcept = default;
+
+  size_t nbytes() const noexcept { return length_ * sizeof(T); }
+  size_t numel() const noexcept { return length_; }
+  Device device() const noexcept { return device_; }
+  size_t offset() const noexcept { return offset_; }
+  const std::vector<size_t>& sizes() const noexcept { return shape_; }
+  const std::vector<size_t>& strides() const noexcept { return strides_; }
+  T* data_ptr() noexcept {
+    T* base = device_ == Device::CPU ? (data_ ? data_->data() : nullptr) : gpu_data_.get();
+    return offset_ ? base + offset_ : base;
+  }
+  const T* data_ptr() const noexcept {
+    const T* base = device_ == Device::CPU ? (data_ ? data_->data() : nullptr) : gpu_data_.get();
+    return offset_ ? base + offset_ : base;
+  }
+  bool is_contiguous() const noexcept {
+    if (!length_) return true;
+    size_t expected = 1;
+    for (size_t i = shape_.size(); i-- > 0;) {
+      if (shape_[i] != 1 && strides_[i] != expected) return false;
+      expected *= shape_[i];
+    }
+    return true;
+  }
+  Tensor& view(const std::vector<size_t>& shape) & {
+    if (count(shape) != length_)
+      throw std::invalid_argument("Tensor reshape changes element count");
+    if (shape == shape_) return *this;
+    if (!is_contiguous()) throw std::invalid_argument("Tensor reshape requires contiguous storage");
+    auto strides = dense_strides(shape);
+    shape_ = shape;
+    strides_ = std::move(strides);
+    return *this;
+  }
+  Tensor view(const std::vector<size_t>& shape) const& {
+    auto result = *this;
+    result.view(shape);
+    return result;
+  }
+  Tensor view(const std::vector<size_t>& shape) && {
+    view(shape);
+    return std::move(*this);
+  }
+  Tensor transpose(int first, int second) const {
+    const int rank = static_cast<int>(shape_.size());
+    if (first < 0) first += rank;
+    if (second < 0) second += rank;
+    if (first < 0 || second < 0 || first >= rank || second >= rank)
+      throw std::out_of_range("Tensor transpose axis out of range");
+    Tensor result = *this;
+    std::swap(result.shape_[first], result.shape_[second]);
+    std::swap(result.strides_[first], result.strides_[second]);
+    return result;
+  }
+  Tensor slice(const std::vector<size_t>& first, const std::vector<size_t>& end) const {
+    if (first.size() != shape_.size() || end.size() != shape_.size())
+      throw std::invalid_argument("Tensor slice rank mismatch");
+    auto shape = shape_;
+    for (size_t i = 0; i < shape.size(); ++i) {
+      if (first[i] > end[i] || end[i] > shape[i])
+        throw std::out_of_range("Tensor slice exceeds extent");
+      shape[i] = end[i] - first[i];
+    }
+    Tensor result = *this;
+    result.shape_ = std::move(shape);
+    result.length_ = shape_.empty() && !length_ ? 0 : count(result.shape_);
+    if (result.length_) {
+      for (size_t i = 0; i < shape_.size(); ++i) result.offset_ += first[i] * strides_[i];
+    }
+    return result;
+  }
+  Tensor squeeze(size_t axis) {
+    if (axis >= shape_.size()) throw std::out_of_range("Tensor squeeze axis out of range");
+    if (shape_[axis] != 1) throw std::invalid_argument("Tensor squeeze requires a singleton axis");
+    shape_.erase(shape_.begin() + axis);
+    strides_.erase(strides_.begin() + axis);
+    return *this;
+  }
+  Tensor& cuda() {
+    if (device_ == Device::CUDA) return *this;
+    auto values = host_values();
+    auto storage = allocate(length_);
+    if (length_) {
+      check(cudaMemcpy(storage.get(), values.data(), nbytes(), cudaMemcpyHostToDevice));
+      check(cudaStreamSynchronize(nullptr));
+    }
+    gpu_data_ = std::move(storage);
+    data_.reset();
+    offset_ = 0;
+    strides_ = dense_strides(shape_);
+    device_ = Device::CUDA;
+    return *this;
+  }
+  Tensor& cpu() {
+    if (device_ == Device::CPU) return *this;
+    auto storage = std::make_shared<std::vector<T>>(host_values());
+    data_ = std::move(storage);
+    gpu_data_.reset();
+    offset_ = 0;
+    strides_ = dense_strides(shape_);
+    device_ = Device::CPU;
+    return *this;
+  }
+
+ private:
+  std::shared_ptr<std::vector<T>> data_;
+  std::shared_ptr<T> gpu_data_;
+  std::vector<size_t> shape_, strides_;
+  size_t offset_ = 0, length_ = 0;
+  Device device_ = Device::CPU;
+};
+
+template <typename From, typename To>
+Tensor<To> tensor_convert(const Tensor<From>& source) {
+  if (!source.is_contiguous())
+    throw std::invalid_argument("Tensor conversion requires contiguous storage");
+  std::vector<From> input(source.numel());
+  if (source.device() == Device::CPU)
+    std::copy_n(source.data_ptr(), input.size(), input.data());
+  else if (!input.empty()) {
+    const auto status =
+        cudaMemcpy(input.data(), source.data_ptr(), source.nbytes(), cudaMemcpyDeviceToHost);
+    if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+  }
+  std::vector<To> output(input.size());
+  std::transform(input.begin(), input.end(), output.begin(),
+                 [](From value) { return static_cast<To>(value); });
+  return Tensor<To>(std::move(output), source.sizes(), source.device());
 }

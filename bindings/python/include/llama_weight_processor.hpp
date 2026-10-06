@@ -24,7 +24,7 @@ inline void process_global_weights(const py::dict& weights,
         {"lm_head.weight", "lm_head"}};
 
     if (!weights.contains("model.embed_tokens.weight") && weights.contains("lm_head.weight")) {
-        py::array_t<float> np_array = weights["lm_head.weight"].cast<py::array_t<float>>();
+        auto np_array = weight_processor_utils::as_contiguous_array<float>(weights["lm_head.weight"]);
         std::vector<size_t> shape;
         for (int i = 0; i < np_array.ndim(); i++) {
             shape.push_back(np_array.shape(i));
@@ -37,7 +37,7 @@ inline void process_global_weights(const py::dict& weights,
     for (const auto& [src_key, dst_key] : key_mapping) {
         if (weights.contains(src_key)) {
             weight_processor_utils::print_processing_info(src_key, dst_key);
-            py::array_t<float> np_array = weights[src_key.c_str()].cast<py::array_t<float>>();
+            auto np_array = weight_processor_utils::as_contiguous_array<float>(weights[src_key.c_str()]);
             std::vector<size_t> shape;
             for (int i = 0; i < np_array.ndim(); i++) {
                 shape.push_back(np_array.shape(i));
@@ -80,7 +80,7 @@ inline void process_layer_weights(const py::dict& weights,
 
                     weight_processor_utils::print_processing_info(key, dst_key);
 
-                    py::array_t<float> np_array = item.second.cast<py::array_t<float>>();
+                    auto np_array = weight_processor_utils::as_contiguous_array<float>(item.second);
                     std::vector<size_t> shape;
                     for (int i = 0; i < np_array.ndim(); i++) {
                         shape.push_back(np_array.shape(i));

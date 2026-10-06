@@ -98,28 +98,34 @@ void rope(const ExecutionContext& context, TensorView<T, 3> input,
 template <typename T>
 void rope_precomputed(const ExecutionContext& context, TensorView<T, 3> input,
                        TensorView<const float, 2> cache,
-                       const std::size_t* offsets,
+                       std::size_t offset = 0,
+                       const std::size_t* offsets = nullptr,
                        const int* pingpong = nullptr);
 template <typename T>
 void store_kv(const ExecutionContext& context, TensorView<const T, 2> source,
                TensorView<T, 2> capacity, std::size_t offset,
                const std::size_t* device_offset = nullptr);
+// The optimized BF16 width-128 path requires 5 * query_heads * (128 + 2)
+// FP32 scratch elements. Branch numerators, maxima and denominators retain
+// FP32 precision until the final output is rounded to the operand dtype.
 template <typename T>
 void attention_decode(const ExecutionContext& context,
                        TensorView<const T, 3> q, TensorView<const T, 3> k,
                        TensorView<const T, 3> v, TensorView<T, 3> output,
-                       TensorView<T, 1> workspace);
+                       TensorView<float, 1> workspace);
 template <typename T>
 void attention_prefill(const ExecutionContext& context,
                         TensorView<const T, 3> q, TensorView<const T, 3> k,
                         TensorView<const T, 3> v, TensorView<T, 3> output,
                         std::size_t offset);
 // K/V describe fixed cache capacity; lengths selects the live extent on device.
+// The optimized path uses three device pointers to FP32 branch buffers, each
+// with query_heads * (128 + 2) elements, and writes empty-branch identities.
 template <typename T>
 void attention_graph(const ExecutionContext& context,
                       TensorView<const T, 3> q, TensorView<const T, 3> k,
                       TensorView<const T, 3> v, TensorView<T, 3> output,
-                      T** branch_outputs, int* lengths, int* pingpong);
+                      float** branch_outputs, int* lengths, int* pingpong);
 
 // One row of scratch is reused for batch sampling on the same stream.
 // Preparation performs the CUB workspace query; submissions allocate nothing.

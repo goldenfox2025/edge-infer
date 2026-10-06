@@ -8,7 +8,7 @@
 
 #include "qwen3.hpp"
 
-enum class SampleMode { GPU, CPU, GPU_WITH_ASYNC_PREPARE };
+enum class SampleMode { GPU, CPU };
 
 // Qwen2/Llama checkpoints use the same prepared decoder as Qwen3, with Q/K
 // normalization disabled. FP32 CPU execution is a direct reference path.
@@ -33,6 +33,7 @@ class QwenModel : public BaseModel, public SpeculativeModel<T> {
     QwenModel& cuda() override;
     QwenModel& cpu() override;
     Device device() const override { return device_; }
+    void synchronize() const override;
     std::shared_ptr<BaseModel> fork_executor() const override;
     bool owns_execution_workspaces() const override { return true; }
     size_t estimate_prefill_workspace_bytes(size_t) const override;
@@ -73,8 +74,6 @@ class QwenModel : public BaseModel, public SpeculativeModel<T> {
     uint32_t sample_cpu(const Tensor<T>& logits, float temperature, float top_p, size_t top_k) {
         return sample_cpu(borrow_tensor_view<2>(logits), temperature, top_p, top_k);
     }
-    std::vector<uint32_t> generate(const std::vector<uint32_t>&, size_t,
-                                   float = 1.0f, float = 0.9f, size_t = 50);
 
  private:
     struct ForkExecutorTag {};

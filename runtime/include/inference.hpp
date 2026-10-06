@@ -74,7 +74,6 @@ class KVCache : public KVCacheBase {
   Tensor<T>& k_cache(size_t layer, size_t pos);
   // Return the V-cache view for layer and position pos.
   Tensor<T>& v_cache(size_t layer, size_t pos);
-  size_t max_seq_len_;
 
   // Move the KV cache to CUDA.
   KVCache<T>& cuda();
@@ -85,7 +84,7 @@ class KVCache : public KVCacheBase {
   // KVCacheBase property accessors
   size_t get_n_layers() const override { return n_layers_; }
   size_t get_head_dim() const override { return head_dim_; }
-  size_t get_max_seq_len() const override { return max_seq_len_; }
+  size_t get_max_seq_len() const override { return storage_capacity_; }
 
   // Return base pointers for contiguous K/V storage.
   std::pair<const Tensor<T>, const Tensor<T>> get_contiguous_tensor(
@@ -174,6 +173,13 @@ class infer_base {
       std::function<void(uint32_t)> callback) = 0;
 
   virtual Device device() const = 0;
+  virtual void reset() { throw std::logic_error("This executor does not support reset"); }
+  virtual size_t context_size() const {
+    throw std::logic_error("This executor does not expose context size");
+  }
+  virtual size_t context_capacity() const {
+    throw std::logic_error("This executor does not expose context capacity");
+  }
 };
 template <typename T>
 class InferenceEngine : public infer_base {
@@ -183,8 +189,9 @@ class InferenceEngine : public infer_base {
 
   // Construct with a shared BaseModel instance.
   // device: inference device (CPU or CUDA)
+  // capacity: fixed context storage; zero selects the model's context limit.
   InferenceEngine(std::shared_ptr<BaseModel> model,
-                  Device device = Device::CUDA);
+                  Device device = Device::CUDA, size_t capacity = 0);
 
   // Release CUDA resources.
   virtual ~InferenceEngine();
@@ -193,13 +200,21 @@ class InferenceEngine : public infer_base {
   uint32_t* generate_next_token(ThreadPool& thread_pool, uint32_t* input_ids,
                                float temperature = 1.0f, float top_p = 0.9f,
                                size_t top_k = 50);
-  // Generate until max_length or EOS.
+  // Generate from a complete fresh prompt, until max_length, capacity, or EOS.
   void generate_with_callback(const std::vector<uint32_t>& input_ids,
                               size_t max_length, float temperature, float top_p,
                               size_t top_k,
-                              std::function<void(uint32_t)> callback);
+                              std::function<void(uint32_t)> callback) override;
   // Reset inference state and clear the KV cache.
-  void reset();
+  void reset() override;
+  size_t context_size() const override {
+    require_valid();
+    return kv_cache_.size();
+  }
+  size_t context_capacity() const override {
+    require_valid();
+    return kv_cache_.get_max_seq_len();
+  }
 
   // CUDA warmup
   // warmup_tokens: token count for warmup
@@ -211,13 +226,22 @@ class InferenceEngine : public infer_base {
   // benchmark_warmup_tokens: token count used for benchmark warmup
   void set_benchmark_mode(bool enable_benchmark, size_t benchmark_warmup_tokens = 64);
 
+  // A failed migration invalidates the engine; construct a new engine to retry.
   // Move the engine, model, and KV cache to CUDA.
   InferenceEngine& cuda();
   // Move the engine, model, and KV cache to the CPU.
   InferenceEngine& cpu();
-  Device device() const { return device_; }
+  Device device() const override {
+    require_valid();
+    return device_;
+  }
 
  private:
+  void require_valid() const {
+    if (!valid_)
+      throw std::logic_error("Device migration failed; construct a new inference engine");
+  }
+  bool valid_ = true;
   ThreadPool thread_pool_;
   std::shared_ptr<BaseModel> model_;
   KVCache<T> kv_cache_;

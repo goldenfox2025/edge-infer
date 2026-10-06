@@ -6,9 +6,6 @@
 
 #include "operators/cuda/direct.hpp"
 #include "operators/cuda/execution.hpp"
-#ifndef EDGE_INFER_COMPUTE_ONLY
-#include "operators/cuda/add_cuda.cuh"
-#endif
 
 namespace op {
 
@@ -141,16 +138,6 @@ void cuda::add(ArrayView<const T> input_a, ArrayView<const T> input_b,
   }
 }
 
-#ifndef EDGE_INFER_COMPUTE_ONLY
-
-template <typename T>
-void AddCUDAOperator<T>::operator()(Tensor<T>* output, Tensor<T>* input_a,
-                                      Tensor<T>* input_b, cudaStream_t stream) {
-  cuda::add<T>({input_a->data_ptr(), input_a->numel()},
-                       {input_b->data_ptr(), input_b->numel()},
-                       {output->data_ptr(), output->numel()}, stream);
-}
-#endif
 
 
 template <typename T>
@@ -197,9 +184,5 @@ template void cuda::add<__nv_bfloat16>(const cuda::ExecutionContext&, ArrayView<
 template void cuda::add<float>(ArrayView<const float>, ArrayView<const float>, ArrayView<float>, cudaStream_t);
 template void cuda::add<__nv_bfloat16>(ArrayView<const __nv_bfloat16>, ArrayView<const __nv_bfloat16>, ArrayView<__nv_bfloat16>, cudaStream_t);
 
-#ifndef EDGE_INFER_COMPUTE_ONLY
-template class AddCUDAOperator<float>;
-template class AddCUDAOperator<__nv_bfloat16>;
-#endif
 
 }  // namespace op

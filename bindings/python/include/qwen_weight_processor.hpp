@@ -30,7 +30,7 @@ inline void process_global_weights_fp32(const py::dict& weights,
     for (const auto& [src_key, dst_key] : qwen_key_mapping) {
         if (weights.contains(src_key)) {
             weight_processor_utils::print_processing_info(src_key, dst_key);
-            py::array_t<float> np_array = weights[src_key.c_str()].cast<py::array_t<float>>();
+            auto np_array = weight_processor_utils::as_contiguous_array<float>(weights[src_key.c_str()]);
             std::vector<size_t> shape;
             for (int i = 0; i < np_array.ndim(); i++) {
                 shape.push_back(np_array.shape(i));
@@ -47,7 +47,7 @@ inline void process_global_weights_fp32(const py::dict& weights,
     // Process lm_head ( special handling ) - and AWQ and BF16 keep consistent
     if (weights.contains("lm_head.weight")) {
         weight_processor_utils::print_processing_info("lm_head.weight", "lm_head");
-        py::array_t<float> np_array = weights["lm_head.weight"].cast<py::array_t<float>>();
+        auto np_array = weight_processor_utils::as_contiguous_array<float>(weights["lm_head.weight"]);
         std::vector<size_t> shape;
         for (int i = 0; i < np_array.ndim(); i++) {
             shape.push_back(np_array.shape(i));
@@ -89,7 +89,7 @@ inline void process_layer_weights_fp32(const py::dict& weights,
                     int layer = std::stoi(layer_str);
                     std::string dst_key = "layers." + std::to_string(layer) + "." + dst_suffix;
                     weight_processor_utils::print_processing_info(key, dst_key);
-                    py::array_t<float> np_array = item.second.cast<py::array_t<float>>();
+                    auto np_array = weight_processor_utils::as_contiguous_array<float>(item.second);
                     std::vector<size_t> shape;
                     for (int i = 0; i < np_array.ndim(); i++) {
                         shape.push_back(np_array.shape(i));
@@ -112,7 +112,7 @@ inline void process_layer_weights_fp32(const py::dict& weights,
                     int layer = std::stoi(layer_str);
                     std::string dst_key = "layers." + std::to_string(layer) + "." + dst_suffix;
                     weight_processor_utils::print_processing_info(key, dst_key);
-                    py::array_t<float> np_array = item.second.cast<py::array_t<float>>();
+                    auto np_array = weight_processor_utils::as_contiguous_array<float>(item.second);
                     std::vector<size_t> shape;
                     for (int i = 0; i < np_array.ndim(); i++) {
                         shape.push_back(np_array.shape(i));
@@ -341,7 +341,7 @@ inline void process_quantized_weights_awq(const py::dict& weights,
 
             size_t params_count = weight_processor_utils::calculate_params_count(tensor_obj) * 8;
 
-            py::array_t<int32_t> np_array = tensor_obj.cast<py::array_t<int32_t>>();
+            auto np_array = weight_processor_utils::as_contiguous_array<int32_t>(tensor_obj);
             std::vector<size_t> shape;
             for (int i = 0; i < np_array.ndim(); i++) {
                 shape.push_back(np_array.shape(i));
@@ -370,7 +370,7 @@ inline void process_quantized_weights_awq(const py::dict& weights,
 
             size_t params_count = weight_processor_utils::calculate_params_count(tensor_obj);
 
-            py::array_t<float> np_array = tensor_obj.cast<py::array_t<float>>();
+            auto np_array = weight_processor_utils::as_contiguous_array<float>(tensor_obj);
             std::vector<size_t> shape;
             for (int i = 0; i < np_array.ndim(); i++) {
                 shape.push_back(np_array.shape(i));
@@ -407,7 +407,7 @@ inline void process_quantized_weights_awq(const py::dict& weights,
 
             size_t params_count = weight_processor_utils::calculate_params_count(tensor_obj);
 
-            py::array_t<int32_t> np_array = tensor_obj.cast<py::array_t<int32_t>>();
+            auto np_array = weight_processor_utils::as_contiguous_array<int32_t>(tensor_obj);
             std::vector<size_t> shape;
             for (int i = 0; i < np_array.ndim(); i++) {
                 shape.push_back(np_array.shape(i));

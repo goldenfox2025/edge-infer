@@ -141,6 +141,8 @@ void generation_test() {
     expect(!ordinary.has_warmed_up_, "New engine must own a fresh warmup state");
     same(collect(ordinary, prompt_a, maximum), expected_a, "Initial ordinary engine");
     expect(ordinary.has_warmed_up_, "First ordinary request must prepare this engine");
+    same(collect(ordinary, prompt_b, maximum), expected_b, "Ordinary complete prompt replaces prior history");
+    same(collect(ordinary, prompt_a, maximum), expected_a, "Ordinary prompt replay without explicit reset");
     ordinary.reset();
     same(collect(ordinary, prompt_b, maximum), expected_b, "Ordinary reset/new prompt");
     ordinary.reset();
@@ -149,7 +151,6 @@ void generation_test() {
 
     for (const std::size_t window : {std::size_t{1}, std::size_t{6}, std::size_t{8}}) {
         Speculation speculative(source, draft, window, 1);
-        speculative.set_use_probability_ratio(false);
         same(collect(speculative, prompt_a, maximum), expected_a, "Speculation window " + std::to_string(window));
         same(collect(speculative, prompt_b, maximum), expected_b, "Repeated speculative request");
         same(collect(speculative, prompt_a, prompt_a.size()), {}, "Speculative max_length equal to prompt");
@@ -157,6 +158,16 @@ void generation_test() {
         const auto short_expected = reference(immutable, prompt_a, prompt_a.size() + 3);
         same(collect(speculative, prompt_a, prompt_a.size() + 3), short_expected, "Short final speculative segment");
         same(collect(speculative, prompt_a, maximum), expected_a, "Speculative prompt replay");
+        const auto held_extent = speculative.context_size();
+        for (std::size_t unsupported : {std::size_t{0}, std::size_t{2}, std::size_t{50}}) {
+            bool rejected = false;
+            try {
+                speculative.generate_with_callback(prompt_b, maximum, 1.0f, 1.0f, unsupported,
+                    [](uint32_t) { throw std::runtime_error("Rejected sampling policy invoked callback"); });
+            } catch (const std::invalid_argument&) { rejected = true; }
+            expect(rejected && speculative.context_size() == held_extent,
+                   "Non-greedy speculative policy must reject before changing request state");
+        }
         ordinary.reset();
         same(collect(ordinary, prompt_a, maximum), expected_a, "Ordinary engine after speculation");
         std::cout << "Greedy speculative initial window=" << window
@@ -177,7 +188,6 @@ void generation_test() {
     auto rejected_draft = std::make_shared<Session>(rejected_model, false);
     {
         Speculation speculative(source, rejected_draft, 8, 1);
-        speculative.set_use_probability_ratio(false);
         same(collect(speculative, prompt_a, maximum), expected_a, "Rejected draft proposals");
         same(collect(speculative, prompt_b, maximum), expected_b, "Rejected draft repeated request");
     }
@@ -194,6 +204,36 @@ void generation_test() {
     {
         Engine recreated(source, Device::CUDA);
         same(collect(recreated, prompt_a, maximum), expected_a, "Recreated frontend after prior destruction");
+    }
+    {
+        constexpr std::size_t capacity = 8;
+        Engine bounded(source, Device::CUDA, capacity);
+        Speculation speculative(source, draft, 6, 1, capacity);
+        const auto expected = reference(immutable, prompt_a, capacity);
+        expect(bounded.context_capacity() == capacity && speculative.context_capacity() == capacity,
+               "Bounded frontends must reserve the requested context capacity");
+        same(collect(bounded, prompt_a, maximum), expected, "Bounded ordinary generation");
+        same(collect(speculative, prompt_a, maximum), expected, "Bounded speculative generation");
+        bounded.reset(); speculative.reset();
+        expect(!bounded.context_size() && !speculative.context_size(), "Reset must clear bounded frontend histories");
+        bool rejected = false;
+        try { Engine invalid(source, Device::CUDA, kCapacity + 1); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "Ordinary capacity beyond model limit must reject");
+        rejected = false;
+        try { Speculation invalid(source, draft, 6, 1, kCapacity + 1); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "Speculative capacity beyond a model limit must reject");
+    }
+    {
+        auto eos_configuration = configuration();
+        eos_configuration["eos_token_id"] = expected_a.front();
+        auto eos_model = std::make_shared<Model>(weights(), eos_configuration);
+        auto eos_source = std::make_shared<Session>(eos_model, false);
+        Engine ordinary_eos(eos_source, Device::CUDA);
+        Speculation speculative_eos(eos_source, eos_source, 6, 1);
+        same(collect(ordinary_eos, prompt_a, maximum), {}, "Ordinary initial EOS is not emitted");
+        same(collect(speculative_eos, prompt_a, maximum), {}, "Speculative initial EOS is not emitted");
     }
     std::cout << "Engine/speculative executors: shared immutable weights survive independent cache binding and destruction\n";
 }

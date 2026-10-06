@@ -239,7 +239,7 @@ inline void process_quantized_weights_awq(const py::dict& weights,
                 py::object tensor = py::reinterpret_borrow<py::object>(item.second);
                 size_t params_count = weight_processor_utils::calculate_params_count(tensor);
 
-                py::array_t<int32_t> np_array = tensor.cast<py::array_t<int32_t>>();
+                auto np_array = weight_processor_utils::as_contiguous_array<int32_t>(tensor);
                 std::vector<size_t> shape;
                 for (int i = 0; i < np_array.ndim(); i++) {
                     shape.push_back(np_array.shape(i));
@@ -332,7 +332,7 @@ inline void process_quantized_weights_awq(const py::dict& weights,
                 py::object tensor = py::reinterpret_borrow<py::object>(item.second);
                 size_t params_count = weight_processor_utils::calculate_params_count(tensor);
 
-                py::array_t<int32_t> np_array = tensor.cast<py::array_t<int32_t>>();
+                auto np_array = weight_processor_utils::as_contiguous_array<int32_t>(tensor);
                 std::vector<size_t> shape;
                 for (int i = 0; i < np_array.ndim(); i++) {
                     shape.push_back(np_array.shape(i));

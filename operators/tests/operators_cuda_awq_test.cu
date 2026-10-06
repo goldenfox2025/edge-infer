@@ -1,5 +1,5 @@
 #include "operators/cuda/execution.hpp"
-#include "../../runtime/tests/allocation_probe.hpp"
+#include "allocation_probe.hpp"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -47,12 +47,14 @@ struct Context {
 
 template <typename T>
 struct Buffer {
+    T* allocation = nullptr;
     T* data = nullptr;
     std::size_t count;
-    explicit Buffer(std::size_t size) : count(size) {
-        check(cudaMalloc(reinterpret_cast<void**>(&data), count * sizeof(T)));
+    explicit Buffer(std::size_t size, std::size_t offset = 0) : count(size) {
+        check(cudaMalloc(reinterpret_cast<void**>(&allocation), (count + offset) * sizeof(T)));
+        data = allocation + offset;
     }
-    ~Buffer() { cudaFree(data); }
+    ~Buffer() { cudaFree(allocation); }
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
     TensorView<T, 1> vector() { return TensorView<T, 1>::contiguous(data, {count}); }
@@ -182,9 +184,9 @@ float compare(const std::vector<T>& actual, const std::vector<float>& reference,
 }
 
 template <typename T>
-void run(Context& context, Shape shape, std::size_t rows) {
+void run(Context& context, Shape shape, std::size_t rows, std::size_t input_offset = 0) {
     Fixture<T> fixture(shape, rows);
-    Buffer<T> input(fixture.input.size()), scales(fixture.scales.size()), bias(fixture.bias.size()),
+    Buffer<T> input(fixture.input.size(), input_offset), scales(fixture.scales.size()), bias(fixture.bias.size()),
         dense(fixture.dense.size()), output(fixture.reference.size()), dense_output(fixture.reference.size());
     Buffer<int32_t> packed(fixture.packed_weights.size()), zeros(fixture.packed_zeros.size());
     input.upload(fixture.input, context.stream);
@@ -226,7 +228,7 @@ void run(Context& context, Shape shape, std::size_t rows) {
     const float maximum_pair = compare(actual, dense_values, "AWQ against prepared dense");
     std::cout << "AWQ " << (std::is_same_v<T, float> ? "FP32" : "BF16")
               << " K=" << shape.input << ", N=" << shape.output << ", group=" << shape.group
-              << ", rows=" << rows << ": max_abs_CPU=" << maximum_awq
+              << ", rows=" << rows << ", input_offset=" << input_offset << ": max_abs_CPU=" << maximum_awq
               << ", max_abs_dense_CPU=" << maximum_dense << ", max_abs_AWQ_dense=" << maximum_pair
               << ", C++ allocations=" << count.host_allocations;
 #ifdef EDGE_INFER_TEST_CUDA_WRAPPING
@@ -235,6 +237,66 @@ void run(Context& context, Shape shape, std::size_t rows) {
     std::cout << ", CUDA allocation tracing unavailable in this build";
 #endif
     std::cout << '\n';
+}
+
+void test_bf16_bias_cancellation(Context& context, Shape shape, std::size_t rows,
+                                 std::size_t input_offset = 0) {
+    using T = __nv_bfloat16;
+    const std::size_t groups = shape.input / shape.group;
+    const std::size_t weight_stride = (shape.input + 7) / 8;
+    const std::size_t zero_stride = (groups + 7) / 8;
+    std::vector<T> inputs(rows * shape.input, encode<T>(0.0f));
+    std::vector<T> scales_host(shape.output * groups, encode<T>(1.0f));
+    std::vector<T> bias_host(shape.output);
+    std::vector<int32_t> packed_host(shape.output * weight_stride, static_cast<int32_t>(0x88888888u));
+    std::vector<int32_t> zeros_host(shape.output * zero_stride, static_cast<int32_t>(0x88888888u));
+    for (std::size_t row = 0; row < rows; ++row) {
+        inputs[row * shape.input] = encode<T>(1.0f);
+        inputs[row * shape.input + 1] = encode<T>(1.0f / 256.0f);
+    }
+    for (std::size_t column = 0; column < shape.output; ++column) {
+        const float sign = column % 2 ? -1.0f : 1.0f;
+        const uint32_t quantized = sign > 0 ? 9u : 7u;
+        packed_host[column * weight_stride] = static_cast<int32_t>(
+            (0x88888888u & ~0xffu) | quantized | (quantized << 4));
+        bias_host[column] = encode<T>(-sign);
+    }
+    Buffer<T> input(inputs.size(), input_offset), scales(scales_host.size()), bias(bias_host.size()),
+        output(rows * shape.output);
+    Buffer<int32_t> packed(packed_host.size()), zeros(zeros_host.size());
+    input.upload(inputs, context.stream);
+    scales.upload(scales_host, context.stream);
+    bias.upload(bias_host, context.stream);
+    packed.upload(packed_host, context.stream);
+    zeros.upload(zeros_host, context.stream);
+    check(cudaStreamSynchronize(context.stream));
+    auto weight = op::cuda::prepare_awq<T>(
+        packed.matrix(shape.output, weight_stride).as_const(),
+        scales.matrix(shape.output, groups).as_const(),
+        zeros.matrix(shape.output, zero_stride).as_const(),
+        shape.group, shape.input, bias.vector().as_const());
+    const auto input_view = input.matrix(rows, shape.input).as_const();
+    const auto output_view = output.matrix(rows, shape.output);
+    op::cuda::awq_linear<T>(context.execution, input_view, weight, output_view);
+    const auto actual = output.download(context.stream);
+    // Exact dyadic fixture: dot = +/- (1 + 1/256), bias = -/+ 1.
+    // Rounding the dot to BF16 before adding bias incorrectly produces zero.
+    for (std::size_t row = 0; row < rows; ++row)
+        for (std::size_t column = 0; column < shape.output; ++column) {
+            const float expected = (column % 2 ? -1.0f : 1.0f) / 256.0f;
+            if (decode(actual[row * shape.output + column]) != expected)
+                throw std::runtime_error("AWQ BF16 bias cancellation lost the FP32 residual at row " +
+                    std::to_string(row) + ", column " + std::to_string(column));
+        }
+    weight.bias = nullptr;
+    op::cuda::awq_linear<T>(context.execution, input_view, weight, output_view);
+    const auto unbiased = output.download(context.stream);
+    for (std::size_t row = 0; row < rows; ++row)
+        for (std::size_t column = 0; column < shape.output; ++column) {
+            const float expected = column % 2 ? -1.0f : 1.0f;
+            expect(decode(unbiased[row * shape.output + column]) == expected,
+                   "AWQ optional null bias changed output rounding");
+        }
 }
 
 }  // namespace
@@ -253,6 +315,14 @@ int main() {
                 run<__nv_bfloat16>(context, shape, rows);
             }
         }
+        // A contiguous borrowed view may begin one element into an allocation.
+        // The BF16 MMA path requires 16-byte loads and must fall back safely.
+        run<__nv_bfloat16>(context, {32, 17, 4}, 3, 1);
+        run<__nv_bfloat16>(context, {1024, 17, 128}, 3, 1);
+        test_bf16_bias_cancellation(context, {32, 17, 4}, 3);  // Partial MMA output tile.
+        test_bf16_bias_cancellation(context, {32, 17, 4}, 1);  // Scalar decode path.
+        test_bf16_bias_cancellation(context, {32, 16, 8}, 1);  // Vectorized GEMV.
+        test_bf16_bias_cancellation(context, {32, 17, 4}, 3, 1);  // Unaligned scalar fallback.
         std::cout << "operators_cuda_awq_test passed\n";
     } catch (const std::exception& error) {
         std::cerr << "operators_cuda_awq_test failed: " << error.what() << '\n';

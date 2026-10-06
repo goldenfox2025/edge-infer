@@ -1,6 +1,10 @@
 # Historical CUTLASS profiler commands
 
-Build the profiler from the pinned checkout before using these manual development references.
+These commands are historical third-party GEMM experiments. The maintained
+source contains no CUTLASS checkout or profiler build target. To reproduce an
+old experiment, recover its pinned source from Git history or provide an
+external CUTLASS profiler. These commands do not validate the current decoder;
+use `scripts/profile.sh` for maintained native generation profiling.
 
 ```sh
 ./cutlass_profiler \

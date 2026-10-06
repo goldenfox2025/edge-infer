@@ -7,6 +7,7 @@
 #include "base_model.hpp"
 #include "common.hpp"
 #include "operators/cuda/random.hpp"
+#include "operators/cuda/execution.hpp"
 
 enum class Signal { EndOfStream };
 using GenerationResult = std::variant<uint32_t, Signal, std::exception_ptr>;
@@ -42,10 +43,32 @@ void validate_token_id(const BaseModel* model, uint32_t token,
   }
 }
 
-std::shared_ptr<BaseModel> require_model(std::shared_ptr<BaseModel> model) {
+std::shared_ptr<BaseModel> require_model(std::shared_ptr<BaseModel> model, Device device) {
   if (!model) throw std::invalid_argument("Inference engine requires a model");
   auto executor = model->fork_executor();
-  return executor ? std::move(executor) : std::move(model);
+  if (executor) model = std::move(executor);
+  // Resolve unsupported devices before allocating a cache for that backend.
+  if (model->device() != device) {
+    if (device == Device::CUDA) model->cuda();
+    else model->cpu();
+  }
+  return model;
+}
+
+size_t engine_capacity(const BaseModel& model, size_t capacity) {
+  const size_t limit = model.get_max_seq_len();
+  if (!limit || capacity > limit) throw std::invalid_argument("Engine capacity exceeds the model context limit");
+  return capacity ? capacity : limit;
+}
+
+void validate_request_sampling(const BaseModel& model, Device device,
+                               float temperature, float top_p, size_t top_k) {
+  if (device == Device::CUDA) {
+    op::cuda::validate_sampling_policy(model.get_vocab_size(), temperature, top_p, top_k, true);
+  } else if (!std::isfinite(temperature) || !std::isfinite(top_p) ||
+             top_p <= 0.0f || top_p > 1.0f || !top_k) {
+    throw std::invalid_argument("Invalid generation sampling policy");
+  }
 }
 
 class EngineDeviceScope {
@@ -66,20 +89,20 @@ class EngineDeviceScope {
 
 template <typename T>
 KVCache<T>::KVCache(size_t n_layers, size_t max_seq_len, size_t head_dim, Device device, size_t initial_size)
-    : max_seq_len_(max_seq_len), n_layers_(n_layers), storage_capacity_(max_seq_len),
+    : n_layers_(n_layers), storage_capacity_(max_seq_len),
       head_dim_(head_dim), current_len_(0), device_(device) {
 
-    if (!n_layers_ || !max_seq_len_ || !head_dim_ ||
-        n_layers_ > std::numeric_limits<size_t>::max() / max_seq_len_ ||
-        n_layers_ * max_seq_len_ > std::numeric_limits<size_t>::max() / head_dim_ / sizeof(T)) {
+    if (!n_layers_ || !storage_capacity_ || !head_dim_ ||
+        n_layers_ > std::numeric_limits<size_t>::max() / storage_capacity_ ||
+        n_layers_ * storage_capacity_ > std::numeric_limits<size_t>::max() / head_dim_ / sizeof(T)) {
         throw std::invalid_argument("KVCache dimensions are empty or exceed addressable storage");
     }
-    if (initial_size > max_seq_len_) {
+    if (initial_size > storage_capacity_) {
         throw std::invalid_argument("Initial size cannot exceed max_seq_len");
     }
-    const std::vector<size_t> shape{n_layers_, max_seq_len_, head_dim_};
+    const std::vector<size_t> shape{n_layers_, storage_capacity_, head_dim_};
     if (device_ == Device::CUDA) {
-        const size_t bytes = n_layers_ * max_seq_len_ * head_dim_ * sizeof(T);
+        const size_t bytes = n_layers_ * storage_capacity_ * head_dim_ * sizeof(T);
         k_storage_.reserve(bytes);
         v_storage_.reserve(bytes);
         k_cache_contiguous_ = Tensor<T>::from_external_buffer(k_storage_.template ptr_at<T>(0), shape, device_);
@@ -94,7 +117,7 @@ KVCache<T>::KVCache(size_t n_layers, size_t max_seq_len, size_t head_dim, Device
 
 template <typename T>
 void KVCache<T>::resize(size_t new_size) {
-    if (new_size > max_seq_len_ || new_size > storage_capacity_) {
+    if (new_size > storage_capacity_) {
         throw std::runtime_error("KVCache: Attempted to resize beyond max_seq_len");
     }
     current_len_ = new_size;
@@ -109,7 +132,7 @@ Tensor<T>& KVCache<T>::k_cache(size_t layer, size_t pos) {
     if (layer >= n_layers_) {
         throw std::runtime_error("KVCache: Layer index out of range");
     }
-    if (pos >= max_seq_len_ || pos >= storage_capacity_) {
+    if (pos >= storage_capacity_) {
         throw std::runtime_error("KVCache: Position index out of range");
     }
     const size_t idx = layer * storage_capacity_ + pos;
@@ -126,7 +149,7 @@ Tensor<T>& KVCache<T>::v_cache(size_t layer, size_t pos) {
     if (layer >= n_layers_) {
         throw std::runtime_error("KVCache: Layer index out of range");
     }
-    if (pos >= max_seq_len_ || pos >= storage_capacity_) {
+    if (pos >= storage_capacity_) {
         throw std::runtime_error("KVCache: Position index out of range");
     }
     const size_t idx = layer * storage_capacity_ + pos;
@@ -157,10 +180,8 @@ KVCache<T>& KVCache<T>::cuda() {
     if (device_ == Device::CUDA)
         return *this;
 
-    // Tensor::nbytes() is a legacy int API. Persistent cache capacities can
-    // exceed 2 GiB per buffer, so compute allocation/copy sizes in size_t.
-    const size_t k_bytes = k_cache_contiguous_.numel() * sizeof(T);
-    const size_t v_bytes = v_cache_contiguous_.numel() * sizeof(T);
+    const size_t k_bytes = k_cache_contiguous_.nbytes();
+    const size_t v_bytes = v_cache_contiguous_.nbytes();
     k_storage_.reserve(k_bytes);
     v_storage_.reserve(v_bytes);
     auto next_k = Tensor<T>::from_external_buffer(k_storage_.template ptr_at<T>(0),
@@ -227,16 +248,14 @@ template class KVCache<float>;
 template class KVCache<__nv_bfloat16>;
 
 template <typename T>
-InferenceEngine<T>::InferenceEngine(std::shared_ptr<BaseModel> model, Device device)
-    : thread_pool_(4), model_(require_model(std::move(model))),
-      kv_cache_(model_->get_n_layers(), model_->get_max_seq_len(),
+InferenceEngine<T>::InferenceEngine(std::shared_ptr<BaseModel> model, Device device, size_t capacity)
+    : thread_pool_(device == Device::CUDA ? 0 : 4), model_(require_model(std::move(model), device)),
+      kv_cache_(model_->get_n_layers(), engine_capacity(*model_, capacity),
                 model_->get_head_dim() * model_->get_n_kv_heads(), device),
       device_(device), benchmark_mode_(false), benchmark_warmup_tokens_(64) {
   if (device_ == Device::CUDA) {
-    if (model_->device() != Device::CUDA) model_->cuda();
     init_cuda_resources();
   } else {
-    if (model_->device() != Device::CPU) model_->cpu();
     decode_input_ = Tensor<uint32_t>({1}, Device::CPU);
   }
 }
@@ -252,7 +271,7 @@ void InferenceEngine<T>::init_cuda_resources() {
   d_states = cuda_resources_.template ptr_at<curandState>(plan.at("rng").offset);
   decode_input_ = Tensor<uint32_t>::from_external_buffer(
       cuda_resources_.template ptr_at<uint32_t>(plan.at("decode_input").offset), {1}, Device::CUDA);
-  prompt_storage_.reserve(model_->get_max_seq_len() * sizeof(uint32_t));
+  prompt_storage_.reserve(kv_cache_.get_max_seq_len() * sizeof(uint32_t));
   const auto seed = static_cast<unsigned long long>(
       std::chrono::system_clock::now().time_since_epoch().count());
   op::cuda::init_curand(d_states, seed, 0);
@@ -285,7 +304,9 @@ InferenceEngine<T>::~InferenceEngine() {
 template <typename T>
 uint32_t* InferenceEngine<T>::generate_next_token(ThreadPool& thread_pool, uint32_t* input_ids,
                                                 float temperature, float top_p, size_t top_k) {
+  require_valid();
   if (!input_ids) throw std::invalid_argument("Decode requires a token pointer");
+  validate_request_sampling(*model_, device_, temperature, top_p, top_k);
   EngineDeviceScope device_scope(device_ == Device::CUDA ? cuda_device_id_ : -1);
   if (device_ == Device::CUDA) {
     checkCudaErrors(cudaMemcpy(decode_input_.data_ptr(), input_ids, sizeof(uint32_t), cudaMemcpyDeviceToDevice));
@@ -306,7 +327,9 @@ uint32_t* InferenceEngine<T>::generate_next_token(ThreadPool& thread_pool, uint3
 template <typename T>
 void InferenceEngine<T>::warmup(size_t warmup_tokens, bool force_warmup,
                                 float temperature, float top_p, size_t top_k) {
+  require_valid();
   if (device_ != Device::CUDA || (has_warmed_up_ && !force_warmup) || kv_cache_.size()) return;
+  validate_request_sampling(*model_, device_, temperature, top_p, top_k);
   EngineDeviceScope device_scope(cuda_device_id_);
   const size_t count = std::min(warmup_tokens, kv_cache_.get_max_seq_len());
   if (!count) return;
@@ -321,11 +344,11 @@ void InferenceEngine<T>::warmup(size_t warmup_tokens, bool force_warmup,
     if (!token) throw std::runtime_error("Warmup prefill returned a null token");
     if (count < kv_cache_.get_max_seq_len())
       generate_next_token(thread_pool_, token, temperature, top_p, top_k);
-    checkCudaErrors(cudaDeviceSynchronize());
+    model_->synchronize();
     kv_cache_.clear();
     has_warmed_up_ = true;
   } catch (...) {
-    cudaDeviceSynchronize();
+    try { model_->synchronize(); } catch (...) {}
     kv_cache_.clear();
     throw;
   }
@@ -333,6 +356,7 @@ void InferenceEngine<T>::warmup(size_t warmup_tokens, bool force_warmup,
 
 template <typename T>
 void InferenceEngine<T>::set_benchmark_mode(bool enabled, size_t warmup_tokens) {
+  require_valid();
   benchmark_mode_ = enabled;
   benchmark_warmup_tokens_ = warmup_tokens;
 }
@@ -341,12 +365,16 @@ template <typename T>
 void InferenceEngine<T>::generate_with_callback(const std::vector<uint32_t>& input_ids, size_t max_length,
                                                float temperature, float top_p, size_t top_k,
                                                std::function<void(uint32_t)> callback) {
+  require_valid();
   if (input_ids.empty()) throw std::invalid_argument("Prompt must be nonempty");
   if (!callback) throw std::invalid_argument("Generation requires a callback");
-  if (max_length <= input_ids.size()) return;
-  if (input_ids.size() > kv_cache_.get_max_seq_len() - kv_cache_.size())
+  if (input_ids.size() > kv_cache_.get_max_seq_len())
     throw std::length_error("Prompt exceeds engine context capacity");
+  const size_t limit = std::min(max_length, kv_cache_.get_max_seq_len());
+  if (limit <= input_ids.size()) return;
   for (auto token : input_ids) validate_token_id(model_.get(), token, "prompt");
+  validate_request_sampling(*model_, device_, temperature, top_p, top_k);
+  reset();
   if (device_ == Device::CUDA)
     warmup(benchmark_mode_ ? benchmark_warmup_tokens_ : 64, benchmark_mode_, temperature, top_p, top_k);
 
@@ -381,7 +409,7 @@ void InferenceEngine<T>::generate_with_callback(const std::vector<uint32_t>& inp
         ++total_length;
         if (token == model_->get_eos_token_id()) break;
         results.push(token);
-        if (total_length >= max_length || kv_cache_.size() >= kv_cache_.get_max_seq_len()) break;
+        if (total_length >= limit || kv_cache_.size() >= kv_cache_.get_max_seq_len()) break;
         token_ptr = generate_next_token(thread_pool_, token_ptr, temperature, top_p, top_k);
         if (device_ == Device::CPU) cpu_token.reset(token_ptr);
       }
@@ -406,33 +434,47 @@ void InferenceEngine<T>::generate_with_callback(const std::vector<uint32_t>& inp
 
 template <typename T>
 void InferenceEngine<T>::reset() {
+  require_valid();
   EngineDeviceScope device_scope(device_ == Device::CUDA ? cuda_device_id_ : -1);
-  if (device_ == Device::CUDA) checkCudaErrors(cudaDeviceSynchronize());
+  model_->synchronize();
   kv_cache_.clear();
 }
 
 template <typename T>
 InferenceEngine<T>& InferenceEngine<T>::cuda() {
+  require_valid();
   if (device_ == Device::CUDA) return *this;
-  model_->cuda();
-  kv_cache_.cuda();
-  init_cuda_resources();
-  device_ = Device::CUDA;
-  has_warmed_up_ = false;
+  try {
+    model_->cuda();
+    kv_cache_.cuda();
+    init_cuda_resources();
+    device_ = Device::CUDA;
+    has_warmed_up_ = false;
+  } catch (...) {
+    // Model migration may already have changed its state before throwing.
+    valid_ = false;
+    throw;
+  }
   return *this;
 }
 
 template <typename T>
 InferenceEngine<T>& InferenceEngine<T>::cpu() {
+  require_valid();
   if (device_ == Device::CPU) return *this;
-  EngineDeviceScope device_scope(cuda_device_id_);
-  checkCudaErrors(cudaDeviceSynchronize());
-  model_->cpu();
-  kv_cache_.cpu();
-  release_cuda_resources();
-  decode_input_ = Tensor<uint32_t>({1}, Device::CPU);
-  device_ = Device::CPU;
-  has_warmed_up_ = false;
+  try {
+    EngineDeviceScope device_scope(cuda_device_id_);
+    checkCudaErrors(cudaDeviceSynchronize());
+    model_->cpu();
+    kv_cache_.cpu();
+    release_cuda_resources();
+    decode_input_ = Tensor<uint32_t>({1}, Device::CPU);
+    device_ = Device::CPU;
+    has_warmed_up_ = false;
+  } catch (...) {
+    valid_ = false;
+    throw;
+  }
   return *this;
 }
 

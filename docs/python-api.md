@@ -1,0 +1,90 @@
+# Python models and sessions
+
+`model_bridge.Model` prepares native weights on an explicit device without
+allocating a generation engine or KV cache. It keeps the native preparation
+prototype private. CUDA sessions share immutable prepared weights and own
+independent caches, execution storage and streams. The FP32 CPU reference copies
+weights for each executor and supports CPU temperature/top-k/top-p sampling.
+The reference numerical comparisons cover greedy generation.
+
+```python
+from frontend.checkpoint import load_model
+from model_bridge import Model
+
+config, weights, model_type = load_model("/absolute/path/to/model", "qwen3_bf16")
+model = Model(config, weights, model_type, device="cuda")
+first = model.new_session(capacity=1024)
+second = model.new_session(capacity=1024)
+del weights
+
+# prompt_ids contains the entire rendered prompt, including chat history.
+# max_length counts prompt tokens plus generated tokens.
+tokens = []
+first.generate(prompt_ids, tokens.append,
+               max_length=len(prompt_ids) + 32, top_k=1)
+first.reset()
+```
+
+Supported model types are `llama`, `qwen`, `qwen_bf16`, `qwen_awq`,
+`qwen3_bf16` and `qwen3_awq`. BF16 and AWQ require an available CUDA device.
+`device=None` uses the configured default for new models; selecting a device
+does not migrate existing models or sessions. Invalid devices and construction
+failures raise exceptions. Text models currently require plain RoPE and full
+attention; nonempty `rope_scaling`, active sliding windows and other layer types
+are rejected before weight preparation. `is_cuda_available()` reports actual device
+availability independently of the selected default.
+
+`new_session()` defaults to `min(4096, model.max_context_length)` tokens.
+An explicit capacity must be positive and within the model context limit.
+The session exposes read-only `capacity`, `device` and `speculative` properties.
+Its cache allocation follows the supplied capacity rather than reserving the
+model's full advertised context. Session objects retain prepared weights after
+the Python Model is released.
+
+Each `generate()` call accepts a complete fresh prompt and replaces request
+state. Repeated calls do not implicitly append prompts. The frontend retains
+system, user and assistant messages, renders the complete conversation for each
+turn, and passes a total length within the session capacity. The chat option
+`--max_new_tokens` controls generated-token count; `--max_length` remains an alias
+for that frontend option. The native and binding `max_length` argument continues
+to count the total sequence, including the prompt.
+
+Callbacks receive token IDs on the thread that called generation. The binding
+releases the GIL while native generation runs and reacquires it for callbacks.
+Python callback exceptions retain their original type, value and traceback.
+Generation or reset on the same session while it is busy raises an error;
+another session has an independent guard. Applications should serialize calls
+to each session. `reset()` clears request state while retaining allocations.
+
+## Exact greedy speculation
+
+```python
+draft_config, draft_weights, draft_type = load_model(
+    "/absolute/path/to/draft", "qwen3_bf16")
+draft = Model(draft_config, draft_weights, draft_type, device="cuda")
+speculative = model.new_speculative_session(
+    draft, capacity=1024, spec_length=4)
+speculative.generate(prompt_ids, tokens.append,
+                     max_length=len(prompt_ids) + 32, top_k=1)
+```
+
+Target and draft must use compatible tokenization, BF16/AWQ execution and the
+same vocabulary. Capacity must fit both models. `spec_length` must be between
+1 and 8. The native speculative decoder supports exact greedy verification
+only. In Python, `top_k != 1` creates an ordinary target engine lazily and uses
+its separate cache; this request performs ordinary sampling. There is no
+probability-ratio verification mode or adaptive speculation policy.
+
+## Procedural compatibility
+
+`init_model(config, weights, model_type)`, `generate_text_stream(...)`,
+`init_speculative_decoder(...)` and `generate_text_stream_speculative(...)`
+remain wrappers over one explicit model and bounded session. Initialization
+returns a boolean and publishes replacement objects only on success; failure
+preserves the previous usable model and sessions. Overlapping compatibility
+generation, initialization and default-device changes are rejected.
+
+`generate_text_stream_speculative(..., top_k=1)` uses the initialized
+speculative session, or ordinary inference if no speculative session exists.
+Requests with `top_k != 1` use the existing ordinary session. All generation
+functions require the same complete-prompt and total-length contract.

@@ -1,13 +1,14 @@
 # Native runtime integration
 
 `EdgeInfer::runtime` is a C++17 static library. It links the independent operator
-library, CUDA runtime/driver, cuBLAS and native threads. It does not depend on
+library, CUDA runtime, cuBLAS and native threads. It does not depend on
 Python, pybind11, Torch or a tokenizer. The current implementation is for Linux
 or WSL with a supported CUDA toolchain.
 
 ## CMake source integration
 
-The normal runtime build uses CUDA/cuBLAS and C++17. CUTLASS is only needed for the optional historical operator adapters:
+The runtime build uses CUDA/cuBLAS and C++17. The maintained source does not
+require CUTLASS or historical Tensor/operator-factory adapters.
 
 ```cmake
 cmake_minimum_required(VERSION 3.20)
@@ -44,7 +45,7 @@ the native call boundary is:
 // weights, config and input_ids are supplied by the application.
 auto model = ModelFactory::create_model_bf16(
     ModelType::QWEN3_BF16, weights, config);
-InferenceEngine<__nv_bfloat16> engine(model, Device::CUDA);
+InferenceEngine<__nv_bfloat16> engine(model, Device::CUDA, 1024);
 engine.generate_with_callback(
     input_ids, 128, 1.0f, 0.9f, 1,
     [](uint32_t token) { /* consume a token ID */ });
@@ -52,7 +53,16 @@ engine.generate_with_callback(
 
 `max_length` is the existing total sequence-length limit, including prompt
 tokens. Model EOS terminates generation; the ordinary engine does not emit the
-EOS token to its callback. Applications decode token IDs separately.
+EOS token to its callback. Every high-level generation call starts from the
+complete supplied prompt and replaces the previous request. Applications retain
+and render conversation history themselves. Low-level `prefill()` and `decode()`
+remain available for explicit continuation. Applications decode token IDs separately.
+
+The third engine constructor argument bounds the KV cache. A positive capacity
+must fit the model context limit; zero uses the model limit. SpeculativeDecoder
+accepts capacity as its fifth constructor argument, after thread count, and
+requires capacity within both models' limits. It verifies exact greedy tokens
+only (`top_k=1`); stochastic sampling belongs to an ordinary engine.
 
 ## Lifetime and concurrency
 
@@ -60,12 +70,27 @@ The ordinary engine runs model generation on a worker and invokes token
 callbacks on the calling thread. Generation joins its worker before returning,
 including on callback/worker exceptions. A callback failure currently waits for
 the worker to finish; early cancellation and bounded buffering are future work.
-Serialize calls and state changes on an engine instance. Simultaneous full
-generation using legacy sampling scratch has not been validated.
+Serialize calls and state changes on an engine instance. Each engine forks
+independent mutable execution state while retaining prepared CUDA weights.
+Interleaved session isolation is tested; simultaneous GPU throughput requires
+separate measurement.
 
-Python bindings manage the GIL outside this library. Their current process-global
-session rejects overlapping generation, initialization or device changes. Python
-callbacks retain their original exception type, value and traceback.
+`BaseModel::synchronize()` completes an executor's submitted work before engine
+reset or warmup reuses state. Its default waits for the selected CUDA device;
+Qwen3 sessions override it to wait for their private stream, and Qwen models
+delegate to their session. Input transfers, migration and engine teardown may
+still use default-stream or device-wide waits.
+
+Engine device migration is an explicit compatibility operation. If `cuda()` or
+`cpu()` fails, that engine is permanently invalidated: generation, reset and
+state access then reject with an error. Construct another engine rather than
+reusing partially migrated state. Prepared CUDA models do not support CPU migration.
+
+Python bindings manage the GIL outside this library. Explicit Python models
+create independent bounded sessions; each session rejects overlapping generation
+or reset. The procedural compatibility wrapper also rejects replacement while
+its generation is active. Python callbacks retain their original exception type,
+value and traceback. See the [Python API](python-api.md).
 
 The token-oriented API does not model audio frames or PCM chunks. A Qwen TTS
 implementation can consume the same core/operators and execution mechanisms
@@ -135,9 +160,9 @@ Create another cache/session pair with the same model to serve another history.
 The model owns copies of prepared weights, retaining supported contiguous or
 two-dimensional transposed layouts. Required dimensions are checked before
 execution. Dense linear weights have logical shape `[input, output]` and may
-use a transposed view. Token embeddings must be contiguous `[vocabulary, hidden]`,
-with hidden width divisible by eight. The current attention path requires BF16
-and head dimension 128.
+use a transposed view. Token embeddings must be contiguous `[vocabulary, hidden]`.
+BF16 attention with head dimension 128 uses the optimized implementation.
+Other supported head widths and FP32 use a scalar correctness fallback.
 
 The current AWQ kernel consumes contiguous N-major packed weights:
 `qweight[output, ceil(input/8)]`, `qzeros[output, ceil(groups/8)]` and
@@ -156,8 +181,42 @@ the sampled `forward()` method. For logits, call
 `forward_for_graph_logits_only()` to use graph decode; `forward_eager()` always
 uses the eager decoder.
 
-The token factory returns a Qwen3 session through the legacy `BaseModel`
-interface. Python continues to expose one guarded session. Native interleaved
-logits/KV isolation and greedy sampling are tested with synthetic weights;
-full checkpoint parity, asynchronous generation and probabilistic sampling
-isolation still require separate validation.
+The token factory returns a Qwen3 session through the `BaseModel` interface.
+Native and Python consumers can create independent bounded generation engines.
+Native interleaved logits/KV isolation and greedy sampling are tested with
+synthetic weights; full checkpoint parity, asynchronous throughput and
+probabilistic sampling isolation still require separate validation.
+
+## Host tokens and model adapters
+
+Managed sessions accept host token IDs without an owning CUDA Tensor:
+
+```cpp
+auto first = Qwen3Session<__nv_bfloat16>::create(model, 1024);
+auto second = first->new_session(512);
+auto logits = first->prefill(std::vector<uint32_t>{3, 7, 11});
+logits = first->decode(uint32_t{17});
+```
+
+Host prefill validates IDs and uploads on the session's stream. It grows private
+input storage as needed; subsequent one-token decode uses fixed storage.
+
+An embedding or output-head adapter can use the same transformer backbone:
+
+```cpp
+// prompt_embeddings and frame_embedding are contiguous CUDA TensorViews.
+auto hidden = second->prefill_embeddings(prompt_embeddings, 0);
+hidden = second->decode_embeddings(frame_embedding, next_logical_position);
+// Apply the adapter's output head to hidden on second->stream().
+```
+
+Prefill returns `[rows, hidden_size]`; decode returns `[1, hidden_size]`, both
+after final normalization. No token lookup, language-model head or sampling runs
+in these embedding calls. They use eager execution even when token graph mode is
+enabled. Input storage must be independent of session workspace. Establish stream
+dependencies for uploads from another stream; the calls complete before returning.
+
+Embedding positions are explicit and must fit the model's position limit. The
+session determines physical KV slots independently. Token calls use their normal
+cache-position sequence; callers continuing custom positions use the embedding
+API. This is single-axis RoPE, not an implementation of TTS MRoPE.

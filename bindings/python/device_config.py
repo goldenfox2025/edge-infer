@@ -33,5 +33,4 @@ def is_cuda_available() -> bool:
     Returns:
         bool: True if CUDA is available, False otherwise
     """
-    # If the current device is 'cuda', then CUDA is available
-    return get_device() == 'cuda'
+    return model_bridge.is_cuda_available()

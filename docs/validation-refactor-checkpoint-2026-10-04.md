@@ -1,8 +1,9 @@
 # Decoder refactor checkpoint: 2026-10-04
 
-Work stopped before midnight Asia/Shanghai at the owner's request. This is a
-local checkpoint, not a validated release. The existing remote master was not
-updated with this checkpoint.
+This local checkpoint was saved at 00:00:29 Asia/Shanghai on 2026-10-05 while
+wrapping up the owner's midnight stop request. It was not a validated release;
+the existing remote master was not updated with this checkpoint. Work resumed
+at the owner's request on 2026-10-05; see the current validation record.
 
 The refactor introduces fixed borrowed tensor views, independent direct CUDA
 operators, one shared decoder backbone, private session arenas and requested-size

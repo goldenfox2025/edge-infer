@@ -1,5 +1,5 @@
 #include "operators/cuda/execution.hpp"
-#include "../../runtime/tests/allocation_probe.hpp"
+#include "allocation_probe.hpp"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -233,6 +234,12 @@ void invalid_sampling_preserves_output_test() {
     Buffer<uint32_t> tokens(1);
     Buffer<float> probabilities(1);
     const auto plan = op::cuda::prepare_sampling(context.execution, 2048);
+    bool oversized_rejected = false;
+    try {
+        op::cuda::prepare_sampling(context.execution,
+            static_cast<std::size_t>(std::numeric_limits<int>::max()) + 1);
+    } catch (const std::invalid_argument&) { oversized_rejected = true; }
+    expect(oversized_rejected, "sampling preparation must reject extents beyond the CUB integer range");
     Buffer<unsigned char> scratch(plan.total_bytes);
     constexpr uint32_t sentinel = 0xa5c39e71U;
     for (std::size_t top_k : {std::size_t{0}, std::size_t{1025}}) {

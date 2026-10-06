@@ -1,5 +1,5 @@
 #include "tensor_view.hpp"
-#include "../../runtime/tests/allocation_probe.hpp"
+#include "allocation_probe.hpp"
 
 #include <array>
 #include <cstddef>
@@ -69,12 +69,22 @@ void test_borrowed_offsets_constness_and_layouts() {
     expect(singleton.is_contiguous(), "singleton strides must not defeat contiguity");
     expect_rejected([&] { view.checked_subview({2, 0, 0}, {1, 1, 1}); },
                     "checked subviews must reject origins/extents beyond their source");
+    const auto empty_corner = view.checked_subview({2, 3, 4}, {0, 0, 0});
+    const auto empty_edge = view.checked_subview({1, 3, 4}, {1, 0, 0});
+    expect(empty_corner.numel() == 0 && empty_edge.numel() == 0 &&
+               empty_corner.data_ptr() == data.data() && empty_edge.data_ptr() == data.data(),
+           "empty boundary slices must not form pointers beyond caller storage");
 }
 
 void test_empty_null_and_extent_validation() {
     const auto empty = TensorView<float, 3>::contiguous(nullptr, {2, 0, 3});
     expect(empty.numel() == 0 && empty.is_contiguous() && empty.data_ptr() == nullptr,
            "empty views may borrow null storage");
+    const auto null_region = empty.checked_subview({2, 0, 3}, {0, 0, 0});
+    expect(null_region.numel() == 0 && null_region.data_ptr() == nullptr,
+           "empty null slices must preserve null without pointer arithmetic");
+    expect_rejected([&] { empty.checked_subview({3, 0, 0}, {0, 0, 0}); },
+                    "empty slices must still reject out-of-bounds origins");
     float value = 0;
     expect_rejected([] { TensorView<float, 1>::contiguous(nullptr, {1}); },
                     "nonempty views require caller storage");

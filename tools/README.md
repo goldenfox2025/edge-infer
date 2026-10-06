@@ -1,23 +1,23 @@
 # Developer tools
 
 These scripts inspect local model files, compare diagnostic dumps, and run manual
-experiments. Run the commands below from the repository root: quantization,
-embedding comparisons, and logits visualization use paths relative to the current
-working directory. They are outside the portable CTest suite.
+experiments. Run the commands below from the repository root: quantization and
+embedding comparisons use paths relative to the current working directory.
+They are outside the portable CTest suite.
 
 | Directory | Purpose | Dependencies and inputs |
 | --- | --- | --- |
 | `analysis/` | Inspect weight shapes/AWQ layouts and compare tensor dumps | NumPy for binary comparisons; PyTorch and safetensors for model inspection |
-| `analysis/visualize_logits.py` | Plot target/draft logits and KL divergence | NumPy, Matplotlib, Transformers; saved `logits_data/` and tokenizer files |
 | `analysis/qwen3_inspect.py` | Load a Transformers model, inspect it, and generate text | PyTorch, Transformers, Accelerate; full model weights |
 | `conversion/qwen_tts_checkpoint.py` | Export local Qwen3-TTS conditioning weight metadata | Python standard library; complete local safetensors checkpoint |
 | `quantization/` | Prepare AutoAWQ GEMV/GEMM weights | AutoAWQ, PyTorch, Transformers, Accelerate, safetensors; source model weights |
 | `validation/reference_generation.py` | Run Transformers generation and print elapsed time | PyTorch, Transformers, Accelerate; full model weights |
-| `validation/test_speculative_decoding.py` | Compare standard/speculative generation and collect logits | Built `model_bridge`, CUDA device, PyTorch, safetensors, Transformers; target/draft model directories |
+| `validation/qwen3_reference.py` | Export pinned local Qwen3 logits and check eager/graph native sessions | PyTorch, NumPy, Transformers 4.51.3, safetensors; local checkpoint and optional native diagnostic module |
+| `validation/test_speculative_decoding.py` | Assert ordinary/speculative greedy token equivalence | Built `model_bridge`, CUDA device, PyTorch, safetensors, Transformers; explicit local target/draft model directories |
 | `validation/qwen_tts_conditioning_reference.py` | Export conditioning reference fixtures for native parity tests | PyTorch, NumPy, Git; local weights and the pinned official source checkout |
 
 `requirements-runtime.txt` pins the frontend dependencies; install a suitable
-PyTorch wheel separately. Matplotlib, Accelerate and AutoAWQ are optional tool
+PyTorch wheel separately. Accelerate and AutoAWQ are optional tool
 dependencies and are not included in that file. `device_map="auto"` in the
 Transformers generation tools requires Accelerate; GPU execution also needs a
 CUDA-enabled PyTorch wheel. AutoAWQ's dependency compatibility with the frontend
@@ -48,8 +48,31 @@ it may fetch model files and execute model-provided code.
 
 Other tools retain their existing positional arguments or internal experiment
 settings. Check them before running: quantization replaces its existing output
-directory, and speculative validation uses model paths configured inside the
-script. An alternate native build directory can be provided through `BUILD_DIR`.
+directory. An alternate native build directory can be provided through `BUILD_DIR`.
+The frontend and speculative validator share `frontend/checkpoint.py`, which
+loads local single-file or indexed safetensors checkpoints and rejects shard
+paths outside the model directory.
+
+The loader's CPU tests create real single-file/indexed safetensors payloads,
+check values and AWQ storage, reject missing or truncated payloads, and exercise
+parent paths, absolute paths and symlink escapes:
+
+```sh
+python -m unittest discover -s frontend/tests -p test_checkpoint.py -v
+```
+
+They require the frontend dependencies and a CPU-capable PyTorch installation,
+with no model downloads or GPU.
+
+```sh
+python tools/validation/test_speculative_decoding.py \
+  --target /absolute/path/to/target --draft /absolute/path/to/draft \
+  --model_type qwen3_awq --context_capacity 1024 --max_new_tokens 64
+```
+
+Both sessions use exact greedy decoding (`top_k=1`) from the same complete
+prompt. A mismatch raises an error. The script no longer promises logits dumps:
+the maintained runtime has no producer for the old dump visualizer.
 
 ## Qwen TTS checkpoint metadata
 
@@ -118,8 +141,8 @@ they do not verify a payload checksum or the publisher's revision.
 `--checkpoint`; that subset must include the recorded `source.json` and tensor
 files expected by the generator.
 
-Use the [CUDA build prerequisites](../README.md#cuda-development-setup), initialize
-the pinned CUTLASS submodule, and register the fixture directory for CTest:
+Use the [CUDA build prerequisites](../README.md#native-cuda-build) and
+register the fixture directory for CTest:
 
 ```sh
 cmake -S . -B build-tts-conditioning \

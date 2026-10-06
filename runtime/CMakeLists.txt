@@ -44,7 +44,24 @@ target_link_libraries(inference_runtime PUBLIC
 set_target_properties(inference_runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if(BUILD_TESTING)
-  add_executable(qwen3_session_test tests/qwen3_session_test.cpp tests/allocation_probe.cpp tests/test_cuda_rng.cu)
+  include_directories("${CMAKE_CURRENT_SOURCE_DIR}/../core/tests/support")
+  add_executable(cuda_workspace_arena_test tests/cuda_workspace_arena_test.cpp)
+  target_link_libraries(cuda_workspace_arena_test PRIVATE EdgeInfer::runtime)
+  add_test(NAME cuda_workspace_arena_test COMMAND cuda_workspace_arena_test)
+  set_tests_properties(cuda_workspace_arena_test PROPERTIES
+    LABELS "runtime;cuda;gpu;storage" SKIP_RETURN_CODE 77 TIMEOUT 30)
+  add_executable(tensor_storage_test tests/tensor_storage_test.cpp ../core/tests/support/allocation_probe.cpp)
+  target_link_libraries(tensor_storage_test PRIVATE EdgeInfer::runtime)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND UNIX)
+    target_compile_definitions(tensor_storage_test PRIVATE EDGE_INFER_TEST_CUDA_WRAPPING=1)
+    target_link_options(tensor_storage_test PRIVATE
+      LINKER:--wrap=cudaMalloc LINKER:--wrap=cudaMallocAsync
+      LINKER:--wrap=cudaFree LINKER:--wrap=cudaFreeAsync)
+  endif()
+  add_test(NAME tensor_storage_test COMMAND tensor_storage_test)
+  set_tests_properties(tensor_storage_test PROPERTIES
+    LABELS "runtime;cuda;gpu;storage" SKIP_RETURN_CODE 77 TIMEOUT 30)
+  add_executable(qwen3_session_test tests/qwen3_session_test.cpp ../core/tests/support/allocation_probe.cpp tests/test_cuda_rng.cu)
   set_target_properties(qwen3_session_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND UNIX)
     target_compile_definitions(qwen3_session_test PRIVATE EDGE_INFER_TEST_CUDA_WRAPPING=1)

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <cuda_runtime.h>
@@ -25,10 +26,6 @@ class CudaWorkspaceArena {
         if (bytes == 0) {
             return false;
         }
-        if (capacity_bytes_ >= bytes) {
-            return false;
-        }
-
         int current_device = 0;
         auto result = cudaGetDevice(&current_device);
         if (result != cudaSuccess) {
@@ -36,8 +33,9 @@ class CudaWorkspaceArena {
                                      std::string(cudaGetErrorString(result)));
         }
         if (base_ptr_ && current_device != device_id_) {
-            throw std::invalid_argument("CUDA workspace must grow on its owning device");
+            throw std::invalid_argument("CUDA workspace must be reserved on its owning device");
         }
+        if (capacity_bytes_ >= bytes) return false;
         void* new_ptr = nullptr;
         result = cudaMalloc(&new_ptr, bytes);
         if (result != cudaSuccess) {
@@ -53,6 +51,12 @@ class CudaWorkspaceArena {
     }
 
     bool reserve_for_plan(const WorkspacePlan& plan) {
+        // cudaMalloc guarantees at least 256-byte base alignment. Larger
+        // requests need a different allocator rather than aligned offsets alone.
+        for (const auto& allocation : plan.allocations()) {
+            if (allocation.alignment > 256)
+                throw std::invalid_argument("CUDA workspace plans support alignment at most 256 bytes");
+        }
         return reserve(plan.total_bytes());
     }
 
@@ -61,9 +65,12 @@ class CudaWorkspaceArena {
     template <typename T, size_t Rank>
     TensorView<T, Rank> bind_view(const WorkspaceAllocation& allocation,
                                  const std::array<size_t, Rank>& shape) {
-        if (allocation.offset > capacity_bytes_ ||
+        if (!allocation.bytes || allocation.offset > capacity_bytes_ ||
             allocation.bytes > capacity_bytes_ - allocation.offset ||
-            allocation.offset % alignof(T)) {
+            !allocation.alignment || (allocation.alignment & (allocation.alignment - 1)) ||
+            allocation.alignment > 256 ||
+            (reinterpret_cast<std::uintptr_t>(base_ptr_) + allocation.offset) % allocation.alignment ||
+            (reinterpret_cast<std::uintptr_t>(base_ptr_) + allocation.offset) % alignof(T)) {
             throw std::invalid_argument("Workspace allocation cannot be bound to this arena");
         }
         auto result = TensorView<T, Rank>::contiguous(ptr_at<T>(allocation.offset), shape);

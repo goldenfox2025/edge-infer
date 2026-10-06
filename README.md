@@ -1,50 +1,61 @@
 # edge-infer
 
-A C++17/CUDA inference project for on-device language and speech generation.
-The current implementation contains Qwen/Qwen3 language-model paths and a first
-native Qwen3-TTS conditioning stage for NVIDIA GPUs. NVIDIA desktops are the first validation target,
-followed by a specific Jetson/JetPack configuration.
+A C++17/CUDA inference library for language models on NVIDIA devices, with
+shared prepared weights, independent bounded sessions and direct operators.
+The maintained branch is `master`. The repository was previously named
+`LLM_infer`; its history is preserved.
 
-Shared memory utilities, independent operators and a native C++ runtime form the
-inference foundation. Python bindings and the frontend are optional consumers.
-Models compose operators; the extension target is a model implementation plus
-configuration and weight mapping. Qwen3 separates shared prepared weights from
-dedicated execution sessions with private fixed decode storage and streams.
-Native sessions share prepared weights and own a caller-sized KV cache;
-see the [session API](docs/native-runtime.md#shared-qwen3-weights-and-dedicated-execution).
-The project explores BF16 and AWQ kernels, KV-cache management, CUDA Graphs and
-workspace planning. It is experimental and has not established full model parity.
+## Structure
 
-The repository began with the
-[LearningInfiniTensor Rust inference exercises](https://github.com/LearningInfiniTensor/learning-lm-rs)
-and evolved into this C++/CUDA implementation. Upstream exercises and external
-libraries must be distinguished from the engine's own implementation.
+```text
+core/                Tensor ownership, fixed borrowed views, workspace planning
+operators/           Independent CPU references and direct CUDA kernels
+runtime/             Prepared models, decoder, sessions, KV cache and generation
+bindings/python/     Optional model loading boundary and Model/Session bindings
+frontend/            Local safetensors loading and terminal chat
+tools/validation/    Reproducible checkpoint and reference checks
+```
 
-## Current status
+The compute library depends on CUDA/cuBLAS and portable core headers. It has no
+model-runtime, Python, Tensor-ownership, operator-factory or global-pool dependency.
+Operators receive fixed-rank borrowed views, explicit execution resources and
+caller-owned scratch. Models compose those operators through one transformer
+decoder, shared by prefill, eager decode and CUDA Graph decode.
 
-`master` is the maintained development branch. The repository was previously
-named `LLM_infer`; its history remains intact. Historical source is preserved in
-Git history and the `legacy-before-restructure` tag.
+A prepared model owns immutable weights. Each session owns its stream, handle,
+KV cache and planned workspace. Decode storage is fixed; prefill storage grows
+at a preparation boundary and is reused. Workspace lifetimes allow dead
+intermediates to share storage. Alignment, peak prefill capacity and library
+workspaces still consume memory.
 
-| Area | Status |
+See [architecture](docs/architecture.md), [native API](docs/native-runtime.md),
+[Python API](docs/python-api.md) and [operators](operators/README.md).
+
+## Implemented scope
+
+| Area | Current scope |
 | --- | --- |
-| Workspace planning and lifetime analysis | Standalone C++17 tests; no CUDA or Python dependency |
-| Native C++ runtime | Separate `EdgeInfer::runtime` target; Python bindings are optional |
-| Dedicated decoding sessions | Native Qwen3 model/session split, fixed decode buffers and private cache storage; Python still exposes one guarded session |
-| CUDA operators and `model_bridge` | CUDA build and direct operator tests validated; full model correctness remains pending |
-| Qwen/Qwen3 BF16 and AWQ paths | Implemented; not an established compatibility matrix |
-| Speculative decoding | Experimental; probability rejection/resampling needs a correctness review |
-| Desktop NVIDIA GPU | Current development target; historical measurements used RTX 4070 Laptop |
-| Jetson ARM64 / JetPack | Planned validation target; not verified or supported by this README |
-| Qwen3-TTS 0.6B Base / CustomVoice | Native text projection and audio-code embedding composition; talker, code predictor and waveform generation remain pending |
+| Language models | Qwen3 and Qwen2/Llama-style dense decoder paths; BF16 and AWQ CUDA operators |
+| Sessions | Shared weights, independent caller-sized caches, reset/reuse and fixed decode storage |
+| Generation | Greedy and top-k/top-p sampling; native speculation uses exact greedy verification |
+| Speech | Qwen3-TTS text projection and audio-code embedding composition; embedding-to-hidden decoder boundary |
+| CPU | FP32 model reference and portable operator references; no optimized heterogeneous executor yet |
+| Platforms | Local verification on RTX 4070 Laptop / WSL Ubuntu 24.04; Jetson validation pending |
 
-Passing the workspace tests does not establish model correctness, GPU performance,
-or Jetson support. The existing Tensor-based operator test still requires the CUDA build
-because `Tensor` currently includes CUDA types. A CPU model product is not implied.
+Full Qwen3-TTS talker, MRoPE, code predictor, codec and waveform generation are
+not implemented. A new checkpoint variant can reuse configuration and weight
+mapping. A new architecture may require additional operators and validation.
+The harness decides history summarization and truncation; the runtime enforces
+storage capacity and owns inference state.
 
-## Start with the workspace tests
+The [2026-10-06 validation record](docs/validation-2026-10-06.md) describes current
+tests and their limits. Older measurements in `docs/` describe historical
+revisions and are not current performance guarantees.
 
-Requirements: CMake 3.20 or newer and a C++17 compiler. From this checkout:
+## Portable tests
+
+Requirements: CMake 3.20+ and a C++17 compiler. No CUDA, Python or model download
+is required.
 
 ```sh
 cmake -S . -B build-cpu-tests \
@@ -54,212 +65,97 @@ cmake --build build-cpu-tests --parallel 2
 ctest --test-dir build-cpu-tests --output-on-failure
 ```
 
-On Linux or WSL, `bash scripts/test.sh` runs the same workflow. It does not fetch
-CUTLASS, install Python packages, download models, or initialize CUDA.
-
-Recorded check on 2026-10-04: three portable tests passed in WSL Ubuntu 24.04,
-using GCC 13.3 and CMake 3.28.3. The standalone CUDA library also built with
-GCC 12.4 / CUDA 12.0; all five tests passed, including float/BF16 GPU checks
-on RTX 4070 Laptop. See [validation](docs/validation-2026-10-04.md) for scope.
-After the edge-infer rename and runtime extraction, the native configuration
-passed 6/6 tests and the Python-enabled configuration passed 7/7. The isolated
-callback suite passed eight cases without CUDA. See the
-[native runtime validation](docs/validation-native-runtime-2026-10-04.md).
-The first speech migration has its own
-[conditioning validation record](docs/validation-qwen-tts-2026-10-04.md).
-The operator-based Qwen3 decoder and session isolation are covered in the
-[session refactor validation](docs/validation-qwen3-sessions-2026-10-04.md).
-The Docker recipe was not built.
-
-`scripts/test.sh` now runs these workspace unit tests instead of the historical matrix
-benchmark. That benchmark is available only with `-DEDGE_INFER_BUILD_LEGACY_OPERATORS=ON`:
+On Linux/WSL, `bash scripts/test.sh` runs this workflow. The operator API also
+builds independently:
 
 ```sh
-cmake --build build --target avx_matmul_bench --parallel 2
-./build/operators/benchmarks/avx_matmul_bench 1 512 512 512 3 5
+cmake -S operators -B build-operators \
+  -DEDGE_INFER_OPERATORS_ENABLE_CUDA=OFF -DBUILD_TESTING=ON
+cmake --build build-operators --parallel 2
+ctest --test-dir build-operators --output-on-failure
 ```
 
-The historical target name is retained; it does not establish AVX acceleration
-or GPU inference performance.
+## Native CUDA build
 
-## CUDA development setup
+Use a supported Linux CUDA/compiler combination and an NVIDIA driver. Local
+verification uses CUDA 12.0, GCC 12 and compute capability 89. Native Windows
+and Jetson/JetPack support have not been established.
 
-Use a Linux toolchain supported by the selected CUDA toolkit. The desktop
-container recipe uses CUDA 12.6.3 and Ubuntu 24.04. These are recipe inputs,
-and this CUDA 12.6 container configuration has not been validated. The recorded
-full engine build used CUDA 12.0; see the validation report above.
+```sh
+cmake -S . -B build-native \
+  -DEDGE_INFER_BUILD_RUNTIME=ON -DEDGE_INFER_BUILD_PYTHON=OFF \
+  -DCMAKE_CXX_COMPILER=g++-12 -DCMAKE_CUDA_HOST_COMPILER=g++-12 \
+  -DCMAKE_CUDA_ARCHITECTURES=89 -DCMAKE_BUILD_TYPE=Release
+cmake --build build-native --parallel 2
+ctest --test-dir build-native --output-on-failure
+```
 
-Prerequisites: a suitable NVIDIA driver, CUDA toolkit with cuBLAS, CMake,
-a supported C++ compiler, Python development headers and a Python environment.
-The engine contains Linux-specific host code; native Windows support is not
-established. The compiler is selected by CMake instead of a hard-coded path.
+Applications can add this checkout with CMake and link `EdgeInfer::runtime` or
+the independent `EdgeInfer::operators_cuda` target. Checkpoint parsing and
+tokenization belong to the application/frontend; the native API accepts
+validated Tensor weight maps and configuration.
+
+```cpp
+auto model = std::make_shared<Qwen3Model<__nv_bfloat16>>(weights, config);
+auto first = Qwen3Session<__nv_bfloat16>::create(model, 1024);
+auto second = first->new_session(512);
+
+auto logits = first->prefill(std::vector<uint32_t>{3, 7, 11});
+logits = first->decode(uint32_t{19});
+first->reset();
+```
+
+Each session starts with empty history. `prefill` replaces history, `decode`
+appends, and `reset` preserves allocations. Returned logits borrow session
+storage until its next operation. Public calls complete before returning;
+applications serialize operations within a session.
+
+## Python and local chat
 
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -r requirements-build.txt -r requirements-runtime.txt
 python -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
-PYTHON_BIN=python bash scripts/build.sh -- -DCMAKE_CUDA_ARCHITECTURES=89
+PYTHON_BIN=python bash scripts/build.sh -- \
+  -DCMAKE_CXX_COMPILER=g++-12 -DCMAKE_CUDA_HOST_COMPILER=g++-12 \
+  -DCMAKE_CUDA_ARCHITECTURES=89
 ctest --test-dir build --output-on-failure
 ```
 
-The torch CPU wheel is sufficient for the current frontend's host-side weight
-loading; CUDA execution happens in the native module. Model quantization tools
-have additional dependencies and are outside this quickstart. Python versions
-and runtime dependency pins still need frontend and model-level validation.
-The Python 3.12 binding build and import have been checked.
-
-`89` is the original Ada GPU target. Select the architecture for the actual
-device using `CMAKE_CUDA_ARCHITECTURES`; changing this number alone does not
-adapt the engine to Jetson. Jetson needs a matching JetPack/CUDA/compiler stack,
-ARM64 dependency wheels, model checks and measurements on the device.
-
-The default runtime links the direct `EdgeInfer::operators_cuda` compute library
-and does not require CUTLASS. The historical Tensor/factory adapters are optional:
-enable `EDGE_INFER_BUILD_LEGACY_OPERATORS=ON` to build them, then initialize the
-pinned CUTLASS submodule or provide its checkout through `CUTLASS_DIR`.
-Build directories are reused; `--clean` invokes the build system's clean target.
-
-## Native C++ runtime
-
-Build the native runtime without Python, pybind11 or frontend dependencies:
-
-```sh
-cmake -S . -B build-native \
-  -DEDGE_INFER_BUILD_RUNTIME=ON -DEDGE_INFER_BUILD_PYTHON=OFF \
-  -DCMAKE_CUDA_ARCHITECTURES=89 -DCMAKE_BUILD_TYPE=Debug
-cmake --build build-native --parallel 2
-ctest --test-dir build-native --output-on-failure
-```
-
-`bash scripts/build.sh --native` selects the same dependency boundary. Use a
-compiler supported by your CUDA toolkit. An application adding this checkout
-as a CMake subdirectory can link `EdgeInfer::runtime`; the target exports the
-runtime and core headers and its CUDA/operator dependencies.
-
-`model_factory.hpp` accepts native Tensor weight maps and `ModelConfig`, and
-`infer_base` streams token IDs through a C++ callback. Checkpoint loading and
-tokenization still belong to the current Python frontend. Python GIL handling
-is confined to the bindings. This creates a usable C++ integration boundary;
-it does not provide a native checkpoint loader or complete TTS model implementation.
-See [native runtime integration](docs/native-runtime.md) for CMake usage,
-prepared-weight contracts and callback lifetimes.
-
-## Model smoke test
-
-After validating the full engine build, provide a local model directory with
-`config.json`, tokenizer files and safetensors weights. No model is downloaded
-by the build. This is a suggested manual smoke test, not a recorded passing run:
+The CPU Torch wheel is sufficient for host-side checkpoint loading; the native
+module performs CUDA execution. Provide an existing local directory containing
+configuration, tokenizer files and safetensors weights:
 
 ```sh
 PYTHON_BIN=python bash scripts/run.sh \
-  --model_path /absolute/path/to/Qwen3-1.7B \
+  --model_path /absolute/path/to/Qwen3-0.6B \
   --model_type qwen3_bf16 --device cuda \
-  --top_k 1 --temperature 1.0 --max_length 32
+  --context_capacity 1024 --max_new_tokens 32 --top_k 1
 ```
 
-Compare greedy outputs/logits with a reference implementation before making
-performance claims. AWQ and speculative decoding need separate numerical and
-sampling-distribution checks.
+`model_bridge.Model` prepares weights without allocating a generation cache.
+`model.new_session(capacity)` creates independent state. Python
+`session.generate` receives a complete fresh prompt and a total sequence-length
+limit; see [API examples](docs/python-api.md). Loading never downloads models or
+executes checkpoint-provided code.
 
-## Desktop container
+## Development and validation
 
-Build the desktop development image:
+Keep code, comments and documentation in English. Add numerical operator checks
+for new semantics and reference-model checks for new architectures. Record the
+device, checkpoint revision, commands and measured scope before reporting
+performance or compatibility. See [roadmap](docs/roadmap.md),
+[speech integration](docs/speech-integration.md),
+[CPU/GPU cooperation](docs/heterogeneous-inference.md) and [validation tools](tools/README.md).
 
-```sh
-docker build --build-arg CUDA_ARCHITECTURES=89 -t edge-infer-dev .
-docker run --rm -it --gpus all -v /absolute/path/to/models:/models:ro edge-infer-dev
-```
+CI runs portable tests and a GPU-free CUDA 12.0.1/GCC 12 build with CPU binding
+integration. GPU tests use explicit skip code 77 when hardware is absent;
+compilation and skipped tests do not establish GPU numerical correctness.
+The [Docker recipe](Dockerfile) uses the same desktop toolchain. Its local build
+status is recorded separately from native testing.
 
-The recipe copies `operators/` and its test sources, and does not clone a moving
-dependency revision. The current image recipe has not been built during native validation.
-It is a desktop development image, not a Jetson image.
-
-## Code map and next work
-
-- `core/`: shared tensors, weight views, CUDA memory and portable workspace planning.
-- `runtime/include/execution/`: the shared transformer backbone and planned CUDA workspaces.
-- `runtime/src/`: models, inference flow, KV-cache and CUDA Graph integration.
-- `runtime/include/speech/`: concrete Qwen TTS stage contracts, starting with conditioning.
-- `runtime/CMakeLists.txt`: the native `EdgeInfer::runtime` library.
-- `operators/`: operator interfaces, CPU utilities, CUDA implementations and legacy kernels.
-- `bindings/python/`: model initialization, weight conversion and Python bindings.
-- `frontend/`: local model loading and terminal interaction.
-- `operators/tests/`: portable workspace and static reference checks, plus CUDA-dependent Tensor tests.
-- `tools/`: model analysis, quantization and manual reference checks.
-- `scripts/`: build, test, run and profiling entry points.
-- `docs/`: architecture, development directions and historical measurements.
-
-Keep execution planning separate from model logic and CUDA kernel implementation.
-The next release gates are repeatable CUDA CI, broader GPU operator coverage,
-model-level greedy parity, session integration for other models, a review of speculative resampling, and reproducible
-benchmarks. Platform-specific changes should follow measurements on the chosen
-NVIDIA device instead of speculative abstraction work.
-
-## Extending to speech
-
-`QwenTtsConditioner<float>` and `QwenTtsConditioner<__nv_bfloat16>` implement the
-shared text projection (biased Linear, SiLU, biased Linear) and composition of
-all audio-codebook embeddings with aligned text. They borrow device weights,
-buffers, FP32 workspace, a cuBLAS handle and a stream; they have no Torch or
-Python dependency. Selected real 0.6B Base checkpoint rows and full projection
-weights are compared with a pinned official Torch reference.
-
-The local checkpoint inspection tool maps the conditioning weights of 0.6B
-Base and CustomVoice without converting payloads. The full speech decoder is
-the next stage: an embedding-to-hidden-state transformer backbone, a talker,
-a per-frame code predictor, then an audio codec. Speech execution has its own
-contracts alongside the existing text model. See the
-[speech integration plan](docs/speech-integration.md) for component boundaries
-and validation gates, and [developer tools](tools/README.md) to reproduce the
-reference checks. Voice cloning, preset voices and waveform streaming are
-not yet exposed by edge-infer.
-
-## Measurements and license
-
-The [2025 experiment report](docs/benchmarks-2025.md) is preserved as historical
-material. It reported the best of five runs, without a complete baseline version
-and command record. Its speedups have not been reproduced for the maintained revision and
-are not current performance guarantees.
-
-The project currently has no top-level license. Third-party components retain
-their own terms; the engine's license and attribution need to be resolved before
-a release intended for reuse.
-
-## Standalone operator library
-
-Build the portable API without the inference runtime, Python or CUDA:
-
-```sh
-cmake -S operators -B build-operators \
-  -DEDGE_INFER_OPERATORS_ENABLE_CUDA=OFF -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Debug
-cmake --build build-operators --parallel 2
-ctest --test-dir build-operators --output-on-failure
-```
-
-This build uses the sibling `core/` directory. `EdgeInfer::operators_core`
-exposes borrowed views, workspace planning and inline CPU reference functions.
-With CUDA enabled, `EdgeInfer::operators_cuda` provides direct dense/AWQ linear,
-gather, RoPE, attention, KV stores, sampling and conditioning primitives. The
-compute target requires cudart and cuBLAS, and excludes Tensor ownership,
-operator factories and global memory-pool symbols. Callers own execution
-contexts and scratch; the runtime resolves fixed views and workspace offsets
-before execution. `EdgeInfer::unified_operators` is available only through
-`EDGE_INFER_BUILD_LEGACY_OPERATORS=ON` and requires the pinned CUTLASS checkout.
-CUDA library overhead remains; these boundaries establish no performance or
-complete TTS claim. See [architecture](docs/architecture.md) and [roadmap](docs/roadmap.md).
-
-Keep documentation, comments and diagnostics in English. Model input data may
-contain any language. Develop against `master`, and validate fused operations
-against unfused references before replacing production calls.
-
-## Profiling
-
-Use the same model arguments as the run script; reports go to `data/` or the
-`PROFILE_DIR` you provide. The tools need the appropriate profiler permissions
-on your system.
-
-```sh
-bash scripts/profile.sh nsys --model_path /absolute/path/to/model --model_type qwen3_bf16
-bash scripts/profile.sh ncu --model_path /absolute/path/to/model --model_type qwen3_bf16
-```
+The project originated from the
+[LearningInfiniTensor Rust exercises](https://github.com/LearningInfiniTensor/learning-lm-rs)
+and evolved into this implementation. There is currently no top-level license;
+licensing and upstream attribution remain a release decision.
