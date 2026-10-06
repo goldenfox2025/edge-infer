@@ -48,6 +48,8 @@ jobs:
           .venv-tests/bin/python -m pip install -r requirements-runtime.txt
           .venv-tests/bin/python -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
           .venv-tests/bin/python -m unittest discover -s frontend/tests -p test_checkpoint.py -v
+      - name: Check saved Qwen3 reference artifact contracts on CPU
+        run: .venv-tests/bin/python -m unittest discover -s tools/validation/tests -p test_qwen3_reference_artifacts.py -v
 
   cuda-compile:
     runs-on: ubuntu-24.04

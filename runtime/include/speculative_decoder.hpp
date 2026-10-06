@@ -26,13 +26,30 @@ class SpeculativeDecoder : public infer_base {
   void generate_with_callback(const std::vector<uint32_t>& input_ids, size_t max_length,
                               float temperature, float top_p, size_t top_k,
                               std::function<void(uint32_t)> callback) override;
-  Device device() const override { return Device::CUDA; }
+  Device device() const override {
+    require_valid();
+    return Device::CUDA;
+  }
   void reset() override;
-  size_t context_size() const override { return target_kv_cache_.size(); }
-  size_t context_capacity() const override { return target_kv_cache_.get_max_seq_len(); }
-  size_t get_spec_length() const { return spec_length_; }
+  size_t context_size() const override {
+    require_valid();
+    return target_kv_cache_.size();
+  }
+  size_t context_capacity() const override {
+    require_valid();
+    return target_kv_cache_.get_max_seq_len();
+  }
+  size_t get_spec_length() const {
+    require_valid();
+    return spec_length_;
+  }
 
  private:
+  void require_valid() const {
+    if (!valid_)
+      throw std::logic_error("Executor completion failed; construct a new speculative decoder");
+  }
+  bool valid_ = true;
   static constexpr size_t MAX_SPEC_LENGTH = 8;
   std::shared_ptr<BaseModel> target_model_;
   std::shared_ptr<BaseModel> draft_model_;
@@ -63,6 +80,7 @@ class SpeculativeDecoder : public infer_base {
   std::vector<Tensor<uint32_t>> batch_inputs_;
 
   void init_cuda_resources();
+  void complete_execution();
   void free_cuda_resources() noexcept;
   void generate_draft_tokens(size_t count, float temperature, float top_p);
   TensorView<T, 2> verify_logits(size_t count);

@@ -9,9 +9,6 @@
 #include "operators/cuda/random.hpp"
 #include "operators/cuda/execution.hpp"
 
-enum class Signal { EndOfStream };
-using GenerationResult = std::variant<uint32_t, Signal, std::exception_ptr>;
-
 namespace {
 
 uint32_t read_token_from_device(uint32_t* token_ptr, Device device) {
@@ -307,20 +304,25 @@ uint32_t* InferenceEngine<T>::generate_next_token(ThreadPool& thread_pool, uint3
   require_valid();
   if (!input_ids) throw std::invalid_argument("Decode requires a token pointer");
   validate_request_sampling(*model_, device_, temperature, top_p, top_k);
+  if (kv_cache_.size() >= kv_cache_.get_max_seq_len())
+    throw std::length_error("Engine context capacity exhausted");
   EngineDeviceScope device_scope(device_ == Device::CUDA ? cuda_device_id_ : -1);
-  if (device_ == Device::CUDA) {
-    checkCudaErrors(cudaMemcpy(decode_input_.data_ptr(), input_ids, sizeof(uint32_t), cudaMemcpyDeviceToDevice));
-    checkCudaErrors(cudaStreamSynchronize(nullptr));
-  } else {
-    decode_input_.data_ptr()[0] = *input_ids;
-  }
-  const size_t previous = kv_cache_.size();
   try {
-    kv_cache_.resize(previous + 1);
+    if (device_ == Device::CUDA) {
+      checkCudaErrors(cudaMemcpy(decode_input_.data_ptr(), input_ids, sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+      checkCudaErrors(cudaStreamSynchronize(nullptr));
+    } else {
+      decode_input_.data_ptr()[0] = *input_ids;
+    }
+    kv_cache_.resize(kv_cache_.size() + 1);
     return model_->forward(&decode_input_, thread_pool, &kv_cache_, top_k, temperature, top_p, d_states);
   } catch (...) {
-    kv_cache_.resize(previous);
-    throw;
+    const auto original_error = std::current_exception();
+    try { model_->synchronize(); } catch (...) { valid_ = false; }
+    // Execution may already have overwritten or explicitly discarded history.
+    // Never resurrect it by restoring the previous logical length.
+    if (valid_) kv_cache_.clear();
+    std::rethrow_exception(original_error);
   }
 }
 
@@ -344,13 +346,14 @@ void InferenceEngine<T>::warmup(size_t warmup_tokens, bool force_warmup,
     if (!token) throw std::runtime_error("Warmup prefill returned a null token");
     if (count < kv_cache_.get_max_seq_len())
       generate_next_token(thread_pool_, token, temperature, top_p, top_k);
-    model_->synchronize();
+    try { model_->synchronize(); } catch (...) { valid_ = false; throw; }
     kv_cache_.clear();
     has_warmed_up_ = true;
   } catch (...) {
-    try { model_->synchronize(); } catch (...) {}
-    kv_cache_.clear();
-    throw;
+    const auto original_error = std::current_exception();
+    try { model_->synchronize(); } catch (...) { valid_ = false; }
+    if (valid_) kv_cache_.clear();
+    std::rethrow_exception(original_error);
   }
 }
 
@@ -378,11 +381,13 @@ void InferenceEngine<T>::generate_with_callback(const std::vector<uint32_t>& inp
   if (device_ == Device::CUDA)
     warmup(benchmark_mode_ ? benchmark_warmup_tokens_ : 64, benchmark_mode_, temperature, top_p, top_k);
 
-  ThreadSafeQueue<GenerationResult> results;
-  std::thread worker([&, this]() {
-    try {
+  try {
+    uint32_t* token_ptr = nullptr;
+    Tensor<uint32_t> prompt;
+    {
+      // Select the executor's device only for native work. A callback may use
+      // another device; its caller-thread CUDA selection remains its own.
       EngineDeviceScope device_scope(device_ == Device::CUDA ? cuda_device_id_ : -1);
-      Tensor<uint32_t> prompt;
       if (device_ == Device::CUDA) {
         prompt = Tensor<uint32_t>::from_external_buffer(
             prompt_storage_.template ptr_at<uint32_t>(0), {input_ids.size()}, Device::CUDA);
@@ -392,51 +397,44 @@ void InferenceEngine<T>::generate_with_callback(const std::vector<uint32_t>& inp
       } else {
         prompt = Tensor<uint32_t>(std::vector<uint32_t>(input_ids), {input_ids.size()}, Device::CPU);
       }
-      uint32_t* token_ptr = nullptr;
-      const size_t previous = kv_cache_.size();
-      try {
-        kv_cache_.resize(previous + input_ids.size());
-        token_ptr = model_->prefill(&prompt, thread_pool_, &kv_cache_, top_k, temperature, top_p, d_states);
-      } catch (...) {
-        kv_cache_.resize(previous);
-        throw;
-      }
-      std::unique_ptr<uint32_t> cpu_token(device_ == Device::CPU ? token_ptr : nullptr);
-      size_t total_length = input_ids.size();
-      while (true) {
-        const uint32_t token = read_token_from_device(token_ptr, device_);
-        validate_token_id(model_.get(), token, "generation");
-        ++total_length;
-        if (token == model_->get_eos_token_id()) break;
-        results.push(token);
-        if (total_length >= limit || kv_cache_.size() >= kv_cache_.get_max_seq_len()) break;
-        token_ptr = generate_next_token(thread_pool_, token_ptr, temperature, top_p, top_k);
-        if (device_ == Device::CPU) cpu_token.reset(token_ptr);
-      }
-      results.push(Signal::EndOfStream);
-    } catch (...) {
-      results.push(std::current_exception());
+      kv_cache_.resize(input_ids.size());
+      token_ptr = model_->prefill(&prompt, thread_pool_, &kv_cache_, top_k, temperature, top_p, d_states);
     }
-  });
-  try {
+    std::unique_ptr<uint32_t> cpu_token(device_ == Device::CPU ? token_ptr : nullptr);
+    size_t total_length = input_ids.size();
     while (true) {
-      auto result = results.pop();
-      if (auto* token = std::get_if<uint32_t>(&result)) callback(*token);
-      else if (auto* error = std::get_if<std::exception_ptr>(&result)) std::rethrow_exception(*error);
-      else break;
+      uint32_t token;
+      {
+        EngineDeviceScope device_scope(device_ == Device::CUDA ? cuda_device_id_ : -1);
+        token = read_token_from_device(token_ptr, device_);
+        validate_token_id(model_.get(), token, "generation");
+      }
+      ++total_length;
+      if (token == model_->get_eos_token_id()) break;
+      callback(token);
+      if (total_length >= limit || kv_cache_.size() >= kv_cache_.get_max_seq_len()) break;
+      token_ptr = generate_next_token(thread_pool_, token_ptr, temperature, top_p, top_k);
+      if (device_ == Device::CPU) cpu_token.reset(token_ptr);
     }
   } catch (...) {
-    worker.join();
-    throw;
+    const auto original_error = std::current_exception();
+    // Preserve the operation/callback failure even if completion also fails.
+    // A completion failure keeps backing storage in place and invalidates the
+    // engine, so no public operation can reuse potentially unfinished state.
+    try {
+      EngineDeviceScope device_scope(device_ == Device::CUDA ? cuda_device_id_ : -1);
+      model_->synchronize();
+    } catch (...) { valid_ = false; }
+    if (valid_) kv_cache_.clear();
+    std::rethrow_exception(original_error);
   }
-  worker.join();
 }
 
 template <typename T>
 void InferenceEngine<T>::reset() {
   require_valid();
   EngineDeviceScope device_scope(device_ == Device::CUDA ? cuda_device_id_ : -1);
-  model_->synchronize();
+  try { model_->synchronize(); } catch (...) { valid_ = false; throw; }
   kv_cache_.clear();
 }
 

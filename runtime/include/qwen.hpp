@@ -12,6 +12,9 @@ enum class SampleMode { GPU, CPU };
 
 // Qwen2/Llama checkpoints use the same prepared decoder as Qwen3, with Q/K
 // normalization disabled. FP32 CPU execution is a direct reference path.
+// Executors share privately prepared weights and own mutable workspaces and
+// sampling state. Callers serialize operations on each executor; independent
+// CPU executors may run concurrently while their shared weights remain read-only.
 template <typename T>
 class QwenModel : public BaseModel, public SpeculativeModel<T> {
  public:
@@ -77,6 +80,8 @@ class QwenModel : public BaseModel, public SpeculativeModel<T> {
 
  private:
     struct ForkExecutorTag {};
+    // Checkpoint constructors snapshot caller storage. Only an already prepared
+    // prototype can share that private weight storage with a new executor.
     QwenModel(const QwenModel& prototype, ForkExecutorTag);
 
     struct CpuLinear {

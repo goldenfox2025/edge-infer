@@ -44,6 +44,11 @@ target_link_libraries(inference_runtime PUBLIC
 set_target_properties(inference_runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if(BUILD_TESTING)
+  add_executable(decoder_output_plan_test tests/decoder_output_plan_test.cpp)
+  target_link_libraries(decoder_output_plan_test PRIVATE EdgeInfer::runtime)
+  add_test(NAME decoder_output_plan_test COMMAND decoder_output_plan_test)
+  set_tests_properties(decoder_output_plan_test PROPERTIES
+    LABELS "runtime;cpu;workspace" TIMEOUT 15)
   include_directories("${CMAKE_CURRENT_SOURCE_DIR}/../core/tests/support")
   add_executable(cuda_workspace_arena_test tests/cuda_workspace_arena_test.cpp)
   target_link_libraries(cuda_workspace_arena_test PRIVATE EdgeInfer::runtime)
@@ -67,7 +72,8 @@ if(BUILD_TESTING)
     target_compile_definitions(qwen3_session_test PRIVATE EDGE_INFER_TEST_CUDA_WRAPPING=1)
     target_link_options(qwen3_session_test PRIVATE
       LINKER:--wrap=cudaMalloc LINKER:--wrap=cudaMallocAsync
-      LINKER:--wrap=cudaFree LINKER:--wrap=cudaFreeAsync)
+      LINKER:--wrap=cudaFree LINKER:--wrap=cudaFreeAsync
+      LINKER:--wrap=cublasGemmEx LINKER:--wrap=cudaStreamSynchronize)
   endif()
   target_link_libraries(qwen3_session_test PRIVATE EdgeInfer::runtime)
   add_test(NAME qwen3_session_test COMMAND qwen3_session_test)
@@ -77,6 +83,11 @@ if(BUILD_TESTING)
   target_link_libraries(qwen2_float_test PRIVATE EdgeInfer::runtime)
   add_test(NAME qwen2_float_test COMMAND qwen2_float_test)
   set_tests_properties(qwen2_float_test PROPERTIES LABELS "runtime;cuda;gpu;reference" SKIP_RETURN_CODE 77 TIMEOUT 120)
+  add_executable(qwen_cpu_session_test tests/qwen_cpu_session_test.cpp)
+  target_link_libraries(qwen_cpu_session_test PRIVATE EdgeInfer::runtime)
+  add_test(NAME qwen_cpu_session_test COMMAND qwen_cpu_session_test)
+  set_tests_properties(qwen_cpu_session_test PROPERTIES
+    LABELS "runtime;cpu;session;storage" TIMEOUT 30)
   add_executable(inference_generation_test tests/inference_generation_test.cpp)
   target_link_libraries(inference_generation_test PRIVATE EdgeInfer::runtime)
   add_test(NAME inference_generation_test COMMAND inference_generation_test)

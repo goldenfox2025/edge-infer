@@ -1,7 +1,11 @@
 # Validation and numerical attribution: 2026-10-06
 
-This checkpoint records current local tests and the investigation that motivated
-the RoPE correction. Passing operator tests does not establish full-model logit
+This record covers the published baseline at
+`6fafb0213197b08a13b379a73b81ab42be86bf29` and the investigation that motivated
+the RoPE correction. References to the current implementation below mean that
+baseline. The later [runtime-contract validation](validation-runtime-contracts-2026-10-06.md)
+records the subsequent cleanup and checkpoint rerun.
+Passing operator tests does not establish full-model logit
 fidelity or a performance release. The original strict checkpoint comparison
 remains a recorded failure; its tolerance has not changed.
 
@@ -18,7 +22,7 @@ The dense `Qwen/Qwen3-0.6B` checkpoint is pinned to revision
 payload has SHA256
 `f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b`.
 
-## Current independent validation
+## Baseline independent validation
 
 | Configuration | CTest result | CTest skips |
 | --- | ---: | ---: |

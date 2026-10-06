@@ -48,8 +48,8 @@ mapping. A new architecture may require additional operators and validation.
 The harness decides history summarization and truncation; the runtime enforces
 storage capacity and owns inference state.
 
-The [2026-10-06 validation record](docs/validation-2026-10-06.md) describes current
-tests and their limits. Older measurements in `docs/` describe historical
+The [runtime-contract validation record](docs/validation-runtime-contracts-2026-10-06.md)
+describes current tests and their limits. Older measurements in `docs/` describe historical
 revisions and are not current performance guarantees.
 
 ## Portable tests
@@ -107,8 +107,10 @@ first->reset();
 
 Each session starts with empty history. `prefill` replaces history, `decode`
 appends, and `reset` preserves allocations. Returned logits borrow session
-storage until its next operation. Public calls complete before returning;
-applications serialize operations within a session.
+storage until its next operation. Successful calls complete before returning;
+applications serialize operations within a session. Failed completion makes
+that session unusable; see native integration for recovery and borrowed-storage
+lifetimes.
 
 ## Python and local chat
 

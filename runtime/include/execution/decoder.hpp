@@ -9,6 +9,7 @@
 #include "operators/cuda/execution.hpp"
 
 enum class DecoderMode { Decode, Prefill, Graph };
+enum class DecoderOutput { Hidden, Logits };
 
 // Logical RoPE positions and physical KV slots are deliberately independent.
 struct DecoderStep {
@@ -31,7 +32,8 @@ struct DecoderBuffers {
 // Inclusive lifetimes describe one block. Blocks execute sequentially and
 // reuse this layout; residual remains live across every block and the head.
 template <typename T>
-WorkspacePlan plan_decoder_workspace(const Qwen3Config& c, size_t rows) {
+WorkspacePlan plan_decoder_workspace(const Qwen3Config& c, size_t rows,
+                                     DecoderOutput output = DecoderOutput::Logits) {
   if (!rows || rows > c.max_position_embeddings)
     throw std::invalid_argument("Decoder workspace rows exceed model context");
   WorkspacePlanner p;
@@ -53,7 +55,7 @@ WorkspacePlan plan_decoder_workspace(const Qwen3Config& c, size_t rows) {
   value("up", c.intermediate_size, 12, 14);
   value("ffn", c.hidden_size, 15, 16);
   value("final_norm", c.hidden_size, 17, 18);
-  value("logits", c.vocab_size, 18, 19);
+  if (output == DecoderOutput::Logits) value("logits", c.vocab_size, 18, 19);
   // Fast decode splits attention into five branches. Prefill needs no scratch.
   const size_t scratch = rows == 1 ? 5 * c.n_heads * (c.head_dim + 2) : 1;
   if (scratch > std::numeric_limits<size_t>::max() / sizeof(float))
@@ -81,7 +83,7 @@ DecoderBuffers<T> resolve_decoder_buffers(const Qwen3Config& c, size_t rows,
           take("gate", c.intermediate_size),
           take("up", c.intermediate_size),
           take("ffn", c.hidden_size),
-          take("logits", c.vocab_size),
+          plan.has_allocation("logits") ? take("logits", c.vocab_size) : TensorView<T, 2>{},
           {arena.template ptr_at<float>(plan.at("attention_scratch").offset),
            {plan.at("attention_scratch").bytes / sizeof(float)},
            {1}}};

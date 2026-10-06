@@ -23,6 +23,52 @@
 #include "tensor_view_adapter.hpp"
 #include "test_cuda_rng.hpp"
 
+#ifdef EDGE_INFER_TEST_CUDA_WRAPPING
+namespace test_session_failure {
+thread_local cudaStream_t stream = nullptr;
+thread_local cudaEvent_t submitted = nullptr;
+thread_local bool fail_gemm = false, gemm_failed = false, fail_wait = false;
+thread_local size_t completion_attempts = 0, actual_completions = 0;
+thread_local size_t gemms_until_failure = 0;
+}  // namespace test_session_failure
+
+extern "C" cublasStatus_t __real_cublasGemmEx(
+    cublasHandle_t, cublasOperation_t, cublasOperation_t, int, int, int,
+    const void*, const void*, cudaDataType_t, int, const void*, cudaDataType_t, int,
+    const void*, void*, cudaDataType_t, int, cublasComputeType_t, cublasGemmAlgo_t);
+extern "C" cublasStatus_t __wrap_cublasGemmEx(
+    cublasHandle_t handle, cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k,
+    const void* alpha, const void* a, cudaDataType_t a_type, int lda,
+    const void* b, cudaDataType_t b_type, int ldb, const void* beta,
+    void* c, cudaDataType_t c_type, int ldc, cublasComputeType_t compute, cublasGemmAlgo_t algorithm) {
+  cudaStream_t stream = nullptr;
+  if (test_session_failure::fail_gemm &&
+      cublasGetStream(handle, &stream) == CUBLAS_STATUS_SUCCESS &&
+      stream == test_session_failure::stream && --test_session_failure::gemms_until_failure == 0) {
+    test_session_failure::fail_gemm = false;
+    test_session_failure::gemm_failed = true;
+    // Copy, normalization and KV writes were queued before this rejected GEMM.
+    // An event marks their completion without causing a real CUDA fault.
+    if (cudaEventRecord(test_session_failure::submitted, stream) != cudaSuccess)
+      return CUBLAS_STATUS_INTERNAL_ERROR;
+    return CUBLAS_STATUS_EXECUTION_FAILED;
+  }
+  return __real_cublasGemmEx(handle, transa, transb, m, n, k, alpha, a, a_type, lda,
+                           b, b_type, ldb, beta, c, c_type, ldc, compute, algorithm);
+}
+extern "C" cudaError_t __real_cudaStreamSynchronize(cudaStream_t);
+extern "C" cudaError_t __wrap_cudaStreamSynchronize(cudaStream_t stream) {
+  if (test_session_failure::gemm_failed && stream == test_session_failure::stream) {
+    ++test_session_failure::completion_attempts;
+    if (test_session_failure::fail_wait) return cudaErrorUnknown;
+    const auto status = __real_cudaStreamSynchronize(stream);
+    if (status == cudaSuccess) ++test_session_failure::actual_completions;
+    return status;
+  }
+  return __real_cudaStreamSynchronize(stream);
+}
+#endif
+
 namespace {
 
 using BFloat16 = __nv_bfloat16;
@@ -1315,6 +1361,9 @@ void embedding_session_test(const Weights& source, bool graph) {
   auto hidden_a = a->prefill_embeddings(view_a);
   const auto held_a = download(hidden_a);
   auto hidden_b = b->prefill_embeddings(view_b);
+  require(a->prefill_workspace_bytes() ==
+              a->estimate_embedding_prefill_workspace_bytes(kA.prompt.size()),
+          "Embedding-only prefill must allocate its hidden-output plan");
   auto expected_a = token_a->prefill(kA.prompt);
   auto expected_b = token_b->prefill(kB.prompt.data(), kB.prompt.size());
   require(hidden_a.shape == std::array<std::size_t, 2>{kA.prompt.size(), kHidden} &&
@@ -1471,6 +1520,18 @@ void embedding_session_test(const Weights& source, bool graph) {
   expected_a = token_a->prefill(kA.prompt);
   near_values(download(expected_a), scalar_head(source, hidden_a),
               "Repeated embedding prefill after reset");
+  // Identical row counts still need different plans when the output switches.
+  auto same_session_logits = a->prefill(kA.prompt);
+  equal_values(download(expected_a), download(same_session_logits),
+               "Token prefill after same-length hidden-output plan");
+  require(a->prefill_workspace_bytes() >= a->estimate_prefill_workspace_bytes(kA.prompt.size()),
+          "Switching to token output must provide head storage");
+  const auto peak_bytes = a->prefill_workspace_bytes();
+  hidden_a = a->prefill_embeddings(view_a);
+  near_values(download(expected_a), scalar_head(source, hidden_a),
+              "Hidden prefill after same-length token-output plan");
+  require(a->prefill_workspace_bytes() == peak_bytes,
+          "Switching output contracts must retain reusable peak arena capacity");
   std::cout << "Embedding sessions with token graphs " << (graph ? "enabled" : "disabled")
             << ": independent scalar-head parity, compact shifted cache, warm C++ allocations="
             << total.host_allocations;
@@ -1479,6 +1540,117 @@ void embedding_session_test(const Weights& source, bool graph) {
 #endif
   std::cout << '\n';
 }
+
+#ifdef EDGE_INFER_TEST_CUDA_WRAPPING
+class InjectedSessionFailure {
+ public:
+  InjectedSessionFailure(cudaStream_t stream, bool fail_completion) : stream_(stream) {
+    cuda_check(cudaEventCreateWithFlags(&event_, cudaEventDisableTiming));
+    test_session_failure::stream = stream;
+    test_session_failure::submitted = event_;
+    test_session_failure::fail_gemm = true;
+    test_session_failure::gemm_failed = false;
+    test_session_failure::fail_wait = fail_completion;
+    test_session_failure::completion_attempts = 0;
+    test_session_failure::actual_completions = 0;
+    // Reject output projection after attention has consumed submitted K/V.
+    test_session_failure::gemms_until_failure = 4;
+  }
+  ~InjectedSessionFailure() {
+    // Even failed assertions drain real work before borrowed fixtures die.
+    test_session_failure::fail_gemm = false;
+    test_session_failure::fail_wait = false;
+    test_session_failure::gemm_failed = false;
+    __real_cudaStreamSynchronize(stream_);
+    cudaEventDestroy(event_);
+    test_session_failure::stream = nullptr;
+    test_session_failure::submitted = nullptr;
+  }
+  void allow_completion() { test_session_failure::fail_wait = false; }
+  cudaEvent_t event() const { return event_; }
+
+ private:
+  cudaStream_t stream_;
+  cudaEvent_t event_ = nullptr;
+};
+
+void execution_failure_completion_test(const Weights& source) {
+  const auto model = std::make_shared<const Model>(source, config());
+  const auto expected = isolated(source, kA, false);
+  for (bool failed_completion : {false, true}) {
+    for (int route = 0; route < 3; ++route) {
+      auto session = Session::create(model, kCapacity);
+      auto sibling = session->new_session(kCapacity);
+      auto tokens = input(kA.prompt);
+      auto embeddings = gathered_embeddings(source, kA.prompt);
+      auto held = session->prefill(borrow_tensor_view<1>(tokens).as_const());
+      auto sibling_held = sibling->prefill(kA.prompt);
+      const auto sibling_before = download(sibling_held);
+      const auto previous = session->context_size();
+      const auto decode_bytes = session->decode_workspace_bytes();
+      const auto prefill_bytes = session->prefill_workspace_bytes();
+      InjectedSessionFailure injection(session->stream(), failed_completion);
+      const auto operation = [&] {
+        if (route == 0) session->prefill(borrow_tensor_view<1>(tokens).as_const());
+        else if (route == 1) session->prefill(kA.prompt);
+        else session->prefill_embeddings(borrow_tensor_view<2>(embeddings).as_const());
+      };
+      std::string original_error;
+      test_alloc::Scope allocations;
+      try {
+        operation();
+      } catch (const std::exception& error) {
+        original_error = error.what();
+      }
+      const auto counts = allocations.finish();
+      require(original_error == "Direct cuBLAS submission failed: " +
+                                    std::to_string(CUBLAS_STATUS_EXECUTION_FAILED),
+              "Execution cleanup replaced or missed the original GEMM error");
+      require(test_session_failure::completion_attempts > 0,
+              "Execution error returned without attempting its own stream completion");
+      require(counts.device_frees == 0 && session->decode_workspace_bytes() == decode_bytes &&
+                  session->prefill_workspace_bytes() == prefill_bytes,
+              "Execution failure released private storage before confirmed completion");
+      cudaPointerAttributes attributes{};
+      cuda_check(cudaPointerGetAttributes(&attributes, held.data));
+      require(attributes.type == cudaMemoryTypeDevice,
+              "Failed execution lost its retained output allocation");
+      if (failed_completion) {
+        require(test_session_failure::actual_completions == 0 && session->context_size() == previous,
+                "Failed completion cleared history or claimed successful cleanup");
+        const auto rejected = [&](const std::function<void()>& action) {
+          bool unusable = false;
+          try { action(); }
+          catch (const std::exception& error) {
+            unusable = std::string(error.what()).find("unusable") != std::string::npos;
+          }
+          require(unusable, "Poisoned session accepted execution, reset, reconfiguration or fork");
+        };
+        rejected(operation);
+        rejected([&] { session->decode(kA.continuation[0]); });
+        rejected([&] { session->reset(); });
+        rejected([&] { session->set_graph_enabled(true); });
+        rejected([&] { auto child = session->new_session(kCapacity); });
+        rejected([&] { auto child = session->fork_executor(); });
+        injection.allow_completion();
+        session->synchronize();
+        cuda_check(cudaEventQuery(injection.event()));
+        rejected(operation);  // A later successful wait never revives it.
+      } else {
+        require(test_session_failure::actual_completions > 0 && session->context_size() == 0,
+                "Confirmed execution cleanup did not invalidate partially written history");
+        cuda_check(cudaEventQuery(injection.event()));
+        auto recovered = session->prefill(kA.prompt);
+        equal_values(expected[0].logits, download(recovered), "Recovered session after confirmed cleanup");
+      }
+      equal_values(sibling_before, download(sibling_held), "Sibling output after execution failure");
+      auto continued = sibling->decode(kA.continuation[0]);
+      equal_values(expected[1].logits, download(continued), "Sibling continuation after execution failure");
+    }
+  }
+  std::cout << "Controlled execution failures: original error, own-stream drain, sticky poison and sibling isolation\n";
+}
+#endif
 
 }  // namespace
 
@@ -1501,6 +1673,9 @@ int main() {
     cross_mode_test(source);
     embedding_session_test(source, false);
     embedding_session_test(source, true);
+#ifdef EDGE_INFER_TEST_CUDA_WRAPPING
+    execution_failure_completion_test(source);
+#endif
     cuda_check(cudaDeviceSynchronize());
     std::cout << "Qwen3 shared-model session regression passed\n";
     return 0;

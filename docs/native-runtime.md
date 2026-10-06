@@ -66,14 +66,34 @@ only (`top_k=1`); stochastic sampling belongs to an ordinary engine.
 
 ## Lifetime and concurrency
 
-The ordinary engine runs model generation on a worker and invokes token
-callbacks on the calling thread. Generation joins its worker before returning,
-including on callback/worker exceptions. A callback failure currently waits for
-the worker to finish; early cancellation and bounded buffering are future work.
+The ordinary engine runs native token operations and callbacks on the calling
+thread. Each token operation completes before its callback; the callback returns
+before the next decode starts. This provides natural backpressure without a
+producer thread or a queue. Callback failures stop the request before another
+decode is submitted. Generation preserves the original model/callback exception,
+attempts completion on its own executor and then clears the failed request's
+logical cache. If completion also fails, the engine becomes invalid and retains
+its backing storage until teardown; construct a fresh engine before retrying.
+Python bindings release the GIL during native computation and reacquire
+it for callbacks. Applications can schedule requests and asynchronous output
+consumers outside the runtime; callback time contributes directly to generation
+latency.
 Serialize calls and state changes on an engine instance. Each engine forks
 independent mutable execution state while retaining prepared CUDA weights.
 Interleaved session isolation is tested; simultaneous GPU throughput requires
 separate measurement.
+
+Transfers, prefill and token reads select the engine's CUDA device only for
+that native phase. Callback code may select another CUDA device without changing
+the engine's device or having that selection overwritten by the next phase.
+
+Speculative generation also runs callbacks outside its native CUDA phases.
+Reset and failed-request cleanup complete both target/draft executors and both
+owned sampling streams before clearing either logical cache. Cleanup attempts
+each completion even when another fails, preserving the original request error.
+If any completion fails, the decoder becomes invalid and retains both caches
+and execution buffers until teardown. Generation, reset and state access then
+require a newly constructed speculative decoder.
 
 `BaseModel::synchronize()` completes an executor's submitted work before engine
 reset or warmup reuses state. Its default waits for the selected CUDA device;
@@ -126,8 +146,17 @@ shares prepared weights and allocates private KV and execution buffers.
 `prefill()` starts a fresh history; `decode()` appends one token after prefill.
 Capacity overflow and invalid inputs reject before model writes. The default
 mode is eager; pass `true` as the final creation argument to use graph decode.
-Prefill remains eager in either mode. Calls are synchronous and logits borrow
-session storage until its next operation.
+Prefill remains eager in either mode. Successful calls complete work on the
+session stream before returning; logits borrow session storage until its next
+operation.
+
+If execution submission fails, the session attempts completion while preserving
+the original exception. Confirmed completion clears the affected managed or
+external cache history; begin again with prefill. If completion fails, the
+session retains its storage and rejects execution, reset, graph changes and
+forks. `synchronize()` can retry completion for cleanup but cannot revive the
+instance. Keep borrowed inputs and external caches alive until completion is
+confirmed, and create a replacement with `Session::create(model, capacity)`.
 
 The application or harness chooses summaries, truncation and retrieved history.
 After changing the token history, prefill the resulting tokens to rebuild the
@@ -172,7 +201,7 @@ These are prepared native layouts; standard AWQ checkpoint layouts may need
 conversion before construction.
 
 Logits borrow session storage. Consume them before its next operation or copy
-them into application-owned output. Calls complete GPU work before returning;
+them into application-owned output. Successful calls complete GPU work before returning;
 serialize access to one session. A cache must retain its object, device,
 capacity and backing addresses throughout execution. After `cache.clear()`,
 prefill starts another history in the same allocations. CUDA graph mode uses
@@ -214,7 +243,7 @@ Prefill returns `[rows, hidden_size]`; decode returns `[1, hidden_size]`, both
 after final normalization. No token lookup, language-model head or sampling runs
 in these embedding calls. They use eager execution even when token graph mode is
 enabled. Input storage must be independent of session workspace. Establish stream
-dependencies for uploads from another stream; the calls complete before returning.
+dependencies for uploads from another stream; successful calls complete before returning.
 
 Embedding positions are explicit and must fit the model's position limit. The
 session determines physical KV slots independently. Token calls use their normal

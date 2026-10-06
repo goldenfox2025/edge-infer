@@ -55,6 +55,16 @@ ModelConfig build_decoder_config(py::dict config) {
 
 std::shared_ptr<BaseModel> ModelInitializer::prepare_model(
     py::dict config, py::dict weights, ModelType type, Device device) {
+  // Resolve declared model semantics once, without mutating the caller's dict.
+  // Weight processors only map names, casts and layouts after this admission.
+  auto cpp_config = build_decoder_config(config);
+  const auto n_layers = config["num_hidden_layers"].cast<size_t>();
+  weights = decoder_weight_mapper::admit(config, weights);
+  const bool awq = type == ModelType::QWEN_AWQ || type == ModelType::QWEN3_AWQ;
+  if (awq) {
+    cpp_config["quant_type"] = 1;
+    cpp_config["group_size"] = decoder_weight_mapper::awq_group_size(config);
+  }
   if (device == Device::CUDA && !DeviceManager::instance().isCudaAvailable()) {
     throw std::runtime_error("CUDA requested but no CUDA device is available");
   }
@@ -63,34 +73,30 @@ std::shared_ptr<BaseModel> ModelInitializer::prepare_model(
     throw std::invalid_argument("BF16 and AWQ models require CUDA");
   }
 
-  auto cpp_config = build_decoder_config(config);
   std::shared_ptr<BaseModel> model;
   switch (type) {
     case ModelType::LLAMA:
       model = ModelFactory::create_model(
-          type, weight_processor::process_llama_weights(weights), cpp_config);
+          type, weight_processor::process_llama_weights(weights, n_layers), cpp_config);
       break;
     case ModelType::QWEN:
       model = ModelFactory::create_model(
-          type, weight_processor::process_qwen_weights_fp32(weights), cpp_config);
+          type, weight_processor::process_qwen_weights_fp32(weights, n_layers), cpp_config);
       break;
     case ModelType::QWEN_BF16:
       model = ModelFactory::create_model_bf16(
-          type, weight_processor::process_qwen_weights_bf16(weights), cpp_config);
+          type, weight_processor::process_qwen_weights_bf16(weights, n_layers), cpp_config);
       break;
     case ModelType::QWEN3_BF16:
       model = ModelFactory::create_model_bf16(
-          type, weight_processor::process_qwen3_weights_bf16(weights), cpp_config);
+          type, weight_processor::process_qwen3_weights_bf16(weights, n_layers), cpp_config);
       break;
     case ModelType::QWEN_AWQ:
     case ModelType::QWEN3_AWQ: {
-      cpp_config["quant_type"] = 1;
-      cpp_config["group_size"] =
-          config.contains("group_size") ? config["group_size"].cast<int>() : 128;
       auto [bf16, quantized, scales, zeros] =
           type == ModelType::QWEN3_AWQ
-              ? weight_processor::process_qwen3_weights_awq(weights)
-              : weight_processor::process_qwen_weights_awq(weights);
+              ? weight_processor::process_qwen3_weights_awq(weights, n_layers)
+              : weight_processor::process_qwen_weights_awq(weights, n_layers);
       model = ModelFactory::create_model_quantized(
           type, bf16, quantized, scales, zeros, cpp_config);
       break;

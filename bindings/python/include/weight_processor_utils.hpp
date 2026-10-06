@@ -6,67 +6,22 @@
 
 #include <cstdint>
 #include <cstring>
-#include <iomanip>
-#include <type_traits>
-#include <iostream>
-#include <numeric>
 #include <stdexcept>
-#include <string>
-#include <unordered_map>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "tensor.hpp"
 
 namespace py = pybind11;
 
-/**
- * Namespace for weight-processing utilities
- * Provide shared weight-processing utilities, including tensor conversion, Weight-format processing and progress reporting
- */
 namespace weight_processor_utils {
 
-inline size_t total_weights = 0;
-inline size_t processed_weights = 0;
-inline std::string current_model_type = "";
-inline bool progress_initialized = false;
-inline size_t total_params_count = 0;
-
-inline void update_progress(const std::string& key, const std::string& dst_key);
-
-/**
- * from PyTorch Extract shape information from tensors
- * @param tensor PyTorch Tensor object
- * @return Vector containing shape information
- */
 inline std::vector<size_t> get_tensor_shape(const py::object& tensor) {
-    py::tuple shape_tuple = tensor.attr("shape");
+    const auto shape_tuple = tensor.attr("shape").cast<py::tuple>();
     std::vector<size_t> shape;
-    for (size_t i = 0; i < py::len(shape_tuple); ++i) {
-        shape.push_back(shape_tuple[i].cast<size_t>());
-    }
+    for (const auto& extent : shape_tuple) shape.push_back(py::cast<size_t>(extent));
     return shape;
-}
-
-/**
- * Calculate the parameter count from a tensor shape
- * @param shape Shape vector
- * @return Total parameters
- */
-inline size_t calculate_params_from_shape(const std::vector<size_t>& shape) {
-    if (shape.empty()) {
-        return 0;
-    }
-    return std::accumulate(shape.begin(), shape.end(), 1, std::multiplies<size_t>());
-}
-
-/**
- * Count parameters in a tensor
- * @param tensor PyTorch Tensor object
- * @return Total parameters
- */
-inline size_t calculate_params_count(const py::object& tensor) {
-    std::vector<size_t> shape = get_tensor_shape(tensor);
-    return calculate_params_from_shape(shape);
 }
 
 // Materialize caller arrays in logical C order before raw storage copies.
@@ -90,7 +45,15 @@ inline ContiguousArray<T> as_contiguous_array(py::handle input) {
 
 inline Tensor<__nv_bfloat16> convert_bf16_tensor(const py::object& tensor) {
     const auto torch = py::module::import("torch");
-    auto values = tensor.attr("detach")().attr("to")(
+    py::object source = tensor;
+    if (!py::hasattr(source, "detach")) {
+        // Preserve NumPy dtype before the ordinary BF16 cast. A C-order copy
+        // also lets Torch consume reversed NumPy views without changing values.
+        const auto array = py::array::ensure(source, py::array::c_style);
+        if (!array) throw std::invalid_argument("BF16 conversion requires a tensor or array");
+        source = torch.attr("as_tensor")(array);
+    }
+    auto values = source.attr("detach")().attr("to")(
         py::arg("device") = "cpu", py::arg("dtype") = torch.attr("bfloat16")).attr("contiguous")();
     const auto elements = values.attr("numel")().cast<size_t>();
     std::vector<__nv_bfloat16> data(elements);
@@ -98,127 +61,17 @@ inline Tensor<__nv_bfloat16> convert_bf16_tensor(const py::object& tensor) {
         const auto pointer = values.attr("data_ptr")().cast<uintptr_t>();
         std::memcpy(data.data(), reinterpret_cast<const void*>(pointer), elements * sizeof(__nv_bfloat16));
     }
-    // Casting uses PyTorch's ordinary BF16 conversion. Checkpoint values are
-    // never clamped, rescaled or replaced by a conversion heuristic.
+    // Checkpoint values are never clamped, rescaled or replaced by a heuristic.
     return Tensor<__nv_bfloat16>(std::move(data), get_tensor_shape(values));
 }
 
 inline Tensor<float> convert_float_tensor(const py::object& tensor) {
-    auto values = as_contiguous_array<float>(tensor);
+    const auto values = as_contiguous_array<float>(tensor);
     std::vector<size_t> shape;
     for (int axis = 0; axis < values.ndim(); ++axis) shape.push_back(values.shape(axis));
     std::vector<float> data(values.size());
     if (!data.empty()) std::memcpy(data.data(), values.data(), data.size() * sizeof(float));
     return Tensor<float>(std::move(data), shape);
-}
-
-/**
- * Update the progress bar
- * @param key Source key
- * @param dst_key Target key
- */
-inline void update_progress(const std::string& key, const std::string& dst_key) {
-    if (!progress_initialized) {
-        return;
-    }
-
-    processed_weights++;
-
-    float percentage = static_cast<float>(processed_weights) / total_weights * 100.0f;
-    int bar_width = static_cast<int>(percentage / 2.0f);
-
-    std::cout << "\r";
-
-    std::cout << " Progress: [";
-    std::cout << std::string(bar_width, '=');
-    if (bar_width < 50) {
-        std::cout << ">";
-        std::cout << std::string(49 - bar_width, ' ');
-    } else {
-        std::cout << "=";
-    }
-    std::cout << "] " << std::fixed << std::setprecision(1) << percentage << "%";
-
-    // if (key.length() > 30) {
-    //   std::cout << " " << key.substr(0, 27) << "...";
-    // } else {
-    //   std::cout << " " << key;
-    // }
-
-    std::cout << std::flush;
-}
-
-/**
- * Print weight-processing progress
- * @param key Source key
- * @param dst_key Target key
- */
-inline void print_processing_info(const std::string& key, const std::string& dst_key) {
-    if (progress_initialized) {
-
-        update_progress(key, dst_key);
-    } else {
-
-        std::cout << "Processing key: " << key << " -> " << dst_key << std::endl;
-    }
-}
-
-/**
- * Initialize the progress bar
- * @param total_weights Total weights
- * @param model_type Description of the model type
- */
-inline void init_progress(size_t total_weight_count, const std::string& model_type) {
-
-    if (progress_initialized) {
-        std::cout << "\r Progress: [" << std::string(50, '=') << "] 100%";
-        std::cout << "\n\033[1;32m✓ Previous weight processing was forced to completion!\033[0m\n" << std::endl;
-    }
-
-    total_weights = total_weight_count;
-    processed_weights = 0;
-    total_params_count = 0;
-    current_model_type = model_type;
-    progress_initialized = true;
-
-    std::cout << "\n\033[1;36m Process " << model_type << " Model weights \033[0m" << std::endl;
-    std::cout << " Total weights: " << total_weights << std::endl;
-    std::cout << " Progress: [" << std::string(50, ' ') << "] 0%" << std::flush;
-}
-
-/**
- * Complete the progress bar
- */
-inline void finish_progress() {
-    if (!progress_initialized) {
-        return;
-    }
-
-    std::cout << "\r Progress: [" << std::string(50, '=') << "] 100%";
-    std::cout << "\n\033[1;32m✓ Weight processing complete!\033[0m" << std::endl;
-
-    if (total_params_count > 0) {
-        double params_in_millions = static_cast<double>(total_params_count) / 1000000.0;
-        std::cout << " Total parameters: " << std::fixed << std::setprecision(2) << params_in_millions << " million ("
-                  << total_params_count << " parameters )\n"
-                  << std::endl;
-    } else {
-        std::cout << std::endl;
-    }
-
-    progress_initialized = false;
-    processed_weights = 0;
-    total_weights = 0;
-    total_params_count = 0;
-    current_model_type = "";
-}
-
-/**
- * Update the parameter count
- * @param count Number of parameters to add
- */
-inline void update_params_count(size_t count) {
-    total_params_count += count;
 }
 
 }  // namespace weight_processor_utils

@@ -88,6 +88,79 @@ class ModelSessionTest(unittest.TestCase):
         gc.collect()
         self.assertEqual(collect(session), [2] * 4)
 
+    def test_missing_weights_require_declared_ties(self):
+        missing_head = dict(self.weights)
+        del missing_head["lm_head.weight"]
+        for model_type in ("qwen", "llama"):
+            for tie in ({}, {"tie_word_embeddings": False}):
+                with self.subTest(model_type=model_type, tie=tie), self.assertRaisesRegex(ValueError, "Untied"):
+                    bridge.Model(dict(self.config, **tie), missing_head, model_type, device="cpu")
+            tied = bridge.Model(dict(self.config, tie_word_embeddings=True), missing_head,
+                                model_type, device="cpu")
+            self.assertEqual(collect(tied.new_session(8)), [0] * 4)
+            self.assertNotIn("lm_head.weight", missing_head)
+            missing_embedding = dict(self.weights)
+            del missing_embedding["model.embed_tokens.weight"]
+            with self.assertRaisesRegex(ValueError, "embed_tokens"):
+                bridge.Model(dict(self.config, tie_word_embeddings=True), missing_embedding,
+                             model_type, device="cpu")
+        with self.assertRaisesRegex(ValueError, "boolean"):
+            bridge.Model(dict(self.config, tie_word_embeddings=1), missing_head, "qwen", device="cpu")
+
+    def test_exact_weight_keys_and_alias_collisions(self):
+        original = "model.layers.0.self_attn.q_proj.weight"
+        malformed = (
+            "model.layers.0junk.self_attn.q_proj.weight",
+            "model.layers.-1.self_attn.q_proj.weight",
+            "model.layers.00.self_attn.q_proj.weight",
+            "model.layers..self_attn.q_proj.weight",
+            "model.layers.0.self_attn.q_proj.weight.extra",
+            "model.layers.999999999999999999999999.self_attn.q_proj.weight",
+            "model.layers.1.self_attn.q_proj.weight",
+        )
+        for model_type in ("qwen", "llama"):
+            for key in malformed:
+                weights = dict(self.weights)
+                weights[key] = weights.pop(original)
+                with self.subTest(model_type=model_type, key=key), self.assertRaises(ValueError):
+                    bridge.Model(self.config, weights, model_type, device="cpu")
+            collision = dict(self.weights)
+            collision["model.lm_head.weight"] = collision["lm_head.weight"].copy()
+            with self.assertRaisesRegex(ValueError, "Duplicate normalized"):
+                bridge.Model(self.config, collision, model_type, device="cpu")
+
+    def test_output_attention_and_mlp_biases_affect_cpu_generation(self):
+        for model_type in ("qwen", "llama"):
+            head_bias = dict(self.weights)
+            head_bias["lm_head.bias"] = np.zeros(8, dtype=np.float32)
+            head_bias["lm_head.bias"][4] = 100
+            with self.subTest(model_type=model_type, bias="head"):
+                model = bridge.Model(self.config, head_bias, model_type, device="cpu")
+                self.assertEqual(collect(model.new_session(8)), [4] * 4)
+
+            # The plain residual chooses feature 3. Each bias case makes feature
+            # 0 dominant through a different supported projection boundary.
+            base = dict(self.weights)
+            base["lm_head.weight"] = np.zeros((8, 4), dtype=np.float32)
+            base["lm_head.weight"][3, 0] = 1
+            base["lm_head.weight"][4, 3] = 1
+            model = bridge.Model(self.config, base, model_type, device="cpu")
+            self.assertEqual(collect(model.new_session(8)), [4] * 4)
+            down_bias = dict(base)
+            down_bias["model.layers.0.mlp.down_proj.bias"] = np.array([10, 0, 0, 0], dtype=np.float32)
+            gate_up_bias = dict(base)
+            gate_up_bias["model.layers.0.mlp.gate_proj.bias"] = np.array([3] + [0] * 7, dtype=np.float32)
+            gate_up_bias["model.layers.0.mlp.up_proj.bias"] = np.array([1] + [0] * 7, dtype=np.float32)
+            gate_up_bias["model.layers.0.mlp.down_proj.weight"] = np.zeros((4, 8), dtype=np.float32)
+            gate_up_bias["model.layers.0.mlp.down_proj.weight"][0, 0] = 10
+            value_bias = dict(base)
+            value_bias["model.layers.0.self_attn.v_proj.bias"] = np.array([10, 0, 0, 0], dtype=np.float32)
+            value_bias["model.layers.0.self_attn.o_proj.weight"] = np.eye(4, dtype=np.float32)
+            for name, weights in (("down", down_bias), ("gate/up", gate_up_bias), ("value", value_bias)):
+                with self.subTest(model_type=model_type, bias=name):
+                    model = bridge.Model(self.config, weights, model_type, device="cpu")
+                    self.assertEqual(collect(model.new_session(8)), [3] * 4)
+
     def test_strided_numpy_checkpoint_weights_preserve_model_behavior(self):
         strided = {}
         for name, weight in self.weights.items():

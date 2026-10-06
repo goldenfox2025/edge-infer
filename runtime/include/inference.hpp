@@ -4,19 +4,15 @@
 
 #include <chrono>
 #include <cmath>
-#include <condition_variable>
 #include <exception>
 #include <functional>
 #include <iostream>
 #include <memory>
-#include <mutex>
 #include <optional>
-#include <queue>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
-#include <variant>
 #include <vector>
 
 #include "kvcache_base.hpp"
@@ -24,29 +20,6 @@
 #include "tensor.hpp"
 #include "tensor_view.hpp"
 #include "thread_pool.hpp"
-
-template <typename T>
-class ThreadSafeQueue {
- public:
-  void push(T value) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    queue_.push(std::move(value));
-    cv_.notify_one();
-  }
-  T pop() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    cv_.wait(lock, [this] { return !queue_.empty(); });
-    T value = std::move(queue_.front());
-    queue_.pop();
-    return value;
-  }
-
- private:
-  std::mutex mutex_;
-
-  std::queue<T> queue_;
-  std::condition_variable cv_;
-};
 
 // BaseModel forward declaration
 class BaseModel;
@@ -201,6 +174,8 @@ class InferenceEngine : public infer_base {
                                float temperature = 1.0f, float top_p = 0.9f,
                                size_t top_k = 50);
   // Generate from a complete fresh prompt, until max_length, capacity, or EOS.
+  // Callbacks run on the calling thread between completed token operations.
+  // A callback exception stops the request before the next decode is submitted.
   void generate_with_callback(const std::vector<uint32_t>& input_ids,
                               size_t max_length, float temperature, float top_p,
                               size_t top_k,
@@ -226,7 +201,8 @@ class InferenceEngine : public infer_base {
   // benchmark_warmup_tokens: token count used for benchmark warmup
   void set_benchmark_mode(bool enable_benchmark, size_t benchmark_warmup_tokens = 64);
 
-  // A failed migration invalidates the engine; construct a new engine to retry.
+  // A failed migration or completion invalidates the engine; construct a new
+  // engine to retry. Invalid engines retain their backing storage until teardown.
   // Move the engine, model, and KV cache to CUDA.
   InferenceEngine& cuda();
   // Move the engine, model, and KV cache to the CPU.
@@ -239,7 +215,7 @@ class InferenceEngine : public infer_base {
  private:
   void require_valid() const {
     if (!valid_)
-      throw std::logic_error("Device migration failed; construct a new inference engine");
+      throw std::logic_error("Executor completion or device migration failed; construct a new inference engine");
   }
   bool valid_ = true;
   ThreadPool thread_pool_;

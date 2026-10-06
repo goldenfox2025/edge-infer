@@ -4,8 +4,32 @@
 #include <limits>
 
 #include "operators/cuda/direct.hpp"
+#include "elementwise_math.cuh"
 
 namespace op {
+
+__device__ __forceinline__ float silu_value(float x) {
+  // Bit classification avoids flushing a subnormal input during comparison.
+  // At |x| <= 2^-125, the nonlinear correction is far below an FP32 step:
+  // SiLU rounds exactly to x/2, including subnormals and signed zero.
+  if ((__float_as_uint(x) & 0x7fffffffU) <= 0x01000000U) {
+    return cuda::detail::multiply_preserving_subnormals(x, 0.5f);
+  }
+  if (x < -80.0f) {
+    // In the negative tail, a fast FP32 reciprocal can flush to zero before
+    // multiplication by x; expf(-x) eventually overflows as well. Evaluate the
+    // stable expression in double and round only the final activation to FP32.
+    const double exponential = exp(static_cast<double>(x));
+    const double activation = static_cast<double>(x) * exponential /
+                              (1.0 + exponential);
+    // Keep the conversion independent of the translation unit's FTZ mode.
+    // This is the same explicit PTX conversion used by CUDA's BF16 helpers.
+    float result;
+    asm("cvt.rn.f32.f64 %0, %1;" : "=f"(result) : "d"(activation));
+    return result;
+  }
+  return x / (1.0f + expf(-x));
+}
 
 // CUDA kernel for SiLU activation function
 template <typename T>
@@ -13,7 +37,7 @@ __global__ void silu_kernel(T* output, const T* input, int total) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < total) {
     float x = static_cast<float>(input[idx]);
-    output[idx] = static_cast<T>(x / (1.0f + expf(-x)));
+    output[idx] = static_cast<T>(silu_value(x));
   }
 }
 
@@ -23,11 +47,11 @@ __global__ void silu_multiply_kernel(const T* gate, const T* up, T* output, int 
   if (idx < total) {
     const float x = static_cast<float>(gate[idx]);
     // Keep the same rounded activation that the standalone SiLU kernel stores.
-    const T activated = static_cast<T>(x / (1.0f + expf(-x)));
+    const T activated = static_cast<T>(silu_value(x));
     // An explicit rounded multiply prevents fast-math reassociation through
     // the SiLU division; BF16 conversion preserves the intermediate rounding.
-    output[idx] = static_cast<T>(__fmul_rn(static_cast<float>(activated),
-                                          static_cast<float>(up[idx])));
+    output[idx] = static_cast<T>(cuda::detail::multiply_preserving_subnormals(
+        static_cast<float>(activated), static_cast<float>(up[idx])));
   }
 }
 

@@ -4,6 +4,7 @@
 #include <limits>
 
 #include "operators/cuda/direct.hpp"
+#include "elementwise_math.cuh"
 
 namespace op {
 
@@ -34,7 +35,8 @@ __global__ void multiply_kernel(const T* input_a, const T* input_b, T* output,
     VecT result;
 #pragma unroll
     for (int j = 0; j < vec_unit; j++) {
-      result.t[j] = a_val.t[j] * b_val.t[j];
+      result.t[j] = static_cast<T>(cuda::detail::multiply_preserving_subnormals(
+          static_cast<float>(a_val.t[j]), static_cast<float>(b_val.t[j])));
     }
     output_vec[i] = result;
   }
@@ -43,7 +45,8 @@ __global__ void multiply_kernel(const T* input_a, const T* input_b, T* output,
   size_t remaining = static_cast<size_t>(total) - total_vec * vec_unit;
   size_t offset = total_vec * vec_unit;
   for (size_t i = tid; i < remaining; i += stride) {
-    output[offset + i] = input_a[offset + i] * input_b[offset + i];
+    output[offset + i] = static_cast<T>(cuda::detail::multiply_preserving_subnormals(
+        static_cast<float>(input_a[offset + i]), static_cast<float>(input_b[offset + i])));
   }
 }
 

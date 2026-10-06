@@ -2,6 +2,7 @@
 
 #include <array>
 #include <algorithm>
+#include <exception>
 #include <stdexcept>
 #include <string>
 
@@ -124,10 +125,27 @@ void SpeculativeDecoder<T>::init_cuda_resources() {
 }
 
 template <typename T>
-void SpeculativeDecoder<T>::reset() {
+void SpeculativeDecoder<T>::complete_execution() {
   SpeculativeDeviceScope device_scope(cuda_device_id_);
-  checkCudaErrors(cudaStreamSynchronize(draft_stream_));
-  checkCudaErrors(cudaStreamSynchronize(verify_stream_));
+  std::exception_ptr failure;
+  const auto attempt = [&](auto operation) {
+    try { operation(); }
+    catch (...) { if (!failure) failure = std::current_exception(); }
+  };
+  // Model execution can use private streams, including work submitted before
+  // a failed logits call. Drain each executor and every owned sampling stream.
+  attempt([&] { target_model_->synchronize(); });
+  attempt([&] { draft_model_->synchronize(); });
+  if (draft_stream_) attempt([&] { checkCudaErrors(cudaStreamSynchronize(draft_stream_)); });
+  if (verify_stream_) attempt([&] { checkCudaErrors(cudaStreamSynchronize(verify_stream_)); });
+  if (failure) std::rethrow_exception(failure);
+}
+
+template <typename T>
+void SpeculativeDecoder<T>::reset() {
+  require_valid();
+  try { complete_execution(); }
+  catch (...) { valid_ = false; throw; }
   target_kv_cache_.clear();
   draft_kv_cache_.clear();
 }
@@ -138,10 +156,9 @@ void SpeculativeDecoder<T>::free_cuda_resources() noexcept {
   int previous = cuda_device_id_;
   cudaGetDevice(&previous);
   if (previous != cuda_device_id_) cudaSetDevice(cuda_device_id_);
-  // Model logits are synchronized before returning through SpeculativeModel.
-  // Finish every owned sampling/copy stream before releasing its private buffers.
-  if (draft_stream_) cudaStreamSynchronize(draft_stream_);
-  if (verify_stream_) cudaStreamSynchronize(verify_stream_);
+  // Failed model calls can leave submitted work that borrows frontend storage.
+  // Attempt both model completions as well as every owned sampling/copy stream.
+  try { complete_execution(); } catch (...) {}
   token_inputs_.clear();
   batch_inputs_.clear();
   resources_.release();
@@ -210,6 +227,7 @@ template <typename T>
 void SpeculativeDecoder<T>::generate_with_callback(const std::vector<uint32_t>& input_ids, size_t max_length,
                                                     float temperature, float top_p, size_t top_k,
                                                     std::function<void(uint32_t)> callback) {
+  require_valid();
   if (input_ids.empty()) throw std::invalid_argument("Prompt must be nonempty");
   if (!callback) throw std::invalid_argument("Speculative generation requires a callback");
   if (top_k != 1)
@@ -220,35 +238,40 @@ void SpeculativeDecoder<T>::generate_with_callback(const std::vector<uint32_t>& 
   const size_t limit = std::min(max_length, capacity);
   if (limit <= input_ids.size()) return;
   for (auto token : input_ids) validate_speculative_token(token, target_model_->get_vocab_size());
-  SpeculativeDeviceScope device_scope(cuda_device_id_);
   reset();
   try {
     // A fresh request owns its complete prompt. Both models borrow the same
     // upload until their synchronous prefill boundaries have completed.
     auto prompt = Tensor<uint32_t>::from_external_buffer(
         prompt_storage_.template ptr_at<uint32_t>(0), {input_ids.size()}, Device::CUDA);
-    checkCudaErrors(cudaMemcpyAsync(prompt.data_ptr(), input_ids.data(), input_ids.size() * sizeof(uint32_t),
-                                    cudaMemcpyHostToDevice, verify_stream_));
-    checkCudaErrors(cudaStreamSynchronize(verify_stream_));
-    target_kv_cache_.resize(input_ids.size());
-    auto target_logits = target_spec_model_->speculative_prefill_logits(&prompt, &target_kv_cache_);
-    if (target_logits.shape[0] != input_ids.size())
-      throw std::runtime_error("Target prefill returned an invalid extent");
-    op::cuda::sample<T>(verify_context_,
-                       target_logits.subview({input_ids.size() - 1, 0}, {1, target_logits.shape[1]}).as_const(),
-                       {target_tokens_, {1}, {1}}, {}, target_scratch_, target_sampling_plan_,
-                       temperature, top_p, 1, nullptr);
     uint32_t pending = 0;
-    checkCudaErrors(cudaMemcpyAsync(&pending, target_tokens_, sizeof(uint32_t),
-                                    cudaMemcpyDeviceToHost, verify_stream_));
-    checkCudaErrors(cudaStreamSynchronize(verify_stream_));
-    validate_speculative_token(pending, target_model_->get_vocab_size());
+    {
+      SpeculativeDeviceScope device_scope(cuda_device_id_);
+      checkCudaErrors(cudaMemcpyAsync(prompt.data_ptr(), input_ids.data(), input_ids.size() * sizeof(uint32_t),
+                                      cudaMemcpyHostToDevice, verify_stream_));
+      checkCudaErrors(cudaStreamSynchronize(verify_stream_));
+      target_kv_cache_.resize(input_ids.size());
+      auto target_logits = target_spec_model_->speculative_prefill_logits(&prompt, &target_kv_cache_);
+      if (target_logits.shape[0] != input_ids.size())
+        throw std::runtime_error("Target prefill returned an invalid extent");
+      op::cuda::sample<T>(verify_context_,
+                         target_logits.subview({input_ids.size() - 1, 0}, {1, target_logits.shape[1]}).as_const(),
+                         {target_tokens_, {1}, {1}}, {}, target_scratch_, target_sampling_plan_,
+                         temperature, top_p, 1, nullptr);
+      checkCudaErrors(cudaMemcpyAsync(&pending, target_tokens_, sizeof(uint32_t),
+                                      cudaMemcpyDeviceToHost, verify_stream_));
+      checkCudaErrors(cudaStreamSynchronize(verify_stream_));
+      validate_speculative_token(pending, target_model_->get_vocab_size());
+    }
     if (pending == target_model_->get_eos_token_id()) return;
     callback(pending);
     size_t total_length = input_ids.size() + 1;
     if (total_length >= limit) return;
-    draft_kv_cache_.resize(input_ids.size());
-    draft_spec_model_->speculative_prefill_logits(&prompt, &draft_kv_cache_);
+    {
+      SpeculativeDeviceScope device_scope(cuda_device_id_);
+      draft_kv_cache_.resize(input_ids.size());
+      draft_spec_model_->speculative_prefill_logits(&prompt, &draft_kv_cache_);
+    }
     std::vector<uint32_t> verified;
     verified.reserve(MAX_SPEC_LENGTH);
     while (total_length < limit) {
@@ -257,11 +280,14 @@ void SpeculativeDecoder<T>::generate_with_callback(const std::vector<uint32_t>& 
         throw std::logic_error("Speculative sessions lost their shared pending-token boundary");
       const size_t count = std::min({spec_length_, limit - total_length, capacity - original});
       if (!count) break;
-      checkCudaErrors(cudaMemcpyAsync(draft_tokens_, &pending, sizeof(uint32_t),
-                                      cudaMemcpyHostToDevice, verify_stream_));
-      checkCudaErrors(cudaStreamSynchronize(verify_stream_));
-      generate_draft_tokens(count, temperature, top_p);
-      verify_greedy(count, temperature, top_p, verified);
+      {
+        SpeculativeDeviceScope device_scope(cuda_device_id_);
+        checkCudaErrors(cudaMemcpyAsync(draft_tokens_, &pending, sizeof(uint32_t),
+                                        cudaMemcpyHostToDevice, verify_stream_));
+        checkCudaErrors(cudaStreamSynchronize(verify_stream_));
+        generate_draft_tokens(count, temperature, top_p);
+        verify_greedy(count, temperature, top_p, verified);
+      }
       if (verified.empty()) throw std::logic_error("Speculative verification must make progress");
       size_t emitted = 0;
       bool eos = false;
@@ -279,11 +305,13 @@ void SpeculativeDecoder<T>::generate_with_callback(const std::vector<uint32_t>& 
       if (eos) break;
     }
   } catch (...) {
-    // Propagate model and callback failures after restoring a reusable request boundary.
-    cudaDeviceSynchronize();
-    target_kv_cache_.clear();
-    draft_kv_cache_.clear();
-    throw;
+    const auto original_error = std::current_exception();
+    try { complete_execution(); } catch (...) { valid_ = false; }
+    if (valid_) {
+      target_kv_cache_.clear();
+      draft_kv_cache_.clear();
+    }
+    std::rethrow_exception(original_error);
   }
 }
 

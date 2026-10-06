@@ -6,6 +6,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <type_traits>
 #include <vector>
@@ -135,6 +136,100 @@ void test_silu_multiply() {
   }, "SiLU multiply accepted an extent exceeding its launch index range");
   op::cuda::silu_multiply<T>({}, {}, {}, stream.value);
   check(cudaGetLastError());
+}
+
+template <typename T>
+void test_silu_negative_tail() {
+  // x=-88 is an observed checkpoint input: its nonzero, normal SiLU result
+  // was lost by fast FP32 reciprocal evaluation. Later values exercise true
+  // subnormals, including activation products that become normal again. Tiny
+  // inputs test activation rounding before multiplication can amplify a loss.
+  constexpr float inputs[] = {
+      -80.0f, -80.5f, -81.0f, -86.0f, -87.0f, -88.0f, -89.0f,
+      -90.0f, -91.0f, -92.0f, -93.0f, -94.0f, -95.0f, -96.0f,
+      -97.0f, -98.0f, -99.0f, -100.0f, -0.0f, 0.0f, 88.0f,
+      -0x1p-125f, 0x1p-125f, -0x1p-126f, 0x1p-126f,
+      -0x1p-127f, 0x1p-127f, -0x1p-133f, 0x1p-133f,
+      -0x1p-149f, 0x1p-149f};
+  constexpr float multipliers[] = {1.0f, -1.0f, 65536.0f, -65536.0f,
+                                    1.0f / 65536.0f, -0.0f, 0.0f};
+  constexpr size_t input_count = sizeof(inputs) / sizeof(inputs[0]);
+  constexpr size_t multiplier_count = sizeof(multipliers) / sizeof(multipliers[0]);
+  constexpr size_t count = input_count * multiplier_count;
+  std::vector<T> gate(count), up(count), activations(count), products(count);
+  size_t normal_tail = 0, subnormal_tail = 0, amplified_subnormal = 0;
+  for (size_t i = 0; i < count; ++i) {
+    gate[i] = static_cast<T>(inputs[i / multiplier_count]);
+    up[i] = static_cast<T>(multipliers[i % multiplier_count]);
+    const double x = static_cast<float>(gate[i]);
+    // Independent FP64 oracle uses the original mathematical form. Its
+    // denominator remains finite throughout this fixture, unlike FP32 exp.
+    const float activation = static_cast<float>(x / (1.0 + std::exp(-x)));
+    activations[i] = static_cast<T>(activation);
+    const float staged = static_cast<float>(activations[i]);
+    const double product = static_cast<double>(staged) * static_cast<float>(up[i]);
+    products[i] = static_cast<T>(static_cast<float>(product));
+    if (x < -80.0) {
+      normal_tail += std::fpclassify(staged) == FP_NORMAL;
+      subnormal_tail += std::fpclassify(staged) == FP_SUBNORMAL;
+      amplified_subnormal += std::fpclassify(staged) == FP_SUBNORMAL &&
+                             std::fpclassify(static_cast<float>(products[i])) == FP_NORMAL;
+    }
+  }
+  require(normal_tail > 0 && subnormal_tail > 0 && amplified_subnormal > 0,
+          "SiLU tail fixture must cover normal, subnormal and amplified results");
+  const auto compare = [&](const std::vector<T>& actual, const std::vector<T>& expected) {
+    for (size_t i = 0; i < count; ++i) {
+      const float a = static_cast<float>(actual[i]), e = static_cast<float>(expected[i]);
+      require(std::isfinite(a), "SiLU negative tail produced a nonfinite result");
+      require(std::signbit(a) == std::signbit(e), "SiLU negative tail lost its output sign");
+      if constexpr (std::is_same_v<T, BF16>) {
+        if (std::memcmp(&actual[i], &expected[i], sizeof(T)) != 0) {
+          unsigned short actual_bits = 0, expected_bits = 0;
+          std::memcpy(&actual_bits, &actual[i], sizeof(T));
+          std::memcpy(&expected_bits, &expected[i], sizeof(T));
+          std::ostringstream message;
+          message << "BF16 SiLU tail differs from independent staged FP64 gold at " << i
+                  << ": gate=" << std::hexfloat << static_cast<float>(gate[i])
+                  << ", up=" << static_cast<float>(up[i]) << ", actual=" << a << ", expected=" << e
+                  << ", bits=" << std::hex << actual_bits << "/" << expected_bits;
+          throw std::runtime_error(message.str());
+        }
+      } else {
+        // Relative error plus one minimum FP32 step; unlike a unit-scale
+        // absolute tolerance, this cannot accept zero for a normal tail value.
+        const double bound = 4.0 * std::numeric_limits<float>::epsilon() * std::abs(e) +
+                             std::numeric_limits<float>::denorm_min();
+        if (std::abs(static_cast<double>(a) - e) > bound) {
+          std::ostringstream message;
+          message << "FP32 SiLU tail differs from independent FP64 gold at " << i
+                  << ": gate=" << std::hexfloat << static_cast<float>(gate[i])
+                  << ", up=" << static_cast<float>(up[i]) << ", actual=" << a << ", expected=" << e;
+          throw std::runtime_error(message.str());
+        }
+      }
+    }
+  };
+  Buffer<T> g(count), u(count), output(count), separate(count);
+  upload(g, gate);
+  upload(u, up);
+  Stream stream;
+  op::cuda::silu<T>({g.data, count}, {output.data, count}, stream.value);
+  check(cudaStreamSynchronize(stream.value));
+  compare(download(output, count), activations);
+  op::cuda::multiply<T>({output.data, count}, {u.data, count}, {separate.data, count}, stream.value);
+  check(cudaStreamSynchronize(stream.value));
+  const auto unfused = download(separate, count);
+  compare(unfused, products);
+  op::cuda::silu_multiply<T>({g.data, count}, {u.data, count}, {output.data, count}, stream.value);
+  check(cudaStreamSynchronize(stream.value));
+  const auto fused = download(output, count);
+  compare(fused, products);
+  require(std::memcmp(fused.data(), unfused.data(), count * sizeof(T)) == 0,
+          "SiLU fusion changed standalone staged product bits in the negative tail");
+  op::cuda::silu_multiply<T>({g.data, count}, {u.data, count}, {g.data, count}, stream.value);
+  check(cudaStreamSynchronize(stream.value));
+  compare(download(g, count), products);
 }
 
 void test_norm() {
@@ -331,6 +426,8 @@ int main() {
     test_biased_linear();
     test_silu_multiply<BF16>();
     test_silu_multiply<float>();
+    test_silu_negative_tail<float>();
+    test_silu_negative_tail<BF16>();
     std::cout << "BF16 RMSNorm, RoPE and fused SiLU multiply rounding contracts passed\n";
     return 0;
   } catch (const std::exception& error) {

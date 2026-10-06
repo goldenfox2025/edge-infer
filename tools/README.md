@@ -74,6 +74,32 @@ Both sessions use exact greedy decoding (`top_k=1`) from the same complete
 prompt. A mismatch raises an error. The script no longer promises logits dumps:
 the maintained runtime has no producer for the old dump visualizer.
 
+## Qwen3 reference artifacts
+
+`qwen3_reference.py` selects the Torch attention backend explicitly with
+`--reference-attention eager|sdpa` (default `eager`). It records that backend
+alongside checkpoint hashes, installed software/source identity, token histories
+and checksummed FP32 logit arrays. Use an empty output directory for every run.
+
+`--reuse-reference /absolute/path/to/source.json` admits an existing reference
+before running the current native modules, without loading a Torch model or
+tokenizer. It checks checkpoint/config bytes, installed reference software and
+source, requested provenance/backend, contained fixture paths, checksums, shapes,
+finite values and token/prefix/KV consistency. Supply the same generation counts
+and provenance as the original run; `--prompt-ids` can assert recorded prompt
+identity. The new record retains the original manifest hash and failure state.
+It uses the original strict reference tolerance and separate bit-exact native
+reset/replay and eager/Graph prefill gates. Token agreement cannot replace a
+failed full-logit comparison; the [validation record](../docs/validation-2026-10-06.md)
+contains the current failure and full reproduction arguments.
+
+Run the artifact falsification tests with NumPy and no model or GPU:
+
+```sh
+python -m unittest discover -s tools/validation/tests \
+  -p test_qwen3_reference_artifacts.py -v
+```
+
 ## Qwen TTS checkpoint metadata
 
 The standard-library inspector supports the official 12Hz 0.6B Base and

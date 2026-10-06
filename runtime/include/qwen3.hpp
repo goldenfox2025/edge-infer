@@ -8,8 +8,10 @@
 #include "speculative_model.hpp"
 #include "tensor_view_adapter.hpp"
 
-// Immutable weights are shared. One session owns all mutable resources. Calls
-// complete before returning; callers serialize operations on the same session.
+// Immutable weights are shared. One session owns all mutable resources.
+// Successful calls complete before returning; callers serialize operations on the same session.
+// If stream completion fails, the instance retains its storage and rejects
+// execution/reconfiguration. It must be destroyed rather than reset or forked.
 template <typename T>
 class Qwen3Session : public BaseModel, public SpeculativeModel<T> {
  public:
@@ -24,6 +26,7 @@ class Qwen3Session : public BaseModel, public SpeculativeModel<T> {
   Qwen3Session(const Qwen3Session&) = delete;
   Qwen3Session& operator=(const Qwen3Session&) = delete;
   std::shared_ptr<BaseModel> fork_executor() const override {
+    require_usable();
     return std::make_shared<Qwen3Session<T>>(model_, use_cuda_graph_);
   }
   static std::unique_ptr<Qwen3Session> create(std::shared_ptr<const Qwen3Model<T>>, size_t capacity,
@@ -60,6 +63,8 @@ class Qwen3Session : public BaseModel, public SpeculativeModel<T> {
   const WorkspacePlan& decode_workspace_plan() const { return decode_plan_; }
   bool owns_execution_workspaces() const override { return true; }
   size_t estimate_prefill_workspace_bytes(size_t) const override;
+  size_t estimate_embedding_prefill_workspace_bytes(size_t) const;
+  size_t prefill_workspace_bytes() const { return prefill_workspace_.capacity_bytes(); }
   bool verify_params() const override { return model_->verify_params(); }
   void print_model_info() const override;
   Qwen3Session& cuda() override;
@@ -101,10 +106,13 @@ class Qwen3Session : public BaseModel, public SpeculativeModel<T> {
  private:
   void initialize();
   void release() noexcept;
+  void require_usable() const;
+  bool drain_failed_execution(KVCache<T>* modified_cache = nullptr) noexcept;
   void require_managed() const;
   void validate_and_bind(TensorView<const uint32_t, 1>, KVCache<T>*, bool);
   void validate_cache(KVCache<T>*, size_t, bool);
   void bind_cache(KVCache<T>*);
+  void prepare_prefill(size_t rows, DecoderOutput output);
   TensorView<T, 2> execute_embeddings(TensorView<const T, 2>, size_t, bool);
   TensorView<T, 2> execute(TensorView<const uint32_t, 1>, KVCache<T>&, bool, bool);
   TensorView<T, 2> execute_prevalidated(TensorView<const uint32_t, 1>, KVCache<T>&, bool, bool);
@@ -115,12 +123,12 @@ class Qwen3Session : public BaseModel, public SpeculativeModel<T> {
   std::shared_ptr<const Qwen3Model<T>> model_;
   std::unique_ptr<KVCache<T>> managed_cache_;
   bool history_ready_ = false, use_cuda_graph_ = false;
+  mutable bool poisoned_ = false;
   op::cuda::ExecutionContext context_;
   WorkspacePlan decode_plan_;
   CudaWorkspaceArena decode_workspace_, prefill_workspace_, graph_storage_, sampling_storage_,
       host_token_storage_;
   DecoderBuffers<T> decode_buffers_{}, prefill_buffers_{};
-  size_t prefill_rows_ = 0;
   op::cuda::SamplingPlan sampling_plan_;
   TensorView<unsigned char, 1> sampling_scratch_{};
   TensorView<uint32_t, 1> sampled_token_{}, graph_input_{};

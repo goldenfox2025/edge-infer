@@ -1,0 +1,1683 @@
+{
+  "model_id": "Qwen/Qwen3-0.6B",
+  "model_revision": "c1899de289a04d12100db370d81485cdf75e47ca",
+  "provenance_note": "Model ID/revision are supplied provenance; the local bytes are identified by SHA256",
+  "checkpoint_files": {
+    "config.json": {
+      "bytes": 726,
+      "sha256": "660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd"
+    },
+    "model.safetensors": {
+      "bytes": 1503300328,
+      "sha256": "f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b"
+    }
+  },
+  "torch_version": "2.6.0+cu124",
+  "transformers_version": "4.51.3",
+  "numpy_version": "1.26.4",
+  "reference_source": "transformers/models/qwen3/modeling_qwen3.py",
+  "reference_source_sha256": "704c914530530a1acb0b443add1f520404e3ac2c28c0ab7e16f80f86cfe8ccb2",
+  "dtype": "bfloat16",
+  "attention_implementation": "eager",
+  "tf32": false,
+  "deterministic_algorithms": true,
+  "device": "cuda",
+  "gpu": "NVIDIA GeForce RTX 4070 Laptop GPU",
+  "torch_cuda_version": "12.4",
+  "steps": 16,
+  "teacher_forced_checks": 4,
+  "scope": "Small deterministic full-checkpoint Torch reference and optional native greedy-token checks; no performance claim",
+  "prompts": [
+    {
+      "prompt_ids": [
+        1,
+        314,
+        1234,
+        42
+      ],
+      "predicted_token_ids_including_eos": [
+        8673,
+        25,
+        508,
+        364,
+        1234,
+        516,
+        364,
+        1234,
+        2808,
+        6,
+        2279,
+        335,
+        330,
+        4710,
+        1986,
+        374
+      ],
+      "emitted_token_ids": [
+        8673,
+        25,
+        508,
+        364,
+        1234,
+        516,
+        364,
+        1234,
+        2808,
+        6,
+        2279,
+        335,
+        330,
+        4710,
+        1986,
+        374
+      ],
+      "kv_lengths": [
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "teacher_forced_prefixes": [
+        [
+          1,
+          314,
+          1234,
+          42
+        ],
+        [
+          1,
+          314,
+          1234,
+          42,
+          8673
+        ],
+        [
+          1,
+          314,
+          1234,
+          42,
+          8673,
+          25
+        ],
+        [
+          1,
+          314,
+          1234,
+          42,
+          8673,
+          25,
+          508
+        ]
+      ],
+      "teacher_forced_first_token_ids": [
+        8673,
+        25,
+        508,
+        364
+      ],
+      "incremental_vs_full_prefix_first_token_ids": {
+        "passed": true,
+        "first_mismatch": null,
+        "expected": [
+          8673,
+          25,
+          508,
+          364
+        ],
+        "actual": [
+          8673,
+          25,
+          508,
+          364
+        ]
+      },
+      "fixture": "prompt-000.npz",
+      "fixture_sha256": "7d970f5002945a3031753457ec7cbcc18453c008ac72369f3593ef49390dda63",
+      "array_shapes": {
+        "prefill_logits": [
+          4,
+          151936
+        ],
+        "incremental_last_logits": [
+          16,
+          151936
+        ],
+        "teacher_forced_last_logits": [
+          4,
+          151936
+        ]
+      }
+    },
+    {
+      "prompt_ids": [
+        3,
+        7,
+        11,
+        19,
+        23
+      ],
+      "predicted_token_ids_including_eos": [
+        15087,
+        271,
+        10061,
+        400,
+        69,
+        2075,
+        8,
+        284,
+        1124,
+        37018,
+        90,
+        16,
+        15170,
+        87,
+        61,
+        17
+      ],
+      "emitted_token_ids": [
+        15087,
+        271,
+        10061,
+        400,
+        69,
+        2075,
+        8,
+        284,
+        1124,
+        37018,
+        90,
+        16,
+        15170,
+        87,
+        61,
+        17
+      ],
+      "kv_lengths": [
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20
+      ],
+      "teacher_forced_prefixes": [
+        [
+          3,
+          7,
+          11,
+          19,
+          23
+        ],
+        [
+          3,
+          7,
+          11,
+          19,
+          23,
+          15087
+        ],
+        [
+          3,
+          7,
+          11,
+          19,
+          23,
+          15087,
+          271
+        ],
+        [
+          3,
+          7,
+          11,
+          19,
+          23,
+          15087,
+          271,
+          10061
+        ]
+      ],
+      "teacher_forced_first_token_ids": [
+        15087,
+        271,
+        10061,
+        400
+      ],
+      "incremental_vs_full_prefix_first_token_ids": {
+        "passed": true,
+        "first_mismatch": null,
+        "expected": [
+          15087,
+          271,
+          10061,
+          400
+        ],
+        "actual": [
+          15087,
+          271,
+          10061,
+          400
+        ]
+      },
+      "fixture": "prompt-001.npz",
+      "fixture_sha256": "107f5e8ae68057089297631fcdc9fcbd86b45d056f4dfc75b531e1347f0aa055",
+      "array_shapes": {
+        "prefill_logits": [
+          5,
+          151936
+        ],
+        "incremental_last_logits": [
+          16,
+          151936
+        ],
+        "teacher_forced_last_logits": [
+          4,
+          151936
+        ]
+      }
+    }
+  ],
+  "reference_reuse": {
+    "manifest": "local-reference/qwen3-text-parity-final/source.json",
+    "manifest_sha256": "2844cd02a8a814e6e18e506ca389e76e8efcd87483ea2e5e733710472e406a0c",
+    "policy": "Verified saved reference; no Torch model or tokenizer loaded",
+    "prior_native_passed": true,
+    "prior_native_logits_passed": false,
+    "prior_absolute_tolerance": 0.015625,
+    "prior_relative_tolerance": 0.01
+  },
+  "native": {
+    "module": "model_bridge.cpython-312-x86_64-linux-gnu.so",
+    "module_sha256": "3c6c3b6bfd71bec8b305983f62a950ec130995a9f45458b924added973013400",
+    "emitted_tokens_compared_per_mode": 32,
+    "scope": "Exact emitted greedy tokens and first tokens for fresh teacher-forced prefixes; no native logits API",
+    "modes": [
+      {
+        "mode": "eager",
+        "capacity": 128,
+        "prompts": [
+          {
+            "full_greedy": {
+              "passed": true,
+              "first_mismatch": null,
+              "expected": [
+                8673,
+                25,
+                508,
+                364,
+                1234,
+                516,
+                364,
+                1234,
+                2808,
+                6,
+                2279,
+                335,
+                330,
+                4710,
+                1986,
+                374
+              ],
+              "actual": [
+                8673,
+                25,
+                508,
+                364,
+                1234,
+                516,
+                364,
+                1234,
+                2808,
+                6,
+                2279,
+                335,
+                330,
+                4710,
+                1986,
+                374
+              ]
+            },
+            "teacher_forced_first_tokens": [
+              {
+                "passed": true,
+                "first_mismatch": null,
+                "expected": [
+                  8673
+                ],
+                "actual": [
+                  8673
+                ]
+              },
+              {
+                "passed": true,
+                "first_mismatch": null,
+                "expected": [
+                  25
+                ],
+                "actual": [
+                  25
+                ]
+              },
+              {
+                "passed": true,
+                "first_mismatch": null,
+                "expected": [
+                  508
+                ],
+                "actual": [
+                  508
+                ]
+              },
+              {
+                "passed": true,
+                "first_mismatch": null,
+                "expected": [
+                  364
+                ],
+                "actual": [
+                  364
+                ]
+              }
+            ]
+          },
+          {
+            "full_greedy": {
+              "passed": true,
+              "first_mismatch": null,
+              "expected": [
+                15087,
+                271,
+                10061,
+                400,
+                69,
+                2075,
+                8,
+                284,
+                1124,
+                37018,
+                90,
+                16,
+                15170,
+                87,
+                61,
+                17
+              ],
+              "actual": [
+                15087,
+                271,
+                10061,
+                400,
+                69,
+                2075,
+                8,
+                284,
+                1124,
+                37018,
+                90,
+                16,
+                15170,
+                87,
+                61,
+                17
+              ]
+            },
+            "teacher_forced_first_tokens": [
+              {
+                "passed": true,
+                "first_mismatch": null,
+                "expected": [
+                  15087
+                ],
+                "actual": [
+                  15087
+                ]
+              },
+              {
+                "passed": true,
+                "first_mismatch": null,
+                "expected": [
+                  271
+                ],
+                "actual": [
+                  271
+                ]
+              },
+              {
+                "passed": true,
+                "first_mismatch": null,
+                "expected": [
+                  10061
+                ],
+                "actual": [
+                  10061
+                ]
+              },
+              {
+                "passed": true,
+                "first_mismatch": null,
+                "expected": [
+                  400
+                ],
+                "actual": [
+                  400
+                ]
+              }
+            ]
+          }
+        ],
+        "reset_replay": [
+          {
+            "passed": true,
+            "first_mismatch": null,
+            "expected": [
+              8673,
+              25,
+              508,
+              364,
+              1234,
+              516,
+              364,
+              1234,
+              2808,
+              6,
+              2279,
+              335,
+              330,
+              4710,
+              1986,
+              374
+            ],
+            "actual": [
+              8673,
+              25,
+              508,
+              364,
+              1234,
+              516,
+              364,
+              1234,
+              2808,
+              6,
+              2279,
+              335,
+              330,
+              4710,
+              1986,
+              374
+            ]
+          },
+          {
+            "passed": true,
+            "first_mismatch": null,
+            "expected": [
+              15087,
+              271,
+              10061,
+              400,
+              69,
+              2075,
+              8,
+              284,
+              1124,
+              37018,
+              90,
+              16,
+              15170,
+              87,
+              61,
+              17
+            ],
+            "actual": [
+              15087,
+              271,
+              10061,
+              400,
+              69,
+              2075,
+              8,
+              284,
+              1124,
+              37018,
+              90,
+              16,
+              15170,
+              87,
+              61,
+              17
+            ]
+          }
+        ]
+      },
+      {
+        "mode": "graph",
+        "capacity": 128,
+        "prompts": [
+          {
+            "full_greedy": {
+              "passed": true,
+              "first_mismatch": null,
+              "expected": [
+                8673,
+                25,
+                508,
+                364,
+                1234,
+                516,
+                364,
+                1234,
+                2808,
+                6,
+                2279,
+                335,
+                330,
+                4710,
+                1986,
+                374
+              ],
+              "actual": [
+                8673,
+                25,
+                508,
+                364,
+                1234,
+                516,
+                364,
+                1234,
+                2808,
+                6,
+                2279,
+                335,
+                330,
+                4710,
+                1986,
+                374
+              ]
+            },
+            "teacher_forced_first_tokens": [
+              {
+                "passed": true,
+                "first_mismatch": null,
+                "expected": [
+                  8673
+                ],
+                "actual": [
+                  8673
+                ]
+              },
+              {
+                "passed": true,
+                "first_mismatch": null,
+                "expected": [
+                  25
+                ],
+                "actual": [
+                  25
+                ]
+              },
+              {
+                "passed": true,
+                "first_mismatch": null,
+                "expected": [
+                  508
+                ],
+                "actual": [
+                  508
+                ]
+              },
+              {
+                "passed": true,
+                "first_mismatch": null,
+                "expected": [
+                  364
+                ],
+                "actual": [
+                  364
+                ]
+              }
+            ]
+          },
+          {
+            "full_greedy": {
+              "passed": true,
+              "first_mismatch": null,
+              "expected": [
+                15087,
+                271,
+                10061,
+                400,
+                69,
+                2075,
+                8,
+                284,
+                1124,
+                37018,
+                90,
+                16,
+                15170,
+                87,
+                61,
+                17
+              ],
+              "actual": [
+                15087,
+                271,
+                10061,
+                400,
+                69,
+                2075,
+                8,
+                284,
+                1124,
+                37018,
+                90,
+                16,
+                15170,
+                87,
+                61,
+                17
+              ]
+            },
+            "teacher_forced_first_tokens": [
+              {
+                "passed": true,
+                "first_mismatch": null,
+                "expected": [
+                  15087
+                ],
+                "actual": [
+                  15087
+                ]
+              },
+              {
+                "passed": true,
+                "first_mismatch": null,
+                "expected": [
+                  271
+                ],
+                "actual": [
+                  271
+                ]
+              },
+              {
+                "passed": true,
+                "first_mismatch": null,
+                "expected": [
+                  10061
+                ],
+                "actual": [
+                  10061
+                ]
+              },
+              {
+                "passed": true,
+                "first_mismatch": null,
+                "expected": [
+                  400
+                ],
+                "actual": [
+                  400
+                ]
+              }
+            ]
+          }
+        ],
+        "reset_replay": [
+          {
+            "passed": true,
+            "first_mismatch": null,
+            "expected": [
+              8673,
+              25,
+              508,
+              364,
+              1234,
+              516,
+              364,
+              1234,
+              2808,
+              6,
+              2279,
+              335,
+              330,
+              4710,
+              1986,
+              374
+            ],
+            "actual": [
+              8673,
+              25,
+              508,
+              364,
+              1234,
+              516,
+              364,
+              1234,
+              2808,
+              6,
+              2279,
+              335,
+              330,
+              4710,
+              1986,
+              374
+            ]
+          },
+          {
+            "passed": true,
+            "first_mismatch": null,
+            "expected": [
+              15087,
+              271,
+              10061,
+              400,
+              69,
+              2075,
+              8,
+              284,
+              1124,
+              37018,
+              90,
+              16,
+              15170,
+              87,
+              61,
+              17
+            ],
+            "actual": [
+              15087,
+              271,
+              10061,
+              400,
+              69,
+              2075,
+              8,
+              284,
+              1124,
+              37018,
+              90,
+              16,
+              15170,
+              87,
+              61,
+              17
+            ]
+          }
+        ]
+      }
+    ],
+    "passed": true
+  },
+  "native_logits": {
+    "passed": false,
+    "strict_reference_passed": false,
+    "deterministic_invariants_passed": true,
+    "cross_mode_prefill_exact": {
+      "executed": true,
+      "checks": [
+        {
+          "passed": true,
+          "expected_shape": [
+            4,
+            151936
+          ],
+          "actual_shape": [
+            4,
+            151936
+          ],
+          "finite": true,
+          "contract": "Exact dtype, shape and bytes; no tolerance"
+        },
+        {
+          "passed": true,
+          "expected_shape": [
+            5,
+            151936
+          ],
+          "actual_shape": [
+            5,
+            151936
+          ],
+          "finite": true,
+          "contract": "Exact dtype, shape and bytes; no tolerance"
+        }
+      ]
+    },
+    "module": "_edge_qwen3_logits_test.cpython-312-x86_64-linux-gnu.so",
+    "module_sha256": "15af30db7c2bc20eaa9deaa802a0fe9e9e840142ebd3645c227e0c5e0da472f0",
+    "absolute_tolerance": 0.015625,
+    "relative_tolerance": 0.01,
+    "tolerance_formula": "abs(actual-reference) <= 0.015625 + 0.01 * max(abs(reference),abs(actual)); exact row argmax also required",
+    "scope": "All copied BF16 logits for recorded local-checkpoint prompts and teacher-forced continuations; private interleaved eager/graph histories and reset",
+    "modes": [
+      {
+        "mode": "eager",
+        "capacity": 128,
+        "prompts": [
+          {
+            "checks": {
+              "prefill": {
+                "passed": false,
+                "shape": [
+                  4,
+                  151936
+                ],
+                "max_absolute_error": 0.660888671875,
+                "mean_absolute_error": 0.06886468080489126,
+                "cosine_similarity": 0.9988465674179681,
+                "outside_tolerance": 321501,
+                "compared_values": 607744,
+                "nonfinite_values": 0,
+                "reference_argmax": [
+                  14582,
+                  330,
+                  92,
+                  8673
+                ],
+                "native_argmax": [
+                  14582,
+                  330,
+                  92,
+                  8673
+                ],
+                "argmax_matches": true
+              },
+              "incremental": {
+                "passed": false,
+                "shape": [
+                  16,
+                  151936
+                ],
+                "max_absolute_error": 0.59375,
+                "mean_absolute_error": 0.04136436984121593,
+                "cosine_similarity": 0.9997576629566723,
+                "outside_tolerance": 1268012,
+                "compared_values": 2430976,
+                "nonfinite_values": 0,
+                "reference_argmax": [
+                  8673,
+                  25,
+                  508,
+                  364,
+                  1234,
+                  516,
+                  364,
+                  1234,
+                  2808,
+                  6,
+                  2279,
+                  335,
+                  330,
+                  4710,
+                  1986,
+                  374
+                ],
+                "native_argmax": [
+                  8673,
+                  25,
+                  508,
+                  364,
+                  1234,
+                  516,
+                  364,
+                  1234,
+                  2808,
+                  6,
+                  2279,
+                  335,
+                  330,
+                  4710,
+                  1986,
+                  374
+                ],
+                "argmax_matches": true
+              },
+              "teacher_forced_first_rows": {
+                "passed": false,
+                "shape": [
+                  4,
+                  151936
+                ],
+                "max_absolute_error": 0.375,
+                "mean_absolute_error": 0.05366994499238898,
+                "cosine_similarity": 0.9995676892882005,
+                "outside_tolerance": 381402,
+                "compared_values": 607744,
+                "nonfinite_values": 0,
+                "reference_argmax": [
+                  8673,
+                  25,
+                  508,
+                  364
+                ],
+                "native_argmax": [
+                  8673,
+                  25,
+                  508,
+                  364
+                ],
+                "argmax_matches": true
+              },
+              "reset_replayed_prefill": {
+                "passed": false,
+                "shape": [
+                  4,
+                  151936
+                ],
+                "max_absolute_error": 0.660888671875,
+                "mean_absolute_error": 0.06886468080489126,
+                "cosine_similarity": 0.9988465674179681,
+                "outside_tolerance": 321501,
+                "compared_values": 607744,
+                "nonfinite_values": 0,
+                "reference_argmax": [
+                  14582,
+                  330,
+                  92,
+                  8673
+                ],
+                "native_argmax": [
+                  14582,
+                  330,
+                  92,
+                  8673
+                ],
+                "argmax_matches": true
+              }
+            },
+            "kv_lengths": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19
+            ],
+            "kv_growth_matches": true,
+            "reset_replay_exact": {
+              "passed": true,
+              "expected_shape": [
+                4,
+                151936
+              ],
+              "actual_shape": [
+                4,
+                151936
+              ],
+              "finite": true,
+              "contract": "Exact dtype, shape and bytes; no tolerance"
+            },
+            "fixture": "native-eager-prompt-000.npz",
+            "fixture_sha256": "81d80789d8995ce239af47edb4b32e0a78a02566b0c7524b2391a70d96209960"
+          },
+          {
+            "checks": {
+              "prefill": {
+                "passed": false,
+                "shape": [
+                  5,
+                  151936
+                ],
+                "max_absolute_error": 0.44921875,
+                "mean_absolute_error": 0.04659921495641504,
+                "cosine_similarity": 0.9997449694472438,
+                "outside_tolerance": 387816,
+                "compared_values": 759680,
+                "nonfinite_values": 0,
+                "reference_argmax": [
+                  14582,
+                  16,
+                  15087,
+                  15087,
+                  15087
+                ],
+                "native_argmax": [
+                  14582,
+                  16,
+                  15087,
+                  15087,
+                  15087
+                ],
+                "argmax_matches": true
+              },
+              "incremental": {
+                "passed": false,
+                "shape": [
+                  16,
+                  151936
+                ],
+                "max_absolute_error": 0.3125,
+                "mean_absolute_error": 0.03922071434213586,
+                "cosine_similarity": 0.9998761534386221,
+                "outside_tolerance": 1037421,
+                "compared_values": 2430976,
+                "nonfinite_values": 0,
+                "reference_argmax": [
+                  15087,
+                  271,
+                  10061,
+                  400,
+                  69,
+                  2075,
+                  8,
+                  284,
+                  1124,
+                  37018,
+                  90,
+                  16,
+                  15170,
+                  87,
+                  61,
+                  17
+                ],
+                "native_argmax": [
+                  15087,
+                  271,
+                  10061,
+                  400,
+                  69,
+                  2075,
+                  8,
+                  284,
+                  1124,
+                  37018,
+                  90,
+                  16,
+                  15170,
+                  87,
+                  61,
+                  17
+                ],
+                "argmax_matches": true
+              },
+              "teacher_forced_first_rows": {
+                "passed": false,
+                "shape": [
+                  4,
+                  151936
+                ],
+                "max_absolute_error": 0.3125,
+                "mean_absolute_error": 0.05104544747743611,
+                "cosine_similarity": 0.9997164595942519,
+                "outside_tolerance": 359827,
+                "compared_values": 607744,
+                "nonfinite_values": 0,
+                "reference_argmax": [
+                  15087,
+                  271,
+                  10061,
+                  400
+                ],
+                "native_argmax": [
+                  15087,
+                  271,
+                  10061,
+                  400
+                ],
+                "argmax_matches": true
+              },
+              "reset_replayed_prefill": {
+                "passed": false,
+                "shape": [
+                  5,
+                  151936
+                ],
+                "max_absolute_error": 0.44921875,
+                "mean_absolute_error": 0.04659921495641504,
+                "cosine_similarity": 0.9997449694472438,
+                "outside_tolerance": 387816,
+                "compared_values": 759680,
+                "nonfinite_values": 0,
+                "reference_argmax": [
+                  14582,
+                  16,
+                  15087,
+                  15087,
+                  15087
+                ],
+                "native_argmax": [
+                  14582,
+                  16,
+                  15087,
+                  15087,
+                  15087
+                ],
+                "argmax_matches": true
+              }
+            },
+            "kv_lengths": [
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20
+            ],
+            "kv_growth_matches": true,
+            "reset_replay_exact": {
+              "passed": true,
+              "expected_shape": [
+                5,
+                151936
+              ],
+              "actual_shape": [
+                5,
+                151936
+              ],
+              "finite": true,
+              "contract": "Exact dtype, shape and bytes; no tolerance"
+            },
+            "fixture": "native-eager-prompt-001.npz",
+            "fixture_sha256": "ea7ed8cb7fa44c8db1a8bc9e7f3dbaf46959139e9c8768b9c85a9f601967e715"
+          }
+        ]
+      },
+      {
+        "mode": "graph",
+        "capacity": 128,
+        "prompts": [
+          {
+            "checks": {
+              "prefill": {
+                "passed": false,
+                "shape": [
+                  4,
+                  151936
+                ],
+                "max_absolute_error": 0.660888671875,
+                "mean_absolute_error": 0.06886468080489126,
+                "cosine_similarity": 0.9988465674179681,
+                "outside_tolerance": 321501,
+                "compared_values": 607744,
+                "nonfinite_values": 0,
+                "reference_argmax": [
+                  14582,
+                  330,
+                  92,
+                  8673
+                ],
+                "native_argmax": [
+                  14582,
+                  330,
+                  92,
+                  8673
+                ],
+                "argmax_matches": true
+              },
+              "incremental": {
+                "passed": false,
+                "shape": [
+                  16,
+                  151936
+                ],
+                "max_absolute_error": 0.5625,
+                "mean_absolute_error": 0.04444651612978672,
+                "cosine_similarity": 0.9997244774389824,
+                "outside_tolerance": 1336603,
+                "compared_values": 2430976,
+                "nonfinite_values": 0,
+                "reference_argmax": [
+                  8673,
+                  25,
+                  508,
+                  364,
+                  1234,
+                  516,
+                  364,
+                  1234,
+                  2808,
+                  6,
+                  2279,
+                  335,
+                  330,
+                  4710,
+                  1986,
+                  374
+                ],
+                "native_argmax": [
+                  8673,
+                  25,
+                  508,
+                  364,
+                  1234,
+                  516,
+                  364,
+                  1234,
+                  2808,
+                  6,
+                  2279,
+                  335,
+                  330,
+                  4710,
+                  1986,
+                  374
+                ],
+                "argmax_matches": true
+              },
+              "teacher_forced_first_rows": {
+                "passed": false,
+                "shape": [
+                  4,
+                  151936
+                ],
+                "max_absolute_error": 0.375,
+                "mean_absolute_error": 0.05366994499238898,
+                "cosine_similarity": 0.9995676892882005,
+                "outside_tolerance": 381402,
+                "compared_values": 607744,
+                "nonfinite_values": 0,
+                "reference_argmax": [
+                  8673,
+                  25,
+                  508,
+                  364
+                ],
+                "native_argmax": [
+                  8673,
+                  25,
+                  508,
+                  364
+                ],
+                "argmax_matches": true
+              },
+              "reset_replayed_prefill": {
+                "passed": false,
+                "shape": [
+                  4,
+                  151936
+                ],
+                "max_absolute_error": 0.660888671875,
+                "mean_absolute_error": 0.06886468080489126,
+                "cosine_similarity": 0.9988465674179681,
+                "outside_tolerance": 321501,
+                "compared_values": 607744,
+                "nonfinite_values": 0,
+                "reference_argmax": [
+                  14582,
+                  330,
+                  92,
+                  8673
+                ],
+                "native_argmax": [
+                  14582,
+                  330,
+                  92,
+                  8673
+                ],
+                "argmax_matches": true
+              }
+            },
+            "kv_lengths": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19
+            ],
+            "kv_growth_matches": true,
+            "reset_replay_exact": {
+              "passed": true,
+              "expected_shape": [
+                4,
+                151936
+              ],
+              "actual_shape": [
+                4,
+                151936
+              ],
+              "finite": true,
+              "contract": "Exact dtype, shape and bytes; no tolerance"
+            },
+            "fixture": "native-graph-prompt-000.npz",
+            "fixture_sha256": "797ae7359d963872421c77346f794ad6ccc6c4961dfb96060dae57de327c4d41"
+          },
+          {
+            "checks": {
+              "prefill": {
+                "passed": false,
+                "shape": [
+                  5,
+                  151936
+                ],
+                "max_absolute_error": 0.44921875,
+                "mean_absolute_error": 0.04659921495641504,
+                "cosine_similarity": 0.9997449694472438,
+                "outside_tolerance": 387816,
+                "compared_values": 759680,
+                "nonfinite_values": 0,
+                "reference_argmax": [
+                  14582,
+                  16,
+                  15087,
+                  15087,
+                  15087
+                ],
+                "native_argmax": [
+                  14582,
+                  16,
+                  15087,
+                  15087,
+                  15087
+                ],
+                "argmax_matches": true
+              },
+              "incremental": {
+                "passed": false,
+                "shape": [
+                  16,
+                  151936
+                ],
+                "max_absolute_error": 0.359375,
+                "mean_absolute_error": 0.03855747962974291,
+                "cosine_similarity": 0.9998817425307562,
+                "outside_tolerance": 1013110,
+                "compared_values": 2430976,
+                "nonfinite_values": 0,
+                "reference_argmax": [
+                  15087,
+                  271,
+                  10061,
+                  400,
+                  69,
+                  2075,
+                  8,
+                  284,
+                  1124,
+                  37018,
+                  90,
+                  16,
+                  15170,
+                  87,
+                  61,
+                  17
+                ],
+                "native_argmax": [
+                  15087,
+                  271,
+                  10061,
+                  400,
+                  69,
+                  2075,
+                  8,
+                  284,
+                  1124,
+                  37018,
+                  90,
+                  16,
+                  15170,
+                  87,
+                  61,
+                  17
+                ],
+                "argmax_matches": true
+              },
+              "teacher_forced_first_rows": {
+                "passed": false,
+                "shape": [
+                  4,
+                  151936
+                ],
+                "max_absolute_error": 0.3125,
+                "mean_absolute_error": 0.05104544747743611,
+                "cosine_similarity": 0.9997164595942519,
+                "outside_tolerance": 359827,
+                "compared_values": 607744,
+                "nonfinite_values": 0,
+                "reference_argmax": [
+                  15087,
+                  271,
+                  10061,
+                  400
+                ],
+                "native_argmax": [
+                  15087,
+                  271,
+                  10061,
+                  400
+                ],
+                "argmax_matches": true
+              },
+              "reset_replayed_prefill": {
+                "passed": false,
+                "shape": [
+                  5,
+                  151936
+                ],
+                "max_absolute_error": 0.44921875,
+                "mean_absolute_error": 0.04659921495641504,
+                "cosine_similarity": 0.9997449694472438,
+                "outside_tolerance": 387816,
+                "compared_values": 759680,
+                "nonfinite_values": 0,
+                "reference_argmax": [
+                  14582,
+                  16,
+                  15087,
+                  15087,
+                  15087
+                ],
+                "native_argmax": [
+                  14582,
+                  16,
+                  15087,
+                  15087,
+                  15087
+                ],
+                "argmax_matches": true
+              }
+            },
+            "kv_lengths": [
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20
+            ],
+            "kv_growth_matches": true,
+            "reset_replay_exact": {
+              "passed": true,
+              "expected_shape": [
+                5,
+                151936
+              ],
+              "actual_shape": [
+                5,
+                151936
+              ],
+              "finite": true,
+              "contract": "Exact dtype, shape and bytes; no tolerance"
+            },
+            "fixture": "native-graph-prompt-001.npz",
+            "fixture_sha256": "727288ff503eeba6fbeb76e279176d5020db55da3cf99ed1383649f8f6786d49"
+          }
+        ]
+      }
+    ]
+  },
+  "recorded_date": "2026-10-06",
+  "source_manifest_sha256": "baf8adaab0c868e777520a1e24b336c5ca562e66ca52b7f5af53bccab7c48eaa",
+  "native_source_snapshot": {
+    "base_commit": "6fafb0213197b08a13b379a73b81ab42be86bf29",
+    "algorithm": "sha256",
+    "content_policy": "Exact working-tree bytes used for local builds; Git normalizes repository text to LF, so line endings can change checkout byte hashes without changing source semantics.",
+    "files": {
+      "bindings/python/CMakeLists.txt": "825bb5297230540426a44b30916006457aa54b0d5fa02a82a6a75efbc9422aad",
+      "bindings/python/device_config.py": "f5b978cce9510509385a35f5ad767865e832f04f849f7f590795ee4072cad06d",
+      "bindings/python/include/decoder_weight_mapper.hpp": "c06153a960c966f5f6c1a0007a9dd03a737065cbe203dd0035a68b157bee2c45",
+      "bindings/python/include/python_callback.hpp": "58bcb0737ad96e67e284e6b28f10570b3c07832d62fab2cd56a89863d9cf2371",
+      "bindings/python/include/weight_processor_utils.hpp": "634901c24626c3ebf125d3dbecabf3f4d4431947f854e6a5062b23ec24c122d8",
+      "bindings/python/include/weight_processor.hpp": "90a44fd7aa9d55c1041e54f94d907c8bd9d2f97c8b77efcb86c35dd8f0b5f193",
+      "bindings/python/model_bridge.cpp": "01375000e9936c2be58dacaad2f9edf104c6cf68099c8221cbce468b196dc267",
+      "bindings/python/model_initializer.cpp": "c086a916b9aff6f7aa0f3bc987d32dd68bc5d36a52c707df1d0e8b24d33b763d",
+      "bindings/python/model_initializer.hpp": "135021c068221cd0a12af4858a34550fd57f28097d5fe57830f5123c077d4f7a",
+      "bindings/python/tests/callback_boundary_module.cpp": "d999f765c1b9603783faf96c86e185b0005463762432a4ec52331a1d153f9bf4",
+      "bindings/python/tests/callback_boundary_test.py": "18561e893efb3cf5d50ab5ac825bf9e407ccb431fe7692021fb43fd0932f2d3c",
+      "bindings/python/tests/CMakeLists.txt": "bb10a7aadf59ca9430a37b1b0deb97fb8567d319ce685383f2256186e74c83fb",
+      "bindings/python/tests/model_session_test.py": "89f604f00c487173e600bc0b97fbc0966c9d94a935e690e4a97a636a8a39df66",
+      "bindings/python/tests/qwen3_logits_module.cpp": "1eb7d27a517eb44aeafccb5de1da197c38a7f7c6756d140ccaef5f4b1e7a238b",
+      "bindings/python/tests/weight_conversion_module.cpp": "f25e75b4e773c4896647fb95f259c030c75940cb80f8fde6439634d28dff0191",
+      "bindings/python/tests/weight_conversion_test.py": "56bffdbcae4852aa2adb4d47f02bb3eea0429091bd9a790460e103a41562d37f",
+      "CMakeLists.txt": "b7fc7fb7fcf34f9a7ddf1f8fe345c651801223ade2b6e04f91b15783e5a885e5",
+      "core/CMakeLists.txt": "0873be54152221a0d07699f8122f7379909be3bf8794a60793b286633f12b78b",
+      "core/include/execution/workspace_liveness.hpp": "011a2dd82f8290f5ce04876f5489ac6cc6c7d9158b176ba0ef5eee54c8d46b22",
+      "core/include/execution/workspace_plan.hpp": "925f1d7d043cacf3b5fed7806e996876b4ca545d762a4e8461af695acde9aa49",
+      "core/include/tensor_view_adapter.hpp": "d8b1146fd232cd2091db765b1a88d630ae5d4645a3e8284d8f7e5a2dfb57bbf3",
+      "core/include/tensor_view.hpp": "e2c783524cbd38472385d5c4af46cce78ae46f653aefdb916e34b10c62d1fd1e",
+      "core/include/tensor.hpp": "505d07fbcfc318933b32459dd145202146168bbfe4a9fe06b21555508eb51798",
+      "core/include/weight_tensor.hpp": "900837fb42bb8d31a31ffbe6e3b3c3eba7297087da5b13f132f346eff07f5cb8",
+      "core/tests/support/allocation_probe.cpp": "aab90a3e6d88890a2bc2048ec62f7d180bb12d2aacf4cd4ed889d40cdbd3be36",
+      "core/tests/support/allocation_probe.hpp": "71c783eca8cc4dc20d8a2d2d1bd655f45b83cbf8fee35e906690b78fd5e98469",
+      "frontend/chat.py": "58c87f645314282cc1ad9d614819fe1d56892c63725c76ac538f73b3443a8084",
+      "frontend/checkpoint.py": "2137b643d969331b3c3b216a1fed22b9f1f5fc151d81c8a13f1455a16efe69f3",
+      "frontend/tests/test_checkpoint.py": "9cfb045a974c5c2c7bcfacbd94da6ae663799e998467499ffcbebc294f457296",
+      "operators/CMakeLists.txt": "371b1c368291dfa73e6101f1d93efa4a71510ce34130246352f33a9afb734795",
+      "operators/include/operators/core/array_view.hpp": "26b4da96d8cc1340ab4c8da04512839b73b999bba083b63e5d44b5a7eb29cfd2",
+      "operators/include/operators/core/cpu_reference.hpp": "39307790a39261f30e83b4f50039881df75be19df032aa30e4fb4015e449d5c8",
+      "operators/include/operators/cuda/conditioning.hpp": "35da9f038ed0b6389b2136b6c31a0ce8e714d77deaf31f302e1eabbef2fd98d4",
+      "operators/include/operators/cuda/direct.hpp": "ea27f89baa56548f61fbe6469331f39c84608bd9eec83a27e8ba17c1af3d1eb6",
+      "operators/include/operators/cuda/execution_kernels.cuh": "fc88c5a112418363d291352581e49bea5f0d5834b4063af1573fd2a35771508b",
+      "operators/include/operators/cuda/execution.hpp": "b4be5815a95f4539773ec34b658c7badcbae82d90beaf96a2a36879a7f72be50",
+      "operators/include/operators/cuda/random.hpp": "cc0782335cf4cb3e632d8e195ef72ff922462e0d892d73453734355da4397230",
+      "operators/src/cuda/add_cuda.cu": "4ee5def852f4bd7c638d5899ca1e73c1ee5cb85f669cb4878f3af9978d86811c",
+      "operators/src/cuda/conditioning.cu": "89c60d5f469b18529ff775cf000372fcb4b9abe8090a721cc3809a3334f00c79",
+      "operators/src/cuda/elementwise_math.cuh": "d342d74f01c868f6649e66afc148d58c7e136a69182fe376d2cc6b5166c83b44",
+      "operators/src/cuda/execution.cu": "858e88bc659d7df52efae2b6223796ba59ea6292c05caefc81c41272fcc3afdf",
+      "operators/src/cuda/kernels/awq_gemv_gemm.cu": "6af16a7b1fc138c1377754fd68955def7de70c145c2f2d7ae00c3028e0e1f498",
+      "operators/src/cuda/kernels/flash_attention_graph.cu": "021dbb13580b6ed039d154b4f500212263c7663ca43a74d2c00b32b2f49c1d6d",
+      "operators/src/cuda/kernels/flash_attention_variable.cu": "37b5c7c47c8a451a466f09b459a07f03ee20222a48ed9fa4c92c9e3d1face9e9",
+      "operators/src/cuda/kernels/flash_attn_prefill.cu": "53d559ed0ec8e17b9d8c260ae6be474b5160af380e12f3101ca88e1b2107c775",
+      "operators/src/cuda/kernels/gather_fa_graph.cu": "953c6d94d046607e8ad292edfb0fdb4a16caf26f90afd817eeccb0eef85e5a21",
+      "operators/src/cuda/kernels/gather_fa_variable.cu": "7e88bcaeb4b2a0c40a389816f7af7b0ef1b39f1d5d01fa16c8c6bd25b9c6d65e",
+      "operators/src/cuda/multiply_cuda.cu": "285f13d1398e9d012b325bc83cb0a5d7c1938b27eca587164fb836d923d756ad",
+      "operators/src/cuda/random.cu": "eba45d55d03d6ff5bdf700052e1fc6ef04b0da5936fb842f269660701449966b",
+      "operators/src/cuda/rms_norm_cuda.cu": "5dc8dae900ee6cbe6859da1c29ee2225db0661b5c1f39397c340a15ba6fc390f",
+      "operators/src/cuda/silu_cuda.cu": "54c86a2267585d0ace3a208c11734096ef94f470666ee33421f144e4f6ddf6c2",
+      "operators/src/cuda/vector_pack.cuh": "25c503c0c554daa13dcdcc231010559b18816391f5af2401e819d8b609afeaf6",
+      "operators/tests/CMakeLists.txt": "fc1e1ab7d0b69c9c961e015bf130204f81500520ebb268862544ed47263e4542",
+      "operators/tests/decode_workspace_plan_test.cpp": "0fe667ed2bdfa733e8610652d5bb6dd8b57900d86d9bc7ea7c1acc1a56c3dab0",
+      "operators/tests/operators_core_test.cpp": "2c2176986204d2ca0e8e60d4aa584a625507a7fda9b6eb8d94ff2e96d589338b",
+      "operators/tests/operators_cuda_attention_precision_test.cu": "36af1fcd2af26c46f606e01284cfe44c067959533fa4aec4c2a47b0a360d734c",
+      "operators/tests/operators_cuda_awq_test.cu": "9cf00499a0758a523318cce3e64571c0ad92d90af853e34d85fe28ac30b322aa",
+      "operators/tests/operators_cuda_bf16_contract_test.cu": "74076bfd03b03b4a03050775093ab7cd4e0aeb1a0ec313bf5184706332368815",
+      "operators/tests/operators_cuda_conditioning_test.cu": "7a6dda87f130e5cad68fd81562c31838ce5aa909a6fd34588ba933eeae5270f6",
+      "operators/tests/operators_cuda_direct_test.cu": "13b0e1ceffdf948fbd9c6a4675d3269231fa95a63aabeac27094a7a0569221fc",
+      "operators/tests/operators_cuda_sampling_test.cu": "da9a7092406226500c8b87177c25a27b185bf99b08a5a461f9a8ede5df3dee0c",
+      "operators/tests/tensor_view_test.cpp": "61f4204c3e1038836e86197f72f2c2c7550158251d3e07d2b45c2b66b92c0191",
+      "operators/tests/workspace_liveness_test.cpp": "3d67b9019e66f9df03d0ede121d4e3d900ccb306fed6891be293c7cc95f0318b",
+      "runtime/CMakeLists.txt": "48529efe22b9177a46fd7ca03ad48a5d3630481b44653877a5f395f90b359ea7",
+      "runtime/include/base_model.hpp": "9cee74341dbd52a5ee7801b6076e24498fe35b6ada9ded8a93450043753162c2",
+      "runtime/include/common.hpp": "c39e580d53deaad60134f21009eb92b09451bb3017c061fff0497775c15a40e1",
+      "runtime/include/device_manager.hpp": "47b15aa44da4c3801f9aaa2ad918eea8c81201979ff10b40f5bc67ff2f98f535",
+      "runtime/include/execution/cuda_workspace_arena.hpp": "d1ecb9542e46122c45baceb3baad6d1ea14837feee59628ba375856984c7e79b",
+      "runtime/include/execution/decoder.hpp": "214fd9732de0451d8128b157edcf9eb0c1dddff477e38e90f6c13c6e5aae5096",
+      "runtime/include/inference.hpp": "cfbe05032ea0a2303e0204c8e95f25183897226bf8c53658435d0a3d1a3eb609",
+      "runtime/include/kvcache_base.hpp": "10a60e5bab9d7d2ad52569ad60fde5b4a7763c10eb454ac4f80b0b8dd47c6e79",
+      "runtime/include/model_factory.hpp": "4ef9ecd6ba904de1867d5822e886e855c058f533a4aa6039895301d737fa03f9",
+      "runtime/include/models/qwen3_model.hpp": "df6160cbd52b1e91768ed0e141748e132d634b3b18f1a2c062fd90a745cc632c",
+      "runtime/include/qwen.hpp": "67224702c14e8ced97ac53760b36e40482563bd0f8c8a38d28a6a2ee1eb1f549",
+      "runtime/include/qwen3.hpp": "d59cfcd83069ade52c381182ae561f0fdde3a57ed9cc9c98f9db6e3b9e3f855b",
+      "runtime/include/speculative_decoder.hpp": "c8358ec19f1419c79da0052569a7c7d9772c597156f2d12f16c3d3b8ec2302df",
+      "runtime/include/speculative_model.hpp": "da474d1be446ba71442e34ddbe7e754d2c4a4977ac2026642ddf09e3c72559ab",
+      "runtime/include/speech/qwen_tts_conditioning.hpp": "26e6312f1cb3768a167554f69c881bb4f832b554b0180b9392f7475fb02f3ff1",
+      "runtime/include/thread_pool.hpp": "a34f9cb38851e680ff79c6127da14fc9f99cab674947a60a7862be43df01d9e9",
+      "runtime/src/inference.cpp": "1fdbc203b44ef8bfae952369271d7b0a5a9d05b528878aa16362948d2ff9257d",
+      "runtime/src/qwen.cpp": "38cc4937be869682fc5b8250c1ec1a69f0d5dc17db251ea92da0d08da863b239",
+      "runtime/src/qwen3.cpp": "6f0db55f18693fd9597f5475f094ec9b38a8fedd27d0af49bb8142bb5c1f40f7",
+      "runtime/src/speculative_decoder.cpp": "698effc1d9807943ed2af4c8a5ec2bb3697a4ebd39e8b2b936dcfe99f972b34e",
+      "runtime/src/speech/qwen_tts_conditioning.cpp": "2e21a7a41534d4e2117a4af59aac114264e42b77e347eed1b73711a37664bc86",
+      "runtime/src/thread_pool.cpp": "1c9c0ae844ba8e9797109b1e88e5d3b287ca7c7e132a967db17d21301d4963dc",
+      "runtime/tests/cuda_workspace_arena_test.cpp": "5aec1e5b99d36215c8708d261c184af87548a7b8a009c4618a70fd287ba9272e",
+      "runtime/tests/decoder_output_plan_test.cpp": "fc609d365f71c9e76437deb8e854e0bcaf09808e9d7a922abe69b091ac8af76b",
+      "runtime/tests/inference_generation_test.cpp": "d08720b4d866c93ad972af57f461975ad773c669b4b4532143d506cc4673e6ce",
+      "runtime/tests/qwen_cpu_session_test.cpp": "fc3a728d976ae9f35676177df0f6e34d09174f7da0272d41bdd6a33f8323ddac",
+      "runtime/tests/qwen_tts_conditioning_parity.cpp": "a50bd203bbd64f439120ad813919860bfaefc199e339c4270a6d88876f34f7ff",
+      "runtime/tests/qwen2_float_test.cpp": "2bbfa3bba4b2b1b0973bbfa042781216e2ff25869279c92dec121bb9e58d8808",
+      "runtime/tests/qwen3_session_test.cpp": "85a948dcce50877978ce64581488358a7d33a171403f85818ddf10ad5083ff03",
+      "runtime/tests/runtime_callback_test.cpp": "d91a7d5d0e22fff768b5d3282d8235db836c2592521c58c9bb4162a7b3496f4c",
+      "runtime/tests/tensor_storage_test.cpp": "340a3beb322cf15b3c8132dda5225c7e7279463226a55a3fa1b9c580eea024ff",
+      "runtime/tests/test_cuda_rng.cu": "a7ee0d801df63fda0e4cf048b5a78178753e8ac08ae7e267d22951c4ebd2e9c3",
+      "runtime/tests/test_cuda_rng.hpp": "37e904f9219751ad3f771f4e450f82f1a93905e8f9bcf189eaa54d1bfd50d812",
+      "tools/analysis/analyze_qwen_model.py": "6da3839fc90c6402b45d9f9f2a1425a4c1d5a4c934683536ec332eb6aac80bc6",
+      "tools/analysis/awq_debug.py": "4a58521877d3b3b64bbfc229cec886499cdace1d77e7900c7f93693a78efb496",
+      "tools/analysis/check_scales.py": "d28a614638f0acf619780d284039e5b18279075b3f8e8d29ab25840a36c17d22",
+      "tools/analysis/compare_embedding.py": "ba65c15115697c9a30b9685d839de2515ff0b9eb070bdc9b82c9830a46e3194c",
+      "tools/analysis/compare_tensors.py": "e2b01b83bf080554698bcd8ad2c81744461d1f254d3b2e4bddb6407c92d6a45d",
+      "tools/analysis/model_analysis.py": "2704b5c16092e5a44fa6b22ce1f789421944a06b335390f8d019797b8b13f1ef",
+      "tools/analysis/print_model_shapes.py": "79a203829f6fcd5554dc82de328c9b14772c27de00ef9dd6dafb7a619338bc67",
+      "tools/analysis/qwen_model_structure.py": "4cef60cf9057231c99d3ce9b5f8b16a72fc2f71bd208b25cc6e447a17023389f",
+      "tools/analysis/qwen3_inspect.py": "cb965ebd09c4e5e72680aedece2636476c5393180756b18e42fdc81b25b9d637",
+      "tools/conversion/qwen_tts_checkpoint.py": "b85c33d0c3bc733e909e3c95681eb876fe1f40e7be209f4c97d166fbd4be874f",
+      "tools/quantization/quantize_qwen.py": "5215cc4928c5e2e618ff334004accf21428c7fb859e60df17beca295b844822b",
+      "tools/quantization/quantize_qwen3.py": "8c9caf79fc976d1c9523aa21583d4a461a0403a7ef8896d2d4aaa40693d25347",
+      "tools/validation/qwen_tts_conditioning_reference.py": "b6ca5e3c3855fa6d60625820ec3682077977a655d1489d090795276575348779",
+      "tools/validation/qwen3_reference.py": "00c30b10d4906bb0ab6bb9682b0c7fd0190526f82ee35fe2b84b16031c9527fb",
+      "tools/validation/reference_generation.py": "b20b340f89b43d45a030c7b58a59d5b073c96f4072c322a353c5f5d4a5f5b9d8",
+      "tools/validation/test_speculative_decoding.py": "75de9dc77dbeede1063508f1225a932423522ad4787b3da72d4a8056f073434a",
+      "tools/validation/tests/test_qwen_tts_checkpoint.py": "884cd85cffec35bae5b10387143056c549285aa025920c1ca8d1a7e1e556b27f",
+      "tools/validation/tests/test_qwen3_reference_artifacts.py": "036d98e78e039e480be4ee9b8cd2e63ae2dd2c23e5bf54f36b15adb10ba52fed"
+    }
+  },
+  "result_note": "Strict eager-reference full-logit comparison failed at unchanged tolerances. Both modes match all 32 reference greedy tokens, exact reset/replay, cache growth and cross-mode prefill checks. Saved reference provenance and fixtures were verified; no Torch model or tokenizer was loaded. Absolute source/module/reuse paths are normalized; raw arrays remain reproducible local outputs."
+}

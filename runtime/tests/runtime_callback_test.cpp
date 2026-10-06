@@ -24,16 +24,24 @@ class WorkerError : public std::runtime_error {
   WorkerError() : std::runtime_error("native prefill failed") {}
 };
 
+class DecodeError : public std::runtime_error {
+ public:
+  DecodeError() : std::runtime_error("native decode failed") {}
+};
+
 // A deterministic model verifies the public native runtime boundary without
 // checkpoints, a tokenizer, Python, or GPU execution.
 class TokenModel final : public BaseModel {
  public:
-  explicit TokenModel(bool fail_prefill = false, bool mutate_on_cuda = false)
-      : fail_prefill_(fail_prefill), mutate_on_cuda_(mutate_on_cuda) {}
+  explicit TokenModel(bool fail_prefill = false, bool mutate_on_cuda = false,
+                      bool endless = false)
+      : fail_prefill_(fail_prefill), mutate_on_cuda_(mutate_on_cuda), endless_(endless) {}
 
   uint32_t* prefill(const Tensor<uint32_t>* input, ThreadPool&, KVCacheBase* cache, size_t,
                     float, float, curandState*) override {
     ++prefill_calls;
+    prefill_thread = std::this_thread::get_id();
+    last_cache = cache;
     prefill_offset = cache->size() - input->numel();
     if (fail_prefill_) {
       throw WorkerError{};
@@ -44,7 +52,9 @@ class TokenModel final : public BaseModel {
   uint32_t* forward(const Tensor<uint32_t>*, ThreadPool&, KVCacheBase*, size_t,
                     float, float, curandState*) override {
     const int call = ++decode_calls;
-    return new uint32_t(call == 1 ? 3 : get_eos_token_id());
+    decode_thread = std::this_thread::get_id();
+    if (fail_decode) throw DecodeError{};
+    return new uint32_t(endless_ || call == 1 ? 3 : get_eos_token_id());
   }
 
   bool verify_params() const override { return true; }
@@ -61,7 +71,7 @@ class TokenModel final : public BaseModel {
     if (fail_synchronize) throw WorkerError{};
   }
   size_t get_n_layers() const override { return 1; }
-  size_t get_max_seq_len() const override { return 16; }
+  size_t get_max_seq_len() const override { return endless_ ? 1024 : 16; }
   size_t get_head_dim() const override { return 1; }
   size_t get_n_kv_heads() const override { return 1; }
   size_t get_vocab_size() const override { return 16; }
@@ -74,10 +84,14 @@ class TokenModel final : public BaseModel {
   int migration_calls = 0;
   mutable int synchronize_calls = 0;
   bool fail_synchronize = false;
+  bool fail_decode = false;
+  KVCacheBase* last_cache = nullptr;
+  std::thread::id prefill_thread, decode_thread;
 
  private:
   bool fail_prefill_;
   bool mutate_on_cuda_;
+  bool endless_;
   Device device_ = Device::CPU;
 };
 
@@ -99,6 +113,8 @@ void test_tokens_and_thread() {
   });
   require(tokens == std::vector<uint32_t>({2, 3}), "Incorrect native token stream");
   require(model->decode_calls == 2, "Generation must finish before returning");
+  require(model->prefill_thread == caller && model->decode_thread == caller,
+          "Native token operations must run on the calling thread");
 }
 
 void test_callback_exception() {
@@ -112,10 +128,107 @@ void test_callback_exception() {
     caught = std::string(error.what()) == "native callback failed";
   }
   require(caught, "The original native callback exception must reach the caller");
-  require(model->decode_calls == 2, "The generation worker must be joined on failure");
+  require(model->decode_calls == 0 && engine.context_size() == 0,
+          "Callback failure must stop before decode and discard the failed request");
 }
 
-void test_worker_exception() {
+void test_long_request_failure_and_reuse() {
+  auto model = std::make_shared<TokenModel>(false, false, true);
+  InferenceEngine<float> engine(model, Device::CPU);
+  int callbacks = 0;
+  bool caught = false;
+  try {
+    engine.generate_with_callback({1}, 1024, 1.0f, 0.9f, 1, [&](uint32_t) {
+      ++callbacks;
+      throw CallbackError{};
+    });
+  } catch (const CallbackError& error) {
+    caught = std::string(error.what()) == "native callback failed";
+  }
+  require(caught && callbacks == 1 && model->prefill_calls == 1 && model->decode_calls == 0 &&
+              engine.context_size() == 0,
+          "A first callback failure must not drain a long request or queue later tokens");
+  std::vector<uint32_t> tokens;
+  engine.generate_with_callback({1}, 8, 1.0f, 0.9f, 1,
+                                [&](uint32_t token) { tokens.push_back(token); });
+  require(tokens == std::vector<uint32_t>({2, 3, 3, 3, 3, 3, 3}) &&
+              model->decode_calls == 6 && engine.context_size() == 7,
+          "An engine must accept a fresh request after a callback failure");
+}
+
+void test_failed_callback_completion_invalidates_engine() {
+  auto model = std::make_shared<TokenModel>(false, false, true);
+  InferenceEngine<float> engine(model, Device::CPU, 4);
+  bool caught = false;
+  try {
+    engine.generate_with_callback({1}, 4, 1.0f, 0.9f, 1, [&](uint32_t) {
+      model->fail_synchronize = true;
+      throw CallbackError{};
+    });
+  } catch (const CallbackError& error) {
+    caught = std::string(error.what()) == "native callback failed";
+  }
+  require(caught && model->prefill_calls == 1 && model->decode_calls == 0,
+          "Completion failure must preserve the original callback exception");
+  // Even if a backend can later complete, the failed engine cannot reuse its
+  // existing cache or execution resources. Only a fresh engine can retry.
+  model->fail_synchronize = false;
+  const auto require_invalid = [](auto operation) {
+    bool rejected = false;
+    try { operation(); }
+    catch (const std::logic_error& error) {
+      rejected = std::string(error.what()).find("construct a new inference engine") != std::string::npos;
+    }
+    require(rejected, "Failed completion must invalidate every public engine operation");
+  };
+  ThreadPool unused(0);
+  uint32_t token = 1;
+  int callbacks = 0;
+  require_invalid([&] { engine.generate_with_callback({1}, 0, 1.0f, 0.9f, 1,
+                                                     [&](uint32_t) { ++callbacks; }); });
+  require_invalid([&] { engine.generate_next_token(unused, &token); });
+  require_invalid([&] { engine.warmup(); });
+  require_invalid([&] { engine.reset(); });
+  require_invalid([&] { engine.cuda(); });
+  require_invalid([&] { engine.cpu(); });
+  require_invalid([&] { engine.device(); });
+  require_invalid([&] { engine.context_size(); });
+  require_invalid([&] { engine.context_capacity(); });
+  require_invalid([&] { engine.set_benchmark_mode(true); });
+  require(callbacks == 0 && model->prefill_calls == 1 && model->decode_calls == 0,
+          "Invalid engine methods must reject before callbacks or native execution");
+  InferenceEngine<float> fresh(model, Device::CPU, 4);
+  std::vector<uint32_t> output;
+  fresh.generate_with_callback({1}, 4, 1.0f, 0.9f, 1,
+                               [&](uint32_t next) { output.push_back(next); });
+  require(output == std::vector<uint32_t>({2, 3, 3}),
+          "A fresh engine must be able to retry after backend completion recovers");
+}
+
+void test_decode_failure_and_reuse() {
+  auto model = std::make_shared<TokenModel>(false, false, true);
+  InferenceEngine<float> engine(model, Device::CPU);
+  model->fail_decode = true;
+  std::vector<uint32_t> tokens;
+  bool caught = false;
+  try {
+    engine.generate_with_callback({1}, 8, 1.0f, 0.9f, 1,
+                                  [&](uint32_t token) { tokens.push_back(token); });
+  } catch (const DecodeError& error) {
+    caught = std::string(error.what()) == "native decode failed";
+  }
+  require(caught && tokens == std::vector<uint32_t>{2} && model->decode_calls == 1 &&
+              engine.context_size() == 0,
+          "Native decode failure must preserve its error and discard the failed request");
+  model->fail_decode = false;
+  tokens.clear();
+  engine.generate_with_callback({1}, 4, 1.0f, 0.9f, 1,
+                                [&](uint32_t token) { tokens.push_back(token); });
+  require(tokens == std::vector<uint32_t>({2, 3, 3}),
+          "An engine must accept a fresh request after a native decode failure");
+}
+
+void test_prefill_exception() {
   auto model = std::make_shared<TokenModel>(true);
   InferenceEngine<float> engine(model, Device::CPU);
   bool caught = false;
@@ -127,7 +240,9 @@ void test_worker_exception() {
   } catch (const WorkerError& error) {
     caught = std::string(error.what()) == "native prefill failed";
   }
-  require(caught, "The original worker exception must reach the native caller");
+  require(caught, "The original prefill exception must reach the native caller");
+  require(model->prefill_calls == 1 && model->decode_calls == 0 && engine.context_size() == 0,
+          "Native prefill failure must discard the failed request before returning");
 }
 
 void test_fresh_request_and_capacity() {
@@ -300,11 +415,24 @@ void test_executor_completion_delegation() {
   bool caught = false;
   try { engine.reset(); }
   catch (const WorkerError&) { caught = true; }
-  require(caught && model->synchronize_calls == 2 && engine.context_size() == 1,
+  require(caught && model->synchronize_calls == 2 && model->last_cache->size() == 1,
           "Reset must preserve the executor's completion failure and existing context");
   model->fail_synchronize = false;
-  engine.reset();
-  require(model->synchronize_calls == 3 && engine.context_size() == 0,
+  model->synchronize();
+  const auto require_invalid = [](auto operation) {
+    bool rejected = false;
+    try { operation(); }
+    catch (const std::logic_error&) { rejected = true; }
+    require(rejected, "A successful backend cleanup cannot revive a failed engine");
+  };
+  require_invalid([&] { engine.reset(); });
+  require_invalid([&] { engine.context_size(); });
+  require(model->synchronize_calls == 3 && model->last_cache->size() == 1,
+          "Invalid engines must reject before clearing history or touching the executor");
+  InferenceEngine<float> replacement(model, Device::CPU, 4);
+  replacement.generate_with_callback({1}, 2, 1.0f, 0.9f, 1, [](uint32_t) {});
+  replacement.reset();
+  require(model->synchronize_calls == 5 && replacement.context_size() == 0,
           "Reset must clear history only after its executor completes");
 }
 
@@ -314,7 +442,10 @@ int main() {
   try {
     test_tokens_and_thread();
     test_callback_exception();
-    test_worker_exception();
+    test_long_request_failure_and_reuse();
+    test_failed_callback_completion_invalidates_engine();
+    test_decode_failure_and_reuse();
+    test_prefill_exception();
     test_fresh_request_and_capacity();
     test_cpu_sampling_rejects_before_writes();
     test_failed_migration_invalidates_engine();

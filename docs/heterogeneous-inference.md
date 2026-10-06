@@ -5,7 +5,33 @@ does not implement a heterogeneous CPU/GPU executor, expert offloading or an
 automatic hardware placement policy. Its prepared weights, independent bounded
 sessions, concrete operators and offline workspace lifetimes provide useful
 boundaries for that work. The FP32 CPU Qwen path is a correctness reference;
-having a thread pool does not make it an optimized parallel CPU backend.
+its executors share privately snapshotted weights and own independent mutable
+scratch. Having a thread pool does not make it an optimized parallel CPU backend.
+
+## Shared resource contract
+
+The common layer should manage storage and execution resources while each model
+declares its concrete computation and state transitions. A model can describe
+fixed state or bounded dynamic state/workspaces; preparation reserves within
+those bounds and resolves the views used by execution. The Qwen decoder is one
+such sequence. An iterative audio/video model needs its own sequence rather than
+an autoregressive interface with unused KV state.
+
+CPU, GPU and pinned host storage need explicit byte capacity, addressability,
+residency, scalar/quantization format, physical layout, alignment and lifetime.
+Model weights can be shared read-only; session/request state remains private.
+Transfer staging and any shared residency table need an owner, including the
+completion rules for their readers and writers. A slot is reusable only after
+its last read and write complete. Copy submission alone cannot publish a resident
+weight, and mapped host storage cannot be budgeted as GPU-resident storage.
+
+CPU jobs, copy streams and compute streams must agree on dependencies. Start with
+static placement and ordinary completion events. On cancellation or failure,
+drain submitted CPU work and transfers before releasing their backing storage or
+starting another request in it. Adaptive replacement additionally needs to prevent
+an outstanding reader from observing overwritten bytes; it must not reduce an
+existing session's promised capacity. This is a resource contract, not a proposal
+for a generic scheduler or automatic placement framework.
 
 ## Reference and scope
 
@@ -53,12 +79,62 @@ differently. Their reproducible-output controls disable or constrain some adapti
 behavior. Exact speculative verification within a chosen arithmetic path does not
 establish identical outputs across every placement, cache state or backend.
 
-## Fit for dense models, speech and Jetson
+## MiniMax H3: dense multimodal denoising
+
+This review uses the official [MiniMax H3 release][h3-release] at
+`d21241f0a4b3acbb34c97dae47fa417b7065e438`, the official-linked Diffusers
+implementation at `36438e2ee44a7b8939a06e9c635085d96ae83a3e`, and SGLang's H3
+implementation at `f3b5a28f4315767261d439baf4705f2049d8871f`. No H3 checkpoint
+has been executed by `edge-infer`.
+
+H3 uses a Qwen3-VL-32B encoder, a dense 33B Omni Transformer and separate visual
+and audio VAEs. The [released transformer config][h3-config] specifies 50 layers,
+hidden width 5376, 56 attention heads of width 128, and FFN width 14336. The
+[transformer implementation][h3-transformer] performs noncausal self-attention
+over a packed text/video/audio sequence, with partial three-axis `(t, h, w)`
+MM-RoPE and AdaLN selected by each row's timestep and modality. There is no
+cross-attention in that block stack.
+
+Each [denoising iteration][h3-denoise] predicts velocities for the full sequence,
+then updates only generated audio/video rows. Conditioning rows remain fixed.
+Audio and video use separate [rectified-flow schedules][h3-scheduler], with
+released shifts of 3 and 12 respectively. Position construction, timestep
+conventions, modulation, packing and latent updates belong to the H3 model
+implementation. They cannot be supplied by changing the weight names in the
+current causal Qwen/KV loop.
+
+The official release reports about 13B parameters in AdaLN branches whose outputs
+can be precomputed for inference. SGLang's [AdaLN cache][h3-adaln] is a relevant
+resource example: exact FP32 timestep bit patterns identify plans; cache metadata
+validates the format and model variant; read fences and completed copies govern
+publication and reuse. Its host/GPU tiers have byte budgets and an explicit
+arithmetic mode. These precomputed values can be shared when their model,
+timestep and precision contracts agree; request latents remain private.
+
+For H3, first consider encoder, transformer and VAE stage residency, then measured
+dense-block streaming with bounded staging. Unlike sparse MoE, the dense blocks
+are used on every denoising iteration, so repeatedly moving all nonresident
+weights can dominate runtime. A useful transfer accounting term is
+`nonresident dense bytes per iteration * actual model iterations`; sustainable
+copy bandwidth and overlap must be measured. Full attention still has quadratic
+arithmetic cost even if a tiled kernel avoids materializing its score matrix.
+
+As an illustration, 33B BF16 parameters occupy about 66 GB before metadata and
+alignment. Removing the reported 13B AdaLN branches leaves roughly 40 GB of dense
+weights; even an ideal four-bit representation of that remainder is about 10 GB,
+before scales, encoder/VAEs and workspaces. This arithmetic is not a supported
+quantization format, a complete memory plan or a promise that H3 fits an 8 GB GPU.
+The initial release provides full attention only. Its sparse-attention
+implementation, hosted Context-IR workflow and Regenerate-2K module are not
+included in that release.
+
+## Fit for dense models, speech, video and Jetson
 
 | Workload | Useful ideas | Required boundary |
 | --- | --- | --- |
 | Current dense Qwen backbone | Explicit memory budget, stable session arenas, measured prefill/decode policies, transfer completion and bounded staging | Dense weights are broadly used on every token. An MoE hot-expert cache does not translate directly; CPU layer offloading needs optimized CPU operators and a measured transfer/compute cost model. |
 | Qwen TTS architectures | Separate placement of conditioning, transformer, prediction and codec stages; budget the state of each stage; measure first audio and streaming behavior | Multi-axis positions, group-specific heads and cache reset/stopping rules remain model semantics. A codec boundary is not an MoE expert boundary. See [speech integration](speech-integration.md) for maintained scope. |
+| MiniMax H3 | Stage/block residency, bounded copies, reusable dense operators/workspaces and precomputed AdaLN plans | Dense iterative full-sequence execution needs noncausal attention, MM-RoPE, modulation and separate audio/video schedules. An MoE hot-expert policy or append KV loop does not provide these semantics. |
 | Future sparse MoE | Independent router/grouped-expert operators, explicit expert residency and CPU/GPU job partitioning | First implement and numerically validate the architecture, supported weight formats and optimized CPU expert backend. Residency policy alone cannot provide inference. |
 | Jetson | Joint memory budget and phase-specific execution choices | ARM64 needs its own CPU backend. Shared DRAM changes the cost model: CPU, GPU and transfers contend for bandwidth, and desktop PCIe/AVX assumptions do not apply. Validate one board and JetPack release. |
 
@@ -83,7 +159,12 @@ change a session's promised context capacity.
    Compare prefill and decode separately; changing the placement every token is
    not the initial goal. For speech, measure the codec bridge and stage transfers
    before deciding which components to move to native code.
-3. **Add MoE policy with a real MoE model.** Keep routing and grouped expert
+3. **Validate a concrete multimodal block.** For an H3 path, first compare one
+   block against the pinned reference on identical inputs, including noncausal
+   attention, MM-RoPE, AdaLN and the gated MLP. Report its weight, workspace and
+   staging budgets and test repeated independent requests. Then measure static
+   stage/block placement and copy overlap before attempting a full checkpoint.
+4. **Add MoE policy with a real MoE model.** Keep routing and grouped expert
    computation in independently usable operators. Put residency, job partitioning
    and transfer ownership in preparation/session execution. Start with static
    byte-based placement and explicit completion; add adaptive placement only after
@@ -95,8 +176,9 @@ operators with borrowed views and explicit execution resources. Introduce a
 shared abstraction only when implemented paths need the same contract.
 
 Acceptance requires real checkpoints and repeatable measurements: numerical
-error and token/audio behavior; peak RAM/VRAM/pinned bytes; cold/warm first-token
-or first-audio latency; prefill and steady decode; CPU/GPU/copy activity; and
+error and token/audio/video behavior; peak RAM/VRAM/pinned bytes; cold/warm
+first-token or first-audio latency; prefill, steady decode and full denoising
+iterations; CPU/GPU/copy activity; and
 multiple sessions, cancellation and allocation/transfer failures. Record CPU ISA,
 worker policy, device, driver, toolkit, model revision and placements. The external
 project's throughput is not an `edge-infer` result, and this document makes no
@@ -115,3 +197,9 @@ performance claim.
 [verify-dma]: https://github.com/Niko1221/Strata/blob/6f32ec070f23ced9f50e704d854d775da52591ab/src/core/verify.cpp#L1618-L1637
 [prefill]: https://github.com/Niko1221/Strata/blob/6f32ec070f23ced9f50e704d854d775da52591ab/src/prefill/prefill.cpp
 [details]: https://github.com/Niko1221/Strata/blob/6f32ec070f23ced9f50e704d854d775da52591ab/docs/DETAILS.md#L87-L100
+[h3-release]: https://github.com/MiniMax-AI/MiniMax-H3/blob/d21241f0a4b3acbb34c97dae47fa417b7065e438/README.md
+[h3-config]: https://github.com/MiniMax-AI/MiniMax-H3/blob/d21241f0a4b3acbb34c97dae47fa417b7065e438/FL2VA/transformer/config.json
+[h3-transformer]: https://github.com/huggingface/diffusers/blob/36438e2ee44a7b8939a06e9c635085d96ae83a3e/src/diffusers/models/transformers/transformer_minimax_h3.py
+[h3-denoise]: https://github.com/huggingface/diffusers/blob/36438e2ee44a7b8939a06e9c635085d96ae83a3e/src/diffusers/modular_pipelines/minimax_h3/denoise.py
+[h3-scheduler]: https://github.com/huggingface/diffusers/blob/36438e2ee44a7b8939a06e9c635085d96ae83a3e/src/diffusers/schedulers/scheduling_minimax_h3.py
+[h3-adaln]: https://github.com/sgl-project/sglang/blob/f3b5a28f4315767261d439baf4705f2049d8871f/python/sglang/multimodal_gen/runtime/models/dits/minimax_h3_adaln_cache.py

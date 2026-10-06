@@ -35,13 +35,13 @@ class CheckpointTest(unittest.TestCase):
     def write_index(self, weights):
         self.write_json("model.safetensors.index.json", {"weight_map": weights})
 
-    def test_single_file_values_and_tied_head(self):
+    def test_single_file_values_and_preserved_tie_declaration(self):
         self.write_weights()
         config, weights, kind = load_model(self.root, "qwen")
         self.assertTrue(config["tie_word_embeddings"])
         self.assertEqual(kind, "qwen")
         torch.testing.assert_close(weights["model.embed_tokens.weight"], self.embedding)
-        self.assertIs(weights["lm_head.weight"], weights["model.embed_tokens.weight"])
+        self.assertNotIn("lm_head.weight", weights)
 
     def test_indexed_files_follow_recorded_tensor_mapping(self):
         head = torch.tensor([[5.0, 6.0], [7.0, 8.0]], dtype=torch.float32)
@@ -75,6 +75,42 @@ class CheckpointTest(unittest.TestCase):
         self.write_index({"missing.weight": "model.safetensors"})
         with self.assertRaises(SafetensorError):
             load_model(self.root, "qwen")
+
+    def test_declared_awq_formats_are_checked_before_tensor_loading(self):
+        for declared in (
+            {"quant_method": "gptq"}, {"bits": 8}, {"w_bit": True},
+            {"zero_point": False}, {"zero_point": 1}, {"version": "GEMM"},
+            {"version": "MARLIN"}, {"group_size": 0}, {"group_size": True},
+            {"group_size": "64"}, {"q_group_size": False},
+            {"q_group_size": 2147483648}, {"group_size": 32, "q_group_size": 64},
+        ):
+            with self.subTest(declared=declared):
+                for config in (declared, {"quantization_config": declared}):
+                    self.write_json("config.json", config)
+                    with self.assertRaises(ValueError):
+                        load_model(self.root, "qwen3_awq")
+        self.write_json("config.json", {
+            "group_size": 32, "quantization_config": {"group_size": 64}
+        })
+        with self.assertRaisesRegex(ValueError, "agree"):
+            load_model(self.root, "qwen3_awq")
+
+    def test_explicit_awq_metadata_is_preserved(self):
+        self.write_weights()
+        quantization = {
+            "quant_method": "awq", "bits": 4, "zero_point": True,
+            "version": "gemv", "group_size": 64,
+        }
+        self.write_json("config.json", {"quantization_config": quantization})
+        config, _, _ = load_model(self.root, "qwen3_awq")
+        self.assertEqual(config["group_size"], 64)
+        self.assertEqual(config["quantization_config"], quantization)
+        self.write_json("config.json", {
+            "q_group_size": 64, "quantization_config": {**quantization, "q_group_size": 64}
+        })
+        config, _, _ = load_model(self.root, "qwen3_awq")
+        self.assertEqual(config["group_size"], 64)
+        self.assertEqual(config["q_group_size"], 64)
 
     def test_missing_shard_rejects(self):
         self.write_index({"model.embed_tokens.weight": "missing.safetensors"})

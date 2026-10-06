@@ -125,10 +125,43 @@ Qwen3Session<T>::~Qwen3Session() {
 }
 template <typename T>
 void Qwen3Session<T>::synchronize() const {
-  if (context_.stream) CUDA_CHECK(cudaStreamSynchronize(context_.stream));
+  // Cleanup owners may retry completion on a poisoned instance. A successful
+  // retry releases borrowed-input lifetime obligations but never revives it.
+  if (context_.stream) {
+    const auto status = cudaStreamSynchronize(context_.stream);
+    if (status != cudaSuccess) poisoned_ = true;
+    CUDA_CHECK(status);
+  }
+}
+template <typename T>
+void Qwen3Session<T>::require_usable() const {
+  if (poisoned_)
+    throw std::runtime_error("Session is unusable after failed CUDA stream completion");
+}
+template <typename T>
+bool Qwen3Session<T>::drain_failed_execution(KVCache<T>* modified_cache) noexcept {
+  // synchronize() already records a failed completion. Never retry it through
+  // an outer catch or let a later successful API call revive that instance.
+  if (poisoned_) return false;
+  if (context_.stream && cudaStreamSynchronize(context_.stream) != cudaSuccess) {
+    poisoned_ = true;
+    return false;
+  }
+  if (modified_cache) {
+    try {
+      modified_cache->clear();
+      if (modified_cache == managed_cache_.get()) history_ready_ = false;
+    } catch (...) {
+      // A custom external cache must not replace the original launch error.
+      poisoned_ = true;
+      return false;
+    }
+  }
+  return true;
 }
 template <typename T>
 void Qwen3Session<T>::set_graph_enabled(bool enabled) {
+  require_usable();
   synchronize();
   use_cuda_graph_ = enabled;
 }
@@ -150,6 +183,22 @@ template <typename T>
 size_t Qwen3Session<T>::estimate_prefill_workspace_bytes(size_t rows) const {
   return plan_decoder_workspace<T>(model_->config(), rows).total_bytes();
 }
+
+template <typename T>
+size_t Qwen3Session<T>::estimate_embedding_prefill_workspace_bytes(size_t rows) const {
+  return plan_decoder_workspace<T>(model_->config(), rows, DecoderOutput::Hidden).total_bytes();
+}
+
+template <typename T>
+void Qwen3Session<T>::prepare_prefill(size_t rows, DecoderOutput output) {
+  // A same-length request can change its output contract. Cache that contract
+  // in the resolved views, so an embedding plan never serves a token head.
+  if (prefill_buffers_.residual.shape[0] == rows &&
+      (prefill_buffers_.logits.data != nullptr) == (output == DecoderOutput::Logits))
+    return;
+  const auto plan = plan_decoder_workspace<T>(model_->config(), rows, output);
+  prefill_buffers_ = resolve_decoder_buffers<T>(model_->config(), rows, plan, prefill_workspace_);
+}
 template <typename T>
 std::unique_ptr<Qwen3Session<T>> Qwen3Session<T>::create(std::shared_ptr<const Qwen3Model<T>> m,
                                                          size_t n, bool graph) {
@@ -162,6 +211,7 @@ std::unique_ptr<Qwen3Session<T>> Qwen3Session<T>::create(std::shared_ptr<const Q
 }
 template <typename T>
 std::unique_ptr<Qwen3Session<T>> Qwen3Session<T>::new_session(size_t n, bool graph) const {
+  require_usable();
   return create(model_, n, graph);
 }
 template <typename T>
@@ -180,6 +230,7 @@ size_t Qwen3Session<T>::context_capacity() const {
 }
 template <typename T>
 void Qwen3Session<T>::reset() {
+  require_usable();
   require_managed();
   synchronize();
   managed_cache_->clear();
@@ -277,22 +328,24 @@ void Qwen3Session<T>::capture_graph(KVCache<T>& cache) {
 template <typename T>
 TensorView<T, 2> Qwen3Session<T>::execute(TensorView<const uint32_t, 1> in, KVCache<T>& cache,
                                           bool prefill, bool graph) {
-  validate_and_bind(in, &cache, !prefill);
+  require_usable();
+  try {
+    validate_and_bind(in, &cache, !prefill);
+  } catch (...) {
+    // Device-ID validation can already have queued a read of borrowed tokens.
+    // It does not write the cache, so successful cleanup preserves its history.
+    drain_failed_execution();
+    throw;
+  }
   return execute_prevalidated(in, cache, prefill, graph);
 }
 template <typename T>
 TensorView<T, 2> Qwen3Session<T>::execute_prevalidated(TensorView<const uint32_t, 1> in,
                                                        KVCache<T>& cache, bool prefill,
                                                        bool graph) {
+  require_usable();
   const size_t rows = in.shape[0], offset = cache.size() - rows;
-  if (prefill) {
-    if (prefill_rows_ != rows) {
-      const auto plan = plan_decoder_workspace<T>(model_->config(), rows);
-      prefill_buffers_ =
-          resolve_decoder_buffers<T>(model_->config(), rows, plan, prefill_workspace_);
-      prefill_rows_ = rows;
-    }
-  }
+  if (prefill) prepare_prefill(rows, DecoderOutput::Logits);
   try {
     if (prefill) {
       op::cuda::bind_execution_context(context_);
@@ -321,15 +374,13 @@ TensorView<T, 2> Qwen3Session<T>::execute_prevalidated(TensorView<const uint32_t
   } catch (...) {
     // Submitted kernels can partially overwrite KV. Never restore a logical
     // history whose contents are no longer known after an execution failure.
-    if (managed_cache_.get() == &cache) {
-      cache.clear();
-      history_ready_ = false;
-    }
+    drain_failed_execution(&cache);
     throw;
   }
 }
 template <typename T>
 TensorView<T, 2> Qwen3Session<T>::prefill(TensorView<const uint32_t, 1> in) {
+  require_usable();
   require_managed();
   if (!in.shape[0]) throw std::invalid_argument("Prompt must be nonempty");
   if (in.shape[0] > context_capacity()) throw std::length_error("Prompt exceeds session capacity");
@@ -340,7 +391,7 @@ TensorView<T, 2> Qwen3Session<T>::prefill(TensorView<const uint32_t, 1> in) {
     history_ready_ = true;
     return out;
   } catch (...) {
-    if (history_ready_ || !previous) managed_cache_->resize(previous);
+    if (!poisoned_ && (history_ready_ || !previous)) managed_cache_->resize(previous);
     throw;
   }
 }
@@ -351,6 +402,7 @@ TensorView<T, 2> Qwen3Session<T>::prefill(const uint32_t* tokens, size_t rows) {
 template <typename T>
 TensorView<T, 2> Qwen3Session<T>::execute_host_tokens(const uint32_t* tokens, size_t rows,
                                                       bool prefill) {
+  require_usable();
   require_managed();
   if (!tokens || !rows || (!prefill && rows != 1))
     throw std::invalid_argument("Host input requires tokens; decode takes one token");
@@ -386,10 +438,8 @@ TensorView<T, 2> Qwen3Session<T>::execute_host_tokens(const uint32_t* tokens, si
   } catch (...) {
     // The caller may release host storage immediately, including scalar stack
     // tokens. Drain any attempted upload even if later workspace planning fails.
-    if (upload_attempted && cudaStreamSynchronize(context_.stream) != cudaSuccess) {
-      managed_cache_->clear();
-      history_ready_ = false;
-    } else if (history_ready_ || !previous) {
+    const bool completed = !upload_attempted || drain_failed_execution();
+    if (completed && !poisoned_ && (history_ready_ || !previous)) {
       managed_cache_->resize(previous);
     }
     throw;
@@ -397,6 +447,7 @@ TensorView<T, 2> Qwen3Session<T>::execute_host_tokens(const uint32_t* tokens, si
 }
 template <typename T>
 TensorView<T, 2> Qwen3Session<T>::decode(TensorView<const uint32_t, 1> in) {
+  require_usable();
   require_managed();
   if (!history_ready_) throw std::logic_error("Decode requires successful prefill");
   if (in.shape[0] != 1) throw std::invalid_argument("Decode takes one token");
@@ -406,7 +457,7 @@ TensorView<T, 2> Qwen3Session<T>::decode(TensorView<const uint32_t, 1> in) {
     managed_cache_->resize(previous + 1);
     return execute(in, *managed_cache_, false, use_cuda_graph_);
   } catch (...) {
-    if (history_ready_) managed_cache_->resize(previous);
+    if (!poisoned_ && history_ready_) managed_cache_->resize(previous);
     throw;
   }
 }
@@ -417,6 +468,7 @@ TensorView<T, 2> Qwen3Session<T>::decode(uint32_t token) {
 template <typename T>
 TensorView<T, 2> Qwen3Session<T>::execute_embeddings(TensorView<const T, 2> input, size_t position,
                                                      bool prefill) {
+  require_usable();
   require_managed();
   const auto& config = model_->config();
   if (!input.data || !input.shape[0] || input.shape[1] != config.hidden_size ||
@@ -452,11 +504,9 @@ TensorView<T, 2> Qwen3Session<T>::execute_embeddings(TensorView<const T, 2> inpu
     throw;
   }
   bind_cache(managed_cache_.get());
-  if (prefill && prefill_rows_ != rows) {
+  if (prefill) {
     try {
-      const auto plan = plan_decoder_workspace<T>(config, rows);
-      prefill_buffers_ = resolve_decoder_buffers<T>(config, rows, plan, prefill_workspace_);
-      prefill_rows_ = rows;
+      prepare_prefill(rows, DecoderOutput::Hidden);
     } catch (...) {
       managed_cache_->resize(previous);
       throw;
@@ -475,8 +525,7 @@ TensorView<T, 2> Qwen3Session<T>::execute_embeddings(TensorView<const T, 2> inpu
     history_ready_ = true;
     return hidden;
   } catch (...) {
-    managed_cache_->clear();
-    history_ready_ = false;
+    drain_failed_execution(managed_cache_.get());
     throw;
   }
 }
@@ -508,9 +557,15 @@ TensorView<T, 2> Qwen3Session<T>::forward_for_graph_logits_only(const Tensor<uin
 template <typename T>
 uint32_t* Qwen3Session<T>::sample_logits(TensorView<const T, 2> logits, float temp, float p,
                                          size_t k, curandState* states) {
-  op::cuda::sample<T>(context_, logits, sampled_token_, sampled_probability_, sampling_scratch_,
-                      sampling_plan_, temp, p, k, states);
-  synchronize();
+  require_usable();
+  try {
+    op::cuda::sample<T>(context_, logits, sampled_token_, sampled_probability_, sampling_scratch_,
+                        sampling_plan_, temp, p, k, states);
+    synchronize();
+  } catch (...) {
+    drain_failed_execution();
+    throw;
+  }
   return sampled_token_.data;
 }
 template <typename T>

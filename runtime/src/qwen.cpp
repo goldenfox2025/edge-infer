@@ -163,6 +163,14 @@ QwenModel<T>::QwenModel(const QwenModel& prototype, ForkExecutorTag)
       params_(prototype.params_), scales_params_(prototype.scales_params_),
       qweight_params_(prototype.qweight_params_), qzeros_params_(prototype.qzeros_params_),
       prepared_model_(prototype.prepared_model_) {
+    if (device_ == Device::CPU) {
+        // Tensor descriptors retain the initial model's private CPU storage.
+        // Preparation only resolves read-only views and creates this executor's
+        // mutable buffers; it never snapshots the same weights a second time.
+        prepare_cpu();
+        sample_mode_ = prototype.sample_mode_;
+        return;
+    }
     if (device_ != Device::CUDA || !prepared_model_ || !prototype.cuda_session_)
         throw std::logic_error("A shared Qwen executor fork requires a prepared CUDA prototype");
     // Only execution resources are new. The retained prepared model owns all
@@ -175,11 +183,7 @@ QwenModel<T>::QwenModel(const QwenModel& prototype, ForkExecutorTag)
 
 template <typename T>
 std::shared_ptr<BaseModel> QwenModel<T>::fork_executor() const {
-    if (device_ == Device::CUDA)
-        return std::shared_ptr<BaseModel>(new QwenModel(*this, ForkExecutorTag{}));
-    auto executor = std::make_shared<QwenModel<T>>(params_, source_config_);
-    executor->sample_mode_ = sample_mode_;
-    return executor;
+    return std::shared_ptr<BaseModel>(new QwenModel(*this, ForkExecutorTag{}));
 }
 
 template <typename T> void QwenModel<T>::prepare_cuda() {

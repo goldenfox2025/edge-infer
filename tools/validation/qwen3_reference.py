@@ -5,6 +5,8 @@ All model/tokenizer loads are local-only; remote code and automatic downloads
 are disabled. Native token checks use the production Model/Session API. That
 API does not expose logits. An optional test-only module compares copied native
 logits without changing that API.
+Eager and SDPA references retain separate provenance and the same strict bound.
+Verified saved fixtures can be reused without loading a Torch model or tokenizer.
 """
 
 import argparse
@@ -15,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 
 
@@ -36,6 +39,7 @@ def file_hash(path):
 
 
 def checkpoint_files(root):
+    root = root.resolve()
     config = root / "config.json"
     if not config.is_file():
         raise FileNotFoundError(config)
@@ -82,16 +86,153 @@ def compare_tokens(expected, actual):
             "expected": list(expected), "actual": list(actual)}
 
 
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def token_ids(values, vocabulary, label, *, allow_empty=False):
+    require(isinstance(values, list) and (values or allow_empty), f"Invalid {label}")
+    require(all(type(value) is int and 0 <= value < vocabulary for value in values),
+            f"{label} must contain integer vocabulary IDs, not booleans")
+    return values
+
+
+def contained_file(directory, name):
+    require(isinstance(name, str) and name and "\\" not in name and ":" not in name and
+            not Path(name).is_absolute(), "Artifact filenames must be relative contained paths")
+    path = (directory / name).resolve()
+    require(path.is_relative_to(directory.resolve()) and path.is_file(),
+            f"Artifact must be a file inside its recorded directory: {name}")
+    return path
+
+
+def saved_reference(manifest_path, root, hashes, config, requested, software, np):
+    """Validate saved reference bytes and contexts before any native work.
+
+    This function imports no Torch, initializes no model, and accepts no
+    tolerance override. The caller supplies installed software/source identity.
+    """
+    manifest_path = manifest_path.resolve()
+    if manifest_path.is_dir():
+        manifest_path = manifest_path / "source.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    require(isinstance(manifest, dict), "Reference manifest must be an object")
+    for name, expected in requested.items():
+        if name != "prompt_ids":
+            require(type(manifest.get(name)) is type(expected) and manifest.get(name) == expected,
+                    f"Reference provenance mismatch: {name}")
+    for name, expected in software.items():
+        require(name in manifest and type(manifest[name]) is type(expected) and manifest[name] == expected,
+                f"Installed reference software/source differs: {name}")
+    require(manifest.get("dtype") == "bfloat16" and manifest.get("tf32") is False and
+            manifest.get("deterministic_algorithms") is True, "Unsupported reference numerical policy")
+    checkpoint = manifest.get("checkpoint_files")
+    require(isinstance(checkpoint, dict) and hashes.keys() <= checkpoint.keys(),
+            "Reference is missing checkpoint/config hashes")
+    for name, identity in checkpoint.items():
+        require(isinstance(identity, dict) and type(identity.get("bytes")) is int and
+                identity["bytes"] > 0 and isinstance(identity.get("sha256"), str) and
+                re.fullmatch(r"[0-9a-f]{64}", identity["sha256"]),
+                "Malformed checkpoint identity")
+        if name in hashes:
+            actual = hashes[name]
+        else:
+            require(name in {"tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt"},
+                    "Unrecognized checkpoint provenance file")
+            path = contained_file(root, name)
+            actual = {"bytes": path.stat().st_size, "sha256": file_hash(path)}
+        require(identity == actual, f"Checkpoint/config bytes differ: {name}")
+    vocabulary = config["vocab_size"]
+    require(type(vocabulary) is int and vocabulary > 0, "Invalid checkpoint vocabulary")
+    eos, steps, teacher_checks = config["eos_token_id"], manifest["steps"], manifest["teacher_forced_checks"]
+    require(type(eos) is int and 0 <= eos < vocabulary and type(steps) is int and steps > 0 and
+            type(teacher_checks) is int and teacher_checks > 0 and
+            type(config["max_position_embeddings"]) is int and config["max_position_embeddings"] > 0,
+            "Invalid reference generation metadata")
+    records = manifest.get("prompts")
+    require(isinstance(records, list) and records, "Reference requires at least one recorded prompt")
+    fixtures = []
+    for index, record in enumerate(records):
+        require(isinstance(record, dict), "Prompt record must be an object")
+        prompt = token_ids(record.get("prompt_ids"), vocabulary, "prompt IDs")
+        generated = token_ids(record.get("predicted_token_ids_including_eos"), vocabulary,
+                              "teacher continuation")
+        require(len(generated) <= steps and eos not in generated[:-1] and
+                (len(generated) == steps or generated[-1] == eos), "Inconsistent continuation/EOS length")
+        emitted = token_ids(record.get("emitted_token_ids"), vocabulary, "emitted IDs", allow_empty=True)
+        require(emitted == (generated[:-1] if generated[-1] == eos else generated),
+                "Emitted tokens differ from recorded continuation")
+        growth = record.get("kv_lengths")
+        require(isinstance(growth, list) and all(type(value) is int for value in growth) and
+                growth == list(range(len(prompt), len(prompt) + len(generated))), "Invalid recorded KV growth")
+        prefixes = record.get("teacher_forced_prefixes")
+        count = min(teacher_checks, len(generated))
+        require(isinstance(prefixes, list) and len(prefixes) == count, "Invalid teacher-prefix count")
+        for step, prefix in enumerate(prefixes):
+            token_ids(prefix, vocabulary, "teacher prefix")
+            require(prefix == prompt + generated[:step], "Teacher prefix differs from continuation")
+        teacher = token_ids(record.get("teacher_forced_first_token_ids"), vocabulary, "teacher argmax IDs")
+        require(len(teacher) == count, "Invalid teacher argmax count")
+        require(record.get("incremental_vs_full_prefix_first_token_ids") ==
+                compare_tokens(generated[:count], teacher), "Inconsistent cached/full-prefix token report")
+        path = contained_file(manifest_path.parent, record.get("fixture"))
+        require(path.suffix == ".npz" and isinstance(record.get("fixture_sha256"), str) and
+                re.fullmatch(r"[0-9a-f]{64}", record["fixture_sha256"]) and
+                file_hash(path) == record["fixture_sha256"], f"Reference fixture checksum differs: {index}")
+        shapes = {"prefill_logits": [len(prompt), vocabulary],
+                  "incremental_last_logits": [len(generated), vocabulary],
+                  "teacher_forced_last_logits": [count, vocabulary]}
+        declared = record.get("array_shapes")
+        require(isinstance(declared, dict) and declared.keys() == shapes.keys() and
+                all(isinstance(shape, list) and all(type(size) is int for size in shape)
+                    for shape in declared.values()) and declared == shapes, "Invalid declared reference shapes")
+        with np.load(path, allow_pickle=False) as fixture:
+            require(set(fixture.files) == set(shapes), "Unexpected reference array keys")
+            arrays = {name: fixture[name] for name in shapes}
+            for name, array in arrays.items():
+                require(array.dtype == np.dtype("<f4") and list(array.shape) == shapes[name] and
+                        bool(np.isfinite(array).all()), f"Invalid reference logits: {index}:{name}")
+            require(arrays["incremental_last_logits"].argmax(-1).tolist() == generated and
+                    arrays["teacher_forced_last_logits"].argmax(-1).tolist() == teacher,
+                    "Logit argmax differs from recorded teacher tokens")
+            require(arrays["prefill_logits"][-1].tobytes() ==
+                    arrays["incremental_last_logits"][0].tobytes(), "First incremental row differs from prefill")
+        require(len(prompt) + steps <= config["max_position_embeddings"],
+                "Saved reference exceeds checkpoint position budget")
+        fixtures.append(path)
+    if requested.get("prompt_ids") is not None:
+        require([record["prompt_ids"] for record in records] == requested["prompt_ids"],
+                "Requested prompts differ from saved reference")
+    for name in ("native", "native_logits"):
+        report = manifest.get(name, {})
+        require(isinstance(report, dict) and ("passed" not in report or type(report["passed"]) is bool),
+                "Invalid prior native result status")
+    return manifest, fixtures, {"manifest": str(manifest_path), "manifest_sha256": file_hash(manifest_path),
+        "policy": "Verified saved reference; no Torch model or tokenizer loaded",
+        "prior_native_passed": manifest.get("native", {}).get("passed"),
+        "prior_native_logits_passed": manifest.get("native_logits", {}).get("passed"),
+        "prior_absolute_tolerance": manifest.get("native_logits", {}).get("absolute_tolerance"),
+        "prior_relative_tolerance": manifest.get("native_logits", {}).get("relative_tolerance")}
+
+
 def cache_length(cache):
     if hasattr(cache, "get_seq_length"):
         return int(cache.get_seq_length())
     return int(cache[0][0].shape[-2])
 
 
+def configured_attention(model, requested):
+    actual = model.config._attn_implementation
+    require(isinstance(actual, str) and actual == requested,
+            f"Configured reference attention differs: requested {requested}, actual {actual}")
+    return actual
+
+
 def torch_reference(model, prompt, steps, teacher_checks, eos, torch, np):
     tokens = torch.tensor([prompt], dtype=torch.long, device=model.device)
     with torch.inference_mode():
-        result = model(input_ids=tokens, use_cache=True, return_dict=True)
+        result = model(input_ids=tokens, use_cache=True, return_dict=True, output_attentions=False)
         if not bool(torch.isfinite(result.logits).all()):
             raise RuntimeError("Torch produced nonfinite prefill logits")
         prefill = result.logits[0].float().cpu().numpy()
@@ -108,7 +249,8 @@ def torch_reference(model, prompt, steps, teacher_checks, eos, torch, np):
             if selected == eos or step + 1 == steps:
                 break
             result = model(input_ids=torch.tensor([[selected]], device=model.device),
-                           past_key_values=past, use_cache=True, return_dict=True)
+                           past_key_values=past, use_cache=True, return_dict=True,
+                           output_attentions=False)
             past = result.past_key_values
             growth.append(cache_length(past))
             current = result.logits[0, -1]
@@ -119,7 +261,7 @@ def torch_reference(model, prompt, steps, teacher_checks, eos, torch, np):
         for step in range(min(teacher_checks, len(generated))):
             prefix = prompt + generated[:step]
             result = model(input_ids=torch.tensor([prefix], device=model.device),
-                           use_cache=False, return_dict=True)
+                           use_cache=False, return_dict=True, output_attentions=False)
             logits = result.logits[0, -1]
             if not bool(torch.isfinite(logits).all()):
                 raise RuntimeError(f"Torch produced nonfinite teacher-forced logits at step {step}")
@@ -229,6 +371,14 @@ def compare_logits(expected, actual, np):
             "argmax_matches": tokens_match}
 
 
+def compare_exact_logits(expected, actual, np):
+    matching_shape = expected.shape == actual.shape and expected.dtype == actual.dtype
+    finite = bool(np.isfinite(expected).all() and np.isfinite(actual).all())
+    return {"passed": matching_shape and finite and expected.tobytes(order="C") == actual.tobytes(order="C"),
+            "expected_shape": list(expected.shape), "actual_shape": list(actual.shape),
+            "finite": finite, "contract": "Exact dtype, shape and bytes; no tolerance"}
+
+
 def native_logits_reference(root, module_dir, records, output, capacity, modes, np):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     sys.path.insert(0, str(module_dir))
@@ -237,13 +387,13 @@ def native_logits_reference(root, module_dir, records, output, capacity, modes, 
 
     config, weights, _ = load_model(root, "qwen3_bf16")
     model = diagnostic.Model(config, weights)
-    reports = []
+    reports, prefills_by_mode = [], {}
     for mode in modes:
         sessions = [model.new_session(capacity=capacity, graph=mode == "graph") for _ in records]
         prefill, incremental, growth = [], [], []
         for session, record in zip(sessions, records):
             logits = session.prefill(record["prompt_ids"])
-            prefill.append(logits)
+            prefill.append(logits.copy())
             incremental.append([logits[-1].copy()])
             growth.append([session.context_size])
         # Interleave distinct prefixes over shared immutable weights. Continuing
@@ -274,17 +424,27 @@ def native_logits_reference(root, module_dir, records, output, capacity, modes, 
                      teacher_forced_last_logits=observed_teacher, reset_prefill_logits=replay)
             mode_report["prompts"].append({"checks": checks, "kv_lengths": growth[index],
                 "kv_growth_matches": growth[index] == record["kv_lengths"],
+                "reset_replay_exact": compare_exact_logits(prefill[index], replay, np),
                 "fixture": artifact.name, "fixture_sha256": file_hash(artifact)})
             for stage, result in checks.items():
                 print(f"Native {mode} prompt {index} {stage}: max_abs={result.get('max_absolute_error')}, "
                       f"mean_abs={result.get('mean_absolute_error')}, outside={result.get('outside_tolerance')}, "
                       f"argmax={result.get('argmax_matches')}")
         reports.append(mode_report)
+        prefills_by_mode[mode] = prefill
         del session, sessions
         gc.collect()
-    passed = all(prompt["kv_growth_matches"] and all(check["passed"] for check in prompt["checks"].values())
-                 for mode in reports for prompt in mode["prompts"])
-    return {"passed": passed, "module": str(diagnostic.__file__), "module_sha256": file_hash(Path(diagnostic.__file__)),
+    cross_mode = [compare_exact_logits(eager, graph, np) for eager, graph in
+                  zip(prefills_by_mode.get("eager", []), prefills_by_mode.get("graph", []))]
+    strict_passed = all(all(check["passed"] for check in prompt["checks"].values())
+                        for mode in reports for prompt in mode["prompts"])
+    invariants_passed = all(prompt["kv_growth_matches"] and prompt["reset_replay_exact"]["passed"]
+                            for mode in reports for prompt in mode["prompts"]) and all(
+                                check["passed"] for check in cross_mode)
+    return {"passed": strict_passed and invariants_passed, "strict_reference_passed": strict_passed,
+            "deterministic_invariants_passed": invariants_passed,
+            "cross_mode_prefill_exact": {"executed": {"eager", "graph"} <= set(modes), "checks": cross_mode},
+            "module": str(diagnostic.__file__), "module_sha256": file_hash(Path(diagnostic.__file__)),
             "absolute_tolerance": BF16_ABSOLUTE_TOLERANCE, "relative_tolerance": BF16_RELATIVE_TOLERANCE,
             "tolerance_formula": "abs(actual-reference) <= 0.015625 + 0.01 * max(abs(reference),abs(actual)); exact row argmax also required",
             "scope": "All copied BF16 logits for recorded local-checkpoint prompts and teacher-forced continuations; private interleaved eager/graph histories and reset",
@@ -299,6 +459,10 @@ def main():
     parser.add_argument("--model-revision", required=True, help="Full publisher Git SHA; local payload hashes are recorded separately")
     parser.add_argument("--expected-model-sha256", help="Verify the single local model.safetensors payload")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+    parser.add_argument("--reference-attention", choices=("eager", "sdpa"), default="eager",
+                        help="Explicit Torch attention backend; strict logit tolerances are unchanged")
+    parser.add_argument("--reuse-reference", type=Path,
+                        help="Verified source.json or its directory; rerun native checks without loading a Torch model")
     parser.add_argument("--steps", type=int, default=16)
     parser.add_argument("--teacher-forced-checks", type=int, default=4)
     prompts = parser.add_mutually_exclusive_group()
@@ -309,6 +473,8 @@ def main():
     parser.add_argument("--native-capacity", type=int, default=128)
     parser.add_argument("--native-mode", choices=("both", "eager", "graph"), default="both")
     args = parser.parse_args()
+    if args.reuse_reference and args.prompt:
+        parser.error("--reuse-reference takes recorded token IDs; use --prompt-ids to assert their identity")
     if not re.fullmatch(r"[0-9a-fA-F]{40}", args.model_revision):
         parser.error("--model-revision must be a full 40-character Git SHA")
     if args.expected_model_sha256 and not re.fullmatch(r"[0-9a-fA-F]{64}", args.expected_model_sha256):
@@ -338,16 +504,25 @@ def main():
     import torch
     import transformers
     from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 
     if transformers.__version__ != TRANSFORMERS_VERSION:
         raise RuntimeError(f"Pinned reference requires transformers=={TRANSFORMERS_VERSION}; found {transformers.__version__}")
-    if args.device == "cuda" and not torch.cuda.is_available():
+    if not args.reuse_reference and args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("The CUDA reference requires an available Torch CUDA device")
-    torch.manual_seed(0)
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    torch.use_deterministic_algorithms(True)
-    if args.prompt_ids:
+    source_path = Path(inspect.getsourcefile(Qwen3ForCausalLM))
+    software = {"torch_version": str(torch.__version__), "transformers_version": str(transformers.__version__),
+                "numpy_version": str(np.__version__), "torch_cuda_version": torch.version.cuda,
+                "reference_source_sha256": file_hash(source_path)}
+    if args.reuse_reference:
+        requested = {"model_id": args.model_id, "model_revision": args.model_revision.lower(),
+                     "attention_implementation": args.reference_attention, "device": args.device,
+                     "steps": args.steps, "teacher_forced_checks": args.teacher_forced_checks,
+                     "prompt_ids": args.prompt_ids}
+        previous, fixtures, reuse = saved_reference(args.reuse_reference, root, hashes, config,
+                                                   requested, software, np)
+        prompt_ids = [record["prompt_ids"] for record in previous["prompts"]]
+    elif args.prompt_ids:
         prompt_ids = args.prompt_ids
     else:
         tokenizer = AutoTokenizer.from_pretrained(root, local_files_only=True, trust_remote_code=False)
@@ -359,43 +534,61 @@ def main():
             if path.is_file():
                 hashes[name] = {"bytes": path.stat().st_size, "sha256": file_hash(path)}
     for prompt in prompt_ids:
-        if not prompt or any(token >= config["vocab_size"] for token in prompt):
-            raise ValueError("Prompt token IDs must be nonempty and within the model vocabulary")
+        token_ids(prompt, config["vocab_size"], "prompt IDs")
         if len(prompt) + args.steps > config["max_position_embeddings"]:
             raise ValueError("Prompt and continuation budget exceed the model position limit")
         if (args.native_module_dir or args.native_logit_module_dir) and len(prompt) + args.steps > args.native_capacity:
             raise ValueError("Prompt and continuation budget exceed --native-capacity")
-    model = AutoModelForCausalLM.from_pretrained(root, local_files_only=True,
-        trust_remote_code=False, torch_dtype=torch.bfloat16, attn_implementation="eager").to(args.device).eval()
-    source_path = Path(inspect.getsourcefile(type(model)))
-    manifest = {"model_id": args.model_id, "model_revision": args.model_revision.lower(),
+    args.output.mkdir(parents=True, exist_ok=True)
+    records = []
+    if args.reuse_reference:
+        manifest = {name: value for name, value in previous.items()
+                    if name not in {"native", "native_logits", "reference_reuse"}}
+        manifest["reference_reuse"] = reuse
+        for index, (record, path) in enumerate(zip(previous["prompts"], fixtures)):
+            copied = dict(record)
+            fixture = args.output / f"prompt-{index:03d}.npz"
+            shutil.copyfile(path, fixture)
+            require(file_hash(fixture) == record["fixture_sha256"], "Reference bytes changed during copy")
+            copied["fixture"] = fixture.name
+            records.append(copied)
+        print(f"Reused {len(records)} verified {args.reference_attention} references from {reuse['manifest']}; "
+              "no Torch model or tokenizer loaded")
+    else:
+        torch.manual_seed(0)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.use_deterministic_algorithms(True)
+        model = AutoModelForCausalLM.from_pretrained(root, local_files_only=True,
+            trust_remote_code=False, torch_dtype=torch.bfloat16,
+            attn_implementation=args.reference_attention).to(args.device).eval()
+        actual_attention = configured_attention(model, args.reference_attention)
+        manifest = {"model_id": args.model_id, "model_revision": args.model_revision.lower(),
                 "provenance_note": "Model ID/revision are supplied provenance; the local bytes are identified by SHA256",
-                "checkpoint_files": hashes, "torch_version": torch.__version__,
-                "transformers_version": transformers.__version__, "numpy_version": np.__version__,
+                "checkpoint_files": hashes, "torch_version": software["torch_version"],
+                "transformers_version": software["transformers_version"], "numpy_version": software["numpy_version"],
                 "reference_source": str(source_path), "reference_source_sha256": file_hash(source_path),
-                "dtype": "bfloat16", "attention_implementation": "eager", "tf32": False,
+                "dtype": "bfloat16", "attention_implementation": actual_attention, "tf32": False,
                 "deterministic_algorithms": True, "device": args.device,
                 "gpu": torch.cuda.get_device_name() if args.device == "cuda" else None,
                 "torch_cuda_version": torch.version.cuda, "steps": args.steps,
                 "teacher_forced_checks": args.teacher_forced_checks,
                 "scope": "Small deterministic full-checkpoint Torch reference and optional native greedy-token checks; no performance claim",
                 "prompts": []}
-    args.output.mkdir(parents=True, exist_ok=True)
-    records = []
-    for index, prompt in enumerate(prompt_ids):
-        record, arrays = torch_reference(model, prompt, args.steps, args.teacher_forced_checks, eos, torch, np)
-        fixture = args.output / f"prompt-{index:03d}.npz"
-        np.savez(fixture, **arrays)
-        record["fixture"] = fixture.name
-        record["fixture_sha256"] = file_hash(fixture)
-        record["array_shapes"] = {name: list(value.shape) for name, value in arrays.items()}
-        records.append(record)
-        print(f"Torch prompt {index}: {len(prompt)} prompt tokens, {len(record['emitted_token_ids'])} emitted greedy tokens")
+        for index, prompt in enumerate(prompt_ids):
+            record, arrays = torch_reference(model, prompt, args.steps, args.teacher_forced_checks, eos, torch, np)
+            fixture = args.output / f"prompt-{index:03d}.npz"
+            np.savez(fixture, **arrays)
+            record["fixture"] = fixture.name
+            record["fixture_sha256"] = file_hash(fixture)
+            record["array_shapes"] = {name: list(value.shape) for name, value in arrays.items()}
+            records.append(record)
+            print(f"Torch prompt {index}: {len(prompt)} prompt tokens, {len(record['emitted_token_ids'])} emitted greedy tokens")
+        del model
+        gc.collect()
+        if args.device == "cuda":
+            torch.cuda.empty_cache()
     manifest["prompts"] = records
-    del model
-    gc.collect()
-    if args.device == "cuda":
-        torch.cuda.empty_cache()
     failed = False
     if args.native_module_dir:
         modes = ("eager", "graph") if args.native_mode == "both" else (args.native_mode,)
@@ -425,4 +618,8 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"Refused invalid or unmatched reference evidence: {error}", file=sys.stderr)
+        raise SystemExit(2)
